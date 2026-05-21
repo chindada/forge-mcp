@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `docs/specs/forge-mcp-design.md` is the **normative implementation brief** (~900 lines). Read the relevant section before any non-trivial decision; code comments cite it by section (e.g. `# §8.5 cancellation ordering`). When this file and the design doc disagree, the design doc wins.
 
-The repository is currently **pre-implementation** — only the design doc, README, LICENSE, and `.gitignore` exist. The structure below describes the codebase that *will* be built per §5; update this file as code lands.
+The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is
 
@@ -79,11 +79,24 @@ Playwright removal is the defining scope cut versus `harness-mcp`. **Do not rein
 
 Dropping `_auto_approve_codex_requests` is safe: the Codex SDK's default approval handler already accepts command/file approvals; only MCP-specific methods defaulted to `{}`, and those are unreachable with no MCP servers (§10.2).
 
+## Commands
+
+```sh
+uv sync                            # install (creates .venv, resolves uv.lock)
+uv run forge doctor                # environment preflight (claude/codex CLIs, skills, auth)
+uv run forge serve                 # start the stdio MCP server
+uv run pytest -m "not slow"        # fast tests (what CI runs)
+uv run pytest -m slow              # the real-CLI e2e only (needs claude + codex)
+bash scripts/ci.sh                 # full CI gate (ruff + pyright + docstrings + pytest)
+```
+
+Single test: `uv run pytest tests/test_<name>.py::<test>`.
+
 ## Tooling (§17, §18)
 
 Python ≥3.11, `uv` (package mode) + `hatchling`. Lints: `ruff` (`E,F,I,B,UP,ASYNC`, line 100) + `ruff-format` + `pyright` (basic). Tests: `pytest` + `pytest-asyncio` (`asyncio_mode=auto`). Prompts are shipped in the wheel via `[tool.hatch.build.targets.wheel.force-include]`.
 
-CI gate (`scripts/ci.sh` once it exists):
+CI gate (`scripts/ci.sh`):
 
 ```sh
 ruff check
@@ -93,11 +106,11 @@ python scripts/check_docstrings.py src tests scripts
 pytest -m "not slow"
 ```
 
-Test markers: `slow` (one e2e against real `claude` + `codex`, excluded by default), `mcp` (FastMCP transport), `driver` (drivers with mocked runners). Single test: `pytest tests/test_<name>.py::<test>`.
+Test markers: `slow` (one e2e against real `claude` + `codex`, excluded by default), `mcp` (FastMCP transport), `driver` (drivers with mocked runners).
 
 CLI entry points: `forge serve` (stdio MCP server), `forge doctor` (environment subset of preflight + disk-space warn + resolved `CLAUDE_CONFIG_DIR` / `claude` CLI path / codex paths). Both call the same check functions as `prepare_run` — single source of truth (§14).
 
-Pre-release dep: `openai-codex` tracks `@main` (Decision 7 — no PyPI release). Reproducibility comes from a **committed `uv.lock`**; do not pin a SHA in `pyproject.toml`.
+Pre-release dep: `openai-codex` tracks `@main` (Decision 7, §19 — no PyPI release). Reproducibility comes from a **committed `uv.lock`**; do not pin a SHA in `pyproject.toml`.
 
 `claude-agent-sdk` floor is `>=0.1.20,<1` — earliest exposing `setting_sources`, the `tools` preset, and `output_format` (§20 note 7).
 

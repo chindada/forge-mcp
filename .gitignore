@@ -37,3 +37,8 @@ Thumbs.db
 
 # Local-only scratch
 .local/
+.claude/
+.gemini/
+.vscode/
+.superpowers/
+.mcp.json
