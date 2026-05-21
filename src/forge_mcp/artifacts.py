@@ -49,6 +49,19 @@ def atomic_write_json(path: Path, obj: Any, mode: int = 0o600) -> None:
     atomic_write_text(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n", mode=mode)
 
 
+def write_sessions_json(path: Path, iteration: int, entries: list[dict[str, Any]]) -> None:
+    """Atomically persist phase session-id records (§C2.4).
+
+    Design: sessions.json is a forensic sidecar that records phase order and
+        SDK ids without becoming an input to terminal-result decisions.
+    Implementation: render iteration plus ordered phases with sort_keys=False,
+        then delegate to atomic_write_text for 0600 replacement semantics.
+    Example: write_sessions_json(Path('iteration-1/sessions.json'), 1, entries).
+    """
+    payload = {"iteration": iteration, "phases": entries}
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=False) + "\n")
+
+
 def create_run_dir(harness_dir: Path, run_id: str) -> Path:
     """Create the initial run directory layout.
 

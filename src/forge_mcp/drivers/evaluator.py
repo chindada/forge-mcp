@@ -47,6 +47,18 @@ class EvaluatorDriver:
         """
         self._runner = runner
 
+    @property
+    def last_session_id(self) -> str | None:
+        """Expose the evaluator runner's last_session_id for artifacts (§C2.2).
+
+        Design: evaluator calls may run multiple Claude turns in one iteration;
+            orchestrator reads immediately after each call returns.
+        Implementation: passthrough read with None default to preserve fail-soft
+            behavior and existing test fakes.
+        Example: sid = driver.last_session_id after evaluate returns.
+        """
+        return getattr(self._runner, "last_session_id", None)
+
     async def evaluate(
         self, ctx: RunContext, *, retry: bool = False, changed_files: list[str] | None = None
     ) -> EvalResult:

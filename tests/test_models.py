@@ -287,3 +287,19 @@ def test_verify_timeout_seconds_bounds_enforced() -> None:
         RunForgeInput(
             target_dir="/repo", design_doc_content="d", verify_timeout_seconds=24 * 60 * 60 + 1
         )
+
+
+def test_long_run_continuity_optional_fields_are_in_schema():
+    """§C3 optional task/session path fields appear without being required.
+
+    Design: clients can discover task_id and sessions paths while old payloads
+        remain constructible.
+    Implementation: inspect Pydantic JSON schemas for properties and required.
+    Example: 'task_id' in RunResult.model_json_schema()['properties'].
+    """
+    assert "task_id" in RunResult.model_json_schema()["properties"]
+    assert "task_id" not in RunResult.model_json_schema().get("required", [])
+    assert "sessions_path" in IterationArtifacts.model_json_schema()["properties"]
+    assert "sessions_path" not in IterationArtifacts.model_json_schema().get("required", [])
+    assert "plan_sessions_path" in ArtifactIndex.model_json_schema()["properties"]
+    assert "plan_sessions_path" not in ArtifactIndex.model_json_schema().get("required", [])

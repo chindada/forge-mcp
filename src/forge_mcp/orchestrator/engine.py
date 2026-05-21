@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mcp.server.experimental.task_context import ServerTaskContext
 
 from ..artifacts import atomic_write_text, create_run_dir, prune_old_runs
 from ..doctor import disk_space_warn_if_low
@@ -54,6 +58,25 @@ def _reconstruct_fingerprints(run_dir: Path, point: ResumePoint) -> list[frozens
             continue
         history.append(fingerprint_gaps(gaps))
     return history
+
+
+def _accepts_task_kw(func: Any) -> bool:
+    """Return True when a callable accepts the task keyword (§C5).
+
+    Design: production phase helpers accept task, but focused tests monkeypatch
+        older helper fakes; this shim preserves test isolation without changing
+        runtime behavior.
+    Implementation: inspect the callable signature and treat **kwargs as
+        accepting task.
+    Example: if _accepts_task_kw(run_phases): pass task=self._task.
+    """
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return True
+    return "task" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def canonicalize_design(inputs: RunForgeInput, run_dir: Path, ledger: RunLedger) -> None:
@@ -121,20 +144,32 @@ class Orchestrator:
     """
 
     def __init__(
-        self, prepared: PreparedRun, inputs: RunForgeInput, config: Any, ctx: Any, drivers: Any
+        self,
+        prepared: PreparedRun,
+        inputs: RunForgeInput,
+        config: Any,
+        ctx: Any,
+        drivers: Any,
+        *,
+        task: ServerTaskContext | None = None,
+        task_id: str | None = None,
     ) -> None:
         """Store constructor dependencies for run().
 
         Design: preflight owns validation/lock acquisition; orchestrator accepts
-            the PreparedRun handoff and injected drivers.
-        Implementation: plain attribute storage, no IO until run().
-        Example: Orchestrator(prepared, inputs, config, ctx, drivers).
+            the PreparedRun handoff and injected drivers. §C5 adds optional task
+            context and id while preserving direct-call construction.
+        Implementation: plain attribute storage, no IO until run(). Store task
+            for Status/phase polling and task_id for terminal RunResult.
+        Example: Orchestrator(prepared, inputs, config, ctx, drivers, task=task).
         """
         self._prepared = prepared
         self._inputs = inputs
         self._config = config
         self._ctx = ctx
         self._drivers = drivers
+        self._task = task
+        self._task_id = task_id
 
     async def run(self) -> RunResult:
         """Execute the run and return a terminal RunResult.
@@ -166,7 +201,7 @@ class Orchestrator:
                 last_updated_at=started_at,
             ),
         )
-        status = Status(self._prepared.run_id, self._ctx, run_dir / "status.log")
+        status = Status(self._prepared.run_id, self._ctx, run_dir / "status.log", task=self._task)
         status.set_max_iterations(self._inputs.max_iterations)
         logger = logging.getLogger(f"forge_mcp.run.{self._prepared.run_id}")
         logger.propagate = False
@@ -209,20 +244,33 @@ class Orchestrator:
                         atomic_write_text(path, uncommitted)
                         ledger.git_uncommitted_path = str(path)
                     await warn_if_missing_target_agents_md(deps.target_dir, ledger, status)  # §8.1
-                    phase_task = run_phases(deps, sm, ledger, git_state)
+                    if _accepts_task_kw(run_phases):
+                        phase_task = run_phases(deps, sm, ledger, git_state, task=self._task)
+                    else:
+                        phase_task = run_phases(deps, sm, ledger, git_state)
                 else:
                     ledger.resumed_from_iteration = resume_point.last_completed_iteration
                     prepare_resume(run_dir, resume_point)
                     git_state_path = run_dir / "inputs" / "git-state.txt"
                     git_state = git_state_path.read_text() if git_state_path.exists() else None
                     ledger.gap_fingerprints = _reconstruct_fingerprints(run_dir, resume_point)
-                    phase_task = run_iteration_loop(
-                        deps,
-                        sm,
-                        ledger,
-                        git_state,
-                        start_iteration=resume_point.start_iteration,
-                    )
+                    if _accepts_task_kw(run_iteration_loop):
+                        phase_task = run_iteration_loop(
+                            deps,
+                            sm,
+                            ledger,
+                            git_state,
+                            start_iteration=resume_point.start_iteration,
+                            task=self._task,
+                        )
+                    else:
+                        phase_task = run_iteration_loop(
+                            deps,
+                            sm,
+                            ledger,
+                            git_state,
+                            start_iteration=resume_point.start_iteration,
+                        )
                 terminal_status, _ = await asyncio.wait_for(
                     phase_task, timeout=self._inputs.max_runtime_minutes * 60
                 )
@@ -255,6 +303,7 @@ class Orchestrator:
                 sm=sm,
                 ledger=ledger,
                 started_at=started_at,
+                task_id=self._task_id,
             )
             return result
         finally:

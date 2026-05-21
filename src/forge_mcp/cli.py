@@ -18,15 +18,28 @@ app = typer.Typer(no_args_is_help=True)
 
 @app.command()
 def serve() -> None:
-    """Boot the stdio MCP server (§14).
+    """Boot the stdio MCP server (§14, §C1.4).
 
-    Design: §5.1 exposes forge-mcp over FastMCP stdio transport.
-    Implementation: import server lazily and run FastMCP with stdio transport.
+    Design: §5.1 exposes forge-mcp over stdio; §C1.4 Path B uses the low-level
+        Server API because FastMCP lacks taskSupport exposure.
+    Implementation: import server lazily and run it over mcp.server.stdio.
     Example: forge serve.
     """
-    from .server import mcp
+    from mcp.server.stdio import stdio_server
 
-    mcp.run(transport="stdio")
+    from .server import server
+
+    async def _serve_async() -> None:
+        """Run the low-level Server on stdio (§C1.4).
+
+        Design: keep Typer's sync command while server.run is async.
+        Implementation: open stdio streams and pass initialization options.
+        Example: asyncio.run(_serve_async()).
+        """
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+
+    asyncio.run(_serve_async())
 
 
 @app.command()

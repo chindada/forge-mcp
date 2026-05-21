@@ -21,9 +21,9 @@ async def test_real_clis_tiny_feature_smoke() -> None:
         pytest.skip("real claude/codex CLIs unavailable")
     from mcp.shared.memory import create_connected_server_and_client_session
 
-    from forge_mcp.server import mcp
+    from forge_mcp.server import server
 
-    async with create_connected_server_and_client_session(mcp._mcp_server) as client:  # noqa: SLF001
+    async with create_connected_server_and_client_session(server) as client:
         result = await client.call_tool(
             "run_forge",
             {

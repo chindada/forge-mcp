@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..artifacts import atomic_write_text
+if TYPE_CHECKING:
+    from mcp.server.experimental.task_context import ServerTaskContext
+
+from ..artifacts import atomic_write_text, write_sessions_json
 from ..config import RunConfig
 from ..drivers._claude import is_transient_error as is_transient_claude
 from ..drivers._codex import is_transient_error as is_transient_codex
@@ -16,6 +20,7 @@ from ..models import EvalGap, EvalResult, RunForgeInput
 from ..runcontext import RunContext
 from ..verifier import render as render_verification
 from ..verifier import run_verification
+from . import lifecycle
 from .convergence import NON_PROGRESS_WINDOW, detect_non_progress, fingerprint_gaps
 from .handoff import validate_contract, validate_plan
 from .ledger import RunLedger
@@ -61,26 +66,60 @@ def _ctx(deps: PhaseDeps, iteration_n: int | None = None) -> RunContext:
     )
 
 
-async def run_plan_phase(deps: PhaseDeps, sm: RunStateMachine, ledger: RunLedger) -> None:
-    """Run the planner phase and record warnings/completion.
+def _utcnow_iso() -> str:
+    """Return a UTC timestamp for sessions.json records (§C2.4).
+
+    Design: sessions.json is append-free forensic data, so stable sortable UTC
+        strings make phase ordering easy to inspect.
+    Implementation: use timezone-aware datetime and replace the UTC offset with
+        Z for concise JSON artifacts.
+    Example: ts = _utcnow_iso().
+    """
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _session_id_from(driver: Any) -> str | None:
+    """Return a JSON-safe driver session id or None (§C2.5).
+
+    Design: sessions.json is fail-soft forensic data, so test doubles or SDK
+        drift must not make artifact writing fail.
+    Implementation: read last_session_id and keep only non-empty strings.
+    Example: sid = _session_id_from(deps.drivers.evaluator).
+    """
+    sid = getattr(driver, "last_session_id", None)
+    return sid if isinstance(sid, str) and sid else None
+
+
+async def run_plan_phase(
+    deps: PhaseDeps,
+    sm: RunStateMachine,
+    ledger: RunLedger,
+    *,
+    task: ServerTaskContext | None = None,
+) -> None:
+    """Run the planner phase and record warnings/completion (§C2.5, §C1.6).
 
     Design: §9.1 — planner predates the loop, so its RunContext carries
-        run_dir + Claude config only (no target_dir, no iteration_n).
+        run_dir + Claude config only (no target_dir, no iteration_n). §C2.5
+        writes plan/sessions.json before planned; §C1.6 polls task cancellation.
     Implementation: build the planner ctx with keyword args to avoid the §8.4
         field-order pitfall; append the literal 'plan' to completed_phases for
-        §7/§9.1 parity.
-    Example: await run_plan_phase(deps, sm, ledger).
+        §7/§9.1 parity and record the planner session id fail-soft.
+    Example: await run_plan_phase(deps, sm, ledger, task=None).
     """
     sm.transition("planning")
+    lifecycle.poll_task_cancellation(task)
     await deps.status.update(phase="planning", agent="planner", message="writing plan")
     planner_ctx = RunContext(
         run_dir=deps.run_dir,
         claude_config_dir=deps.config.claude_config_dir,
         claude_cli_path=deps.config.claude_cli_path,
     )
+    started = _utcnow_iso()
     warning = await with_transient_retry(
         lambda: deps.drivers.planner.write_plan(planner_ctx), is_transient=is_transient_claude
     )
+    completed = _utcnow_iso()
     if warning:
         ledger.warnings.append(warning)
     plan_path = deps.run_dir / "plan" / "plan.md"
@@ -97,7 +136,21 @@ async def run_plan_phase(deps: PhaseDeps, sm: RunStateMachine, ledger: RunLedger
             if problems:
                 ledger.warnings.append(f"plan.md degenerate after re-author: {problems}")
     ledger.completed_phases.append("plan")  # §7 / §9.1
+    write_sessions_json(
+        deps.run_dir / "plan" / "sessions.json",
+        iteration=0,
+        entries=[
+            {
+                "phase": "planning",
+                "sdk": "claude",
+                "session_id": _session_id_from(deps.drivers.planner),
+                "started_at": started,
+                "completed_at": completed,
+            }
+        ],
+    )
     sm.transition("planned")
+    lifecycle.poll_task_cancellation(task)
 
 
 async def _status_cb(deps: PhaseDeps, phase: str, iteration_n: int, **kwargs: Any) -> None:
@@ -374,16 +427,18 @@ async def run_iteration_loop(
     base_git: str | None,
     *,
     start_iteration: int = 1,
+    task: ServerTaskContext | None = None,
 ) -> tuple[str, int]:
-    """Run generator/evaluator/remediation iterations (§9.2).
+    """Run generator/evaluator/remediation iterations (§9.2, §C2.5).
 
     Design: preserves load-bearing ordering: triage before git-violation
         synthesis, two-conjunct completion, and iter_remediating transition
-        before remediation writing.
+        before remediation writing. §C2.5 writes sessions.json before iter_done
+        and after remediation; §C1.6 polls cancellation at phase boundaries.
     Implementation: for each iteration create contract if needed, run Codex,
         evaluate with schema retry, triage gaps, check git diff, and either
-        complete or write next contract.
-    Example: status, used = await run_iteration_loop(deps, sm, ledger, base_git).
+        complete or write next contract while collecting phase session entries.
+    Example: status, used = await run_iteration_loop(deps, sm, ledger, base_git, task=None).
     """
     design_text = (deps.run_dir / "inputs" / "design.md").read_text()
     # §H13/§H2.5: start==1 seeds plan.md; resume (start>1) re-authors from the
@@ -392,6 +447,7 @@ async def run_iteration_loop(
     for iteration_n in range(start_iteration, deps.inputs.max_iterations + 1):
         iteration_dir = deps.run_dir / f"iteration-{iteration_n}"
         iteration_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        phase_sessions: list[dict[str, Any]] = []
         sm.transition("iter_generating", iteration=iteration_n)
         await deps.status.update(
             phase="iter_generating",
@@ -400,6 +456,7 @@ async def run_iteration_loop(
             iteration=iteration_n,
         )
         gen_iteration = iteration_n
+        gen_started = _utcnow_iso()
         await with_phase_watchdog(
             with_transient_retry(
                 lambda gen_iteration=gen_iteration: _run_generator(deps, gen_iteration),
@@ -409,6 +466,16 @@ async def run_iteration_loop(
             phase="iter_generating",
             iteration=iteration_n,
         )
+        phase_sessions.append(
+            {
+                "phase": "iter_generating",
+                "sdk": "codex",
+                "session_id": _session_id_from(deps.drivers.generator),
+                "started_at": gen_started,
+                "completed_at": _utcnow_iso(),
+            }
+        )
+        lifecycle.poll_task_cancellation(task)
         if deps.inputs.verify_command:
             sm.transition("iter_verifying", iteration=iteration_n)
             await deps.status.update(
@@ -417,6 +484,7 @@ async def run_iteration_loop(
                 message="running verification command",
                 iteration=iteration_n,
             )
+            verify_started = _utcnow_iso()
             outcome = run_verification(
                 deps.target_dir,
                 deps.inputs.verify_command,
@@ -424,22 +492,44 @@ async def run_iteration_loop(
             )
             atomic_write_text(iteration_dir / "verify.txt", render_verification(outcome))
             ledger.last_verification = outcome
+            phase_sessions.append(
+                {
+                    "phase": "iter_verifying",
+                    "sdk": None,
+                    "session_id": None,
+                    "started_at": verify_started,
+                    "completed_at": _utcnow_iso(),
+                }
+            )
+            lifecycle.poll_task_cancellation(task)
         sm.transition("iter_evaluating", iteration=iteration_n)
         changed = changed_files(deps.target_dir)
         eval_iteration = iteration_n
         eval_changed = changed
+        eval_started = _utcnow_iso()
         er = await with_transient_retry(
             lambda eval_iteration=eval_iteration, eval_changed=eval_changed: with_schema_retry(
                 _make_eval_call(deps, eval_iteration, eval_changed)
             ),
             is_transient=is_transient_claude,
         )
+        phase_sessions.append(
+            {
+                "phase": "iter_evaluating",
+                "sdk": "claude",
+                "session_id": _session_id_from(deps.drivers.evaluator),
+                "started_at": eval_started,
+                "completed_at": _utcnow_iso(),
+            }
+        )
+        lifecycle.poll_task_cancellation(task)
         triage_ran = False
         eval_for_loop = er
         if er.gaps:
             sm.transition("iter_triaging", iteration=iteration_n)
             triage_iteration = iteration_n
             triage_er = er
+            triage_started = _utcnow_iso()
             triage_result = await with_transient_retry(
                 lambda triage_iteration=triage_iteration, triage_er=triage_er: with_schema_retry(
                     _make_triage_call(deps, triage_iteration, triage_er)
@@ -447,6 +537,16 @@ async def run_iteration_loop(
                 is_transient=is_transient_claude,
             )
             triage_ran = True
+            phase_sessions.append(
+                {
+                    "phase": "iter_triaging",
+                    "sdk": "claude",
+                    "session_id": _session_id_from(deps.drivers.evaluator),
+                    "started_at": triage_started,
+                    "completed_at": _utcnow_iso(),
+                }
+            )
+            lifecycle.poll_task_cancellation(task)
             outcome = classify_gaps(er, triage_result, design_text, iteration_n)
             ledger.design_flaw_gaps.extend(outcome.design_flaws)
             ledger.warnings.extend(outcome.warnings)
@@ -494,7 +594,11 @@ async def run_iteration_loop(
                     suggested_fix="make the verification command pass; see iteration-N/verify.txt",
                 )
             )
+        write_sessions_json(
+            iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
+        )
         sm.transition("iter_done", iteration=iteration_n, last_completed_iteration=iteration_n)
+        lifecycle.poll_task_cancellation(task)
         ledger.completed_phases.append(f"iter-{iteration_n}")  # §7 / §9.2 step 6
         ledger.gap_fingerprints.append(fingerprint_gaps(eval_for_loop.gaps))
         signal = detect_non_progress(ledger.gap_fingerprints, window=NON_PROGRESS_WINDOW)
@@ -514,6 +618,7 @@ async def run_iteration_loop(
             return ("incomplete", iteration_n)
         sm.transition("iter_remediating", iteration=iteration_n)
         next_n = iteration_n + 1
+        remediation_started = _utcnow_iso()
         warning = await with_transient_retry(
             _make_remediation_call(
                 deps,
@@ -574,19 +679,42 @@ async def run_iteration_loop(
                         ),
                     )
                 )
+        # §C2.2 — record AFTER any post-validation re-author so the captured
+        # session_id reflects the LAST successful remediation attempt, not the
+        # first. The runner overwrites last_session_id on each call; reading
+        # immediately before the final write captures the most recent id.
+        phase_sessions.append(
+            {
+                "phase": "iter_remediating",
+                "sdk": "claude",
+                "session_id": _session_id_from(deps.drivers.evaluator),
+                "started_at": remediation_started,
+                "completed_at": _utcnow_iso(),
+            }
+        )
+        write_sessions_json(
+            iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
+        )
+        lifecycle.poll_task_cancellation(task)
     return ("incomplete", deps.inputs.max_iterations)
 
 
 async def run_phases(
-    deps: PhaseDeps, sm: RunStateMachine, ledger: RunLedger, base_git: str | None
+    deps: PhaseDeps,
+    sm: RunStateMachine,
+    ledger: RunLedger,
+    base_git: str | None,
+    *,
+    task: ServerTaskContext | None = None,
 ) -> tuple[str, int]:
-    """Run plan phase followed by the iteration loop.
+    """Run plan phase followed by the iteration loop (§C1.6).
 
     Design: §8 keeps engine thin by delegating normal phase order to this
-        helper while lifecycle owns terminal exceptional paths.
+        helper while lifecycle owns terminal exceptional paths; §C1.6 threads
+        task cancellation polling into both sub-phases.
     Implementation: call run_plan_phase then run_iteration_loop with the same
-        dependencies and ledger.
-    Example: status, n = await run_phases(deps, sm, ledger, base_git).
+        dependencies, ledger, and task value.
+    Example: status, n = await run_phases(deps, sm, ledger, base_git, task=None).
     """
-    await run_plan_phase(deps, sm, ledger)
-    return await run_iteration_loop(deps, sm, ledger, base_git)
+    await run_plan_phase(deps, sm, ledger, task=task)
+    return await run_iteration_loop(deps, sm, ledger, base_git, task=task)

@@ -16,7 +16,13 @@ class RunForgeInput(BaseModel):
     """Validated input accepted by the `run_forge` MCP tool.
 
     Design: §6.2 keeps the design document source as an xor between a path and
-        inline content while bounding iteration and runtime caps.
+        inline content while bounding iteration and runtime caps. §C11 risk 7
+        adds a CALLER-side TTL recommendation: clients invoking run_forge via
+        `session.experimental.call_tool_as_task(...)` SHOULD set `ttl` (in
+        milliseconds) to at least `max_runtime_minutes * 60 * 1000`, otherwise
+        the server may age the task out before the run terminates. This is
+        intentionally NOT enforced server-side — TTL semantics are governed by
+        the caller's clock, not the server's.
     Implementation: extra fields are forbidden, bounds live on annotated
         fields, and a model validator enforces the document-source xor.
     Example: RunForgeInput(target_dir='/repo', design_doc_content='Build it').
@@ -206,6 +212,9 @@ class IterationArtifacts(BaseModel):
     triage_json_path: str | None = None
     git_violation_path: str | None = None
     verify_path: str | None = None
+    sessions_path: str | None = Field(
+        default=None, description="Path to iteration-N/sessions.json when present (§C2)."
+    )
 
 
 class ArtifactIndex(BaseModel):
@@ -219,6 +228,9 @@ class ArtifactIndex(BaseModel):
     """
 
     plan_path: str
+    plan_sessions_path: str | None = Field(
+        default=None, description="Path to plan/sessions.json when present (§C2)."
+    )
     iterations: list[IterationArtifacts] = Field(default_factory=list)
     status_log_path: str
     state_json_path: str
@@ -257,6 +269,10 @@ class RunResult(BaseModel):
 
     status: Literal["completed", "incomplete", "failed"]
     run_id: str = Field(min_length=8, max_length=8, pattern=r"^[0-9a-f]{8}$")
+    task_id: str | None = Field(
+        default=None,
+        description="Best-effort MCP task id when run via call_tool_as_task (§C1.4, §C3).",
+    )
     run_dir: str
     iterations_used: int = Field(ge=0)
     runtime_seconds: int = Field(ge=0)

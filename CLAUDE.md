@@ -12,6 +12,15 @@ namespaces (cite as e.g. `# §H1 verify gate`, `# §H-Inv 3 resume append-only`)
 The base design doc still wins on anything it already specifies; the companion
 only adds new behavior.
 
+A second companion normative brief, the **long-run continuity** doc, adds
+client-disconnect resilience and session-id recording in its own `§C*`,
+`C-Invariant N`, and `C-Decision N` namespaces (cite as e.g. `# §C1 task
+bridge`, `# §C-Inv 1 single cancellation owner`). The base doc still wins on
+anything it specifies; the hardening doc still wins on anything it specifies;
+this brief only adds new behavior. The §18 schema-pin tests now derive from
+`RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` through
+the low-level `Server` registration, not FastMCP `@mcp.tool` introspection.
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is

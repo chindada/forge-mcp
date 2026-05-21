@@ -6,13 +6,48 @@ import asyncio
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..artifacts import atomic_write_text
 from ..models import EvalGap, EvalResult
 from .caps import GAP_LIST_CAP, build_gap_overflow, split_warnings
 from .ledger import RunLedger
 from .statemachine import RunStateMachine
+
+
+class TaskCancellationProbe(Protocol):
+    """Duck-typed task cancellation source (§C1.6).
+
+    Design: lifecycle only reads is_cancelled so it should not depend on the
+        concrete experimental MCP context at runtime.
+    Implementation: Protocol supports fakes and ServerTaskContext alike.
+    Example: if probe.is_cancelled: raise CancelledError.
+    """
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation has been requested.
+
+        Design: models ServerTaskContext.is_cancelled as a read-only property.
+        Implementation: concrete task contexts compute the current task state.
+        Example: if probe.is_cancelled: ...
+        """
+        ...
+
+
+def poll_task_cancellation(task: TaskCancellationProbe | None) -> None:
+    """Raise CancelledError when a live MCP task is cancelled (§C1.6).
+
+    Design: C-Inv 1 centralizes the bridge from task.is_cancelled to the
+        existing §8.5 cancellation path; this helper never writes state.
+    Implementation: duck-type task.is_cancelled and raise asyncio.CancelledError
+        with a stable forensic message only when true.
+    Example: poll_task_cancellation(task) after a phase boundary.
+    """
+    if task is None:
+        return
+    if getattr(task, "is_cancelled", False):
+        raise asyncio.CancelledError("client cancelled via cancel_task")
 
 
 async def close_drivers(deps: Any) -> None:

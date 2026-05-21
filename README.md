@@ -72,6 +72,24 @@ Five environment variables control behavior:
 
 Pass variables via `claude mcp add -e KEY=value` or set in the parent shell.
 
+### Task-mode callers (`call_tool_as_task`)
+
+When invoking `run_forge` via `session.experimental.call_tool_as_task(...)`
+(MCP task augmentation, §C1.4), set the `ttl` parameter to at least
+`max_runtime_minutes * 60 * 1000` milliseconds. The server does not enforce a
+floor — TTL semantics are governed by the caller's clock — so a too-short TTL
+will cause the server to age the task out before the run terminates. See
+§C11 risk 7 in the long-run continuity design brief.
+
+```python
+ttl_ms = max_runtime_minutes * 60 * 1000
+await session.experimental.call_tool_as_task(
+    "run_forge",
+    {"target_dir": "/repo", "design_doc_content": "...", "max_runtime_minutes": 60},
+    ttl=ttl_ms,
+)
+```
+
 ## Security
 
 The `run.log` file may contain sensitive prompt/output snippets and is written with mode `0600`. It never crosses the tool boundary — `RunResult.artifacts` deliberately omits its path.

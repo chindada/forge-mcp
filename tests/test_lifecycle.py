@@ -428,3 +428,31 @@ async def test_emit_terminal_status_emits_one_phase_update() -> None:
     _, kwargs = status.update.await_args
     assert kwargs["phase"] == "completed"
     assert kwargs["kind"] == "phase"
+
+
+def test_poll_task_cancellation_raises_cancelled_error() -> None:
+    """poll_task_cancellation raises only when task.is_cancelled is true (§C1.6).
+
+    Design: C-Inv 1 keeps cancellation forensics owned by handle_cancellation.
+    Implementation: pass simple duck-typed task objects.
+    Example: task.is_cancelled=True raises CancelledError.
+    """
+    import asyncio
+
+    import pytest
+
+    from forge_mcp.orchestrator.lifecycle import poll_task_cancellation
+
+    class _Task:
+        """Task double exposing is_cancelled.
+
+        Design: lifecycle polling is intentionally duck-typed.
+        Implementation: class attribute is enough for getattr.
+        Example: _Task.is_cancelled is True.
+        """
+
+        is_cancelled = True
+
+    poll_task_cancellation(None)
+    with pytest.raises(asyncio.CancelledError):
+        poll_task_cancellation(_Task())

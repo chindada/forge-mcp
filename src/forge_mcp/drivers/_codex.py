@@ -36,13 +36,25 @@ class CodexSession(Protocol):
 
 @runtime_checkable
 class CodexRunner(Protocol):
-    """Protocol seam for Codex SDK usage (§5.2).
+    """Protocol seam for Codex SDK usage (§5.2, §C2).
 
     Design: concrete generator code depends on this seam rather than direct SDK
-        imports, preserving a single mocking point.
-    Implementation: one `turn` method and lifecycle close/terminate hooks.
-    Example: await runner.turn(instructions='go', ...).
+        imports, preserving a single mocking point. §C2 adds capture-only
+        exposure of the durable Codex thread id.
+    Implementation: one `turn` method, lifecycle hooks, and fail-soft
+        last_thread_id when the SDK surface lacks `.id`.
+    Example: await runner.turn(instructions='go', ...); tid = runner.last_thread_id.
     """
+
+    @property
+    def last_thread_id(self) -> str | None:
+        """Expose the most recently retained thread id (§C2.2).
+
+        Design: Protocol models a read-only fail-soft forensic property.
+        Implementation: concrete runners may compute it from SDK thread state.
+        Example: tid = runner.last_thread_id.
+        """
+        ...
 
     async def turn(
         self,
@@ -205,6 +217,20 @@ class CodexRunnerImpl:
         Example: runner = CodexRunnerImpl().
         """
         self._session: Any | None = None
+        self._thread: Any | None = None
+
+    @property
+    def last_thread_id(self) -> str | None:
+        """Return the retained AsyncThread.id when available (§C2.2).
+
+        Design: Codex thread ids are forensic-only in this round and must never
+            terminate a run if the pinned SDK changes shape.
+        Implementation: getattr with a None default plus str validation keeps
+            malformed values out of sessions.json.
+        Example: tid = runner.last_thread_id.
+        """
+        tid = getattr(self._thread, "id", None)
+        return tid if isinstance(tid, str) and tid else None
 
     async def turn(
         self,
@@ -230,7 +256,9 @@ class CodexRunnerImpl:
             approval_mode=approval_mode,  # type: ignore[call-arg]
             env=env,  # type: ignore[call-arg]
         )
-        thread = await codex.threads.create()  # type: ignore[attr-defined]
+        self._thread = await codex.threads.create()  # type: ignore[attr-defined]
+        thread = self._thread
+        assert thread is not None
         self._session = await thread.runs.create(developer_instructions=instructions)
         return cast(CodexSession, self._session)
 

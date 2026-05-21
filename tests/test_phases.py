@@ -125,6 +125,20 @@ def _gap(title: str) -> EvalGap:
     )
 
 
+def _read_sessions(iteration_dir: Path) -> dict:
+    """Load iteration-N/sessions.json as a dict for matrix assertions.
+
+    Design: §C8 matrix tests inspect both phase entries and write cadence; a
+        shared loader keeps each test focused on its specific configuration.
+    Implementation: read the file as text and parse JSON; missing file raises
+        FileNotFoundError so a forgotten write fails the test loudly.
+    Example: payload = _read_sessions(deps.run_dir / 'iteration-1').
+    """
+    import json
+
+    return json.loads((iteration_dir / "sessions.json").read_text())
+
+
 async def test_no_gaps_completes_iteration_one(tmp_path: Path) -> None:
     """Pin a forge-mcp behavior.
 
@@ -921,3 +935,320 @@ async def test_resume_reauthors_when_archived_contract_degenerate(tmp_path: Path
     await _seed_start_contract(deps, ledger, 2)
 
     assert evaluator.remediation_calls == 1
+
+
+async def test_iter_remediating_records_last_successful_remediation_session_id(
+    tmp_path: Path,
+) -> None:
+    """Pin §C2.2 — iter_remediating sessions.json reflects the LAST successful attempt.
+
+    Design: §C2.2 says retries / validate-and-reauthor cycles overwrite
+        last_session_id per attempt and the recorded id MUST be the last
+        successful one (forensic value of resuming the *most recent* session).
+        A degenerate-then-valid contract reauthor exercises the second
+        remediation call.
+    Implementation: configure FakeSessionEvaluator with remediation_ids=
+        ['sess_first', 'sess_second']; arrange a degenerate first contract so
+        validate_contract triggers the re-author path; assert the
+        iter_remediating entry in iteration-N/sessions.json has session_id
+        equal to 'sess_second'.
+    Example: pytest tests/test_phases.py -k records_last_successful -v.
+    """
+    import json
+
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    class _DegenerateThenValidEvaluator(FakeSessionEvaluator):
+        """Evaluator double whose first remediation writes a degenerate contract.
+
+        Design: §H6 validate_contract treats an empty contract as degenerate, so
+            the orchestrator runs a second remediation call which must overwrite
+            the recorded session id.
+        Implementation: track an attempt counter inside write_remediation; first
+            attempt writes an empty contract.md, second writes a well-formed one
+            with a heading and an acceptance bullet.
+        Example: _DegenerateThenValidEvaluator([er], remediation_ids=['a','b']).
+        """
+
+        def __init__(self, plan, *, remediation_ids):
+            """Wire the per-iteration remediation id rotation.
+
+            Design: parity with FakeSessionEvaluator init plus an attempt counter.
+            Implementation: delegate to super(), then add the counter attribute.
+            Example: _DegenerateThenValidEvaluator([er], remediation_ids=['a','b']).
+            """
+            super().__init__(plan, remediation_ids=remediation_ids)
+            self._attempt = 0
+
+        async def write_remediation(self, ctx, *, next_iteration_n, eval_result, pivot=False):
+            """Write a degenerate contract on attempt 1, well-formed on attempt 2.
+
+            Design: drives the §H6 re-author branch exactly once.
+            Implementation: rotate the session id, increment the counter, then
+                write contract.md content matching the attempt number.
+            Example: await evaluator.write_remediation(ctx, next_iteration_n=2, eval_result=er).
+            """
+            self._rotate(self._remediation_ids)
+            self.remediation_calls += 1
+            self._attempt += 1
+            next_dir = ctx.run_dir / f"iteration-{next_iteration_n}"
+            next_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if self._attempt == 1:
+                (next_dir / "contract.md").write_text("")
+            else:
+                (next_dir / "contract.md").write_text(
+                    "# Remediation contract\n\n"
+                    "Implement the missing behavior and verify it with a focused test.\n"
+                    "## Acceptance criteria\n- [ ] Pass tests and update sessions.json.\n"
+                )
+            return None
+
+    gap = _gap("force remediation path")
+    evaluator = _DegenerateThenValidEvaluator(
+        [
+            EvalResult(no_gaps=False, gaps=[gap], summary="needs work"),
+            EvalResult(no_gaps=True, gaps=[], summary="ok"),
+        ],
+        remediation_ids=["sess_first", "sess_second"],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=2)
+    deps.drivers.planner = FakeSessionPlanner(session_id="sess_plan")
+    deps.drivers.generator = FakeSessionGenerator(session_id="thr_gen")
+    status, used = await run_phases(deps, sm, ledger, None)
+    assert (status, used) == ("completed", 2)
+    payload = json.loads((deps.run_dir / "iteration-1" / "sessions.json").read_text())
+    rem = next(p for p in payload["phases"] if p["phase"] == "iter_remediating")
+    assert rem["session_id"] == "sess_second", payload
+
+
+async def test_sessions_matrix_verify_set_with_remediation_writes_five_entries(
+    tmp_path: Path,
+) -> None:
+    """Pin §C8 matrix row 1: verify_command set + gaps + remediation → 5 entries.
+
+    Design: §C2.5 / C-Inv 4 — when an iteration runs through iter_remediating,
+        sessions.json is written exactly twice (once before iter_done with 4
+        entries, once at end of iter_remediating with 5). The final file must
+        carry all five phases in order: iter_generating, iter_verifying,
+        iter_evaluating, iter_triaging, iter_remediating.
+    Implementation: drive run_iteration_loop with FakeSessionEvaluator returning
+        gaps then no-gaps; verify_command='true' makes iter_verifying run; assert
+        the final on-disk payload shape and ordering.
+    Example: pytest tests/test_phases.py -k verify_set_with_remediation -v.
+    """
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    evaluator = FakeSessionEvaluator(
+        [
+            EvalResult(no_gaps=False, gaps=[_gap("g")], summary="bad"),
+            EvalResult(no_gaps=True, gaps=[], summary="ok"),
+        ],
+        evaluate_ids=["sess_eval_1", "sess_eval_2"],
+        triage_ids=["sess_triage_1"],
+        remediation_ids=["sess_rem_1"],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=2)
+    deps.drivers.planner = FakeSessionPlanner(session_id="sess_plan")
+    deps.drivers.generator = FakeSessionGenerator(session_id="thr_gen")
+    object.__setattr__(deps, "inputs", deps.inputs.model_copy(update={"verify_command": "true"}))
+    status, used = await run_phases(deps, sm, ledger, None)
+    assert (status, used) == ("completed", 2)
+    payload = _read_sessions(deps.run_dir / "iteration-1")
+    assert payload["iteration"] == 1
+    phases = [p["phase"] for p in payload["phases"]]
+    assert phases == [
+        "iter_generating",
+        "iter_verifying",
+        "iter_evaluating",
+        "iter_triaging",
+        "iter_remediating",
+    ]
+    sdk_map = {p["phase"]: p["sdk"] for p in payload["phases"]}
+    assert sdk_map["iter_generating"] == "codex"
+    assert sdk_map["iter_verifying"] is None
+    assert sdk_map["iter_evaluating"] == "claude"
+    assert sdk_map["iter_triaging"] == "claude"
+    assert sdk_map["iter_remediating"] == "claude"
+
+
+async def test_sessions_matrix_verify_set_no_gaps_writes_three_entries(tmp_path: Path) -> None:
+    """Pin §C8 matrix row 2: verify_command set + no gaps → 3 entries (terminal).
+
+    Design: §C2.5 — a terminal iteration writes sessions.json exactly once
+        before sm.transition('iter_done') with the phases that actually ran.
+        With no gaps no iter_triaging entry; with no remediation no iter_remediating.
+    Implementation: single no-gaps evaluator return + verify_command='true';
+        assert exactly three entries in the iteration-1 file.
+    Example: pytest tests/test_phases.py -k verify_set_no_gaps -v.
+    """
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    evaluator = FakeSessionEvaluator(
+        [EvalResult(no_gaps=True, gaps=[], summary="ok")],
+        evaluate_ids=["sess_eval_1"],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=1)
+    deps.drivers.planner = FakeSessionPlanner(session_id="sess_plan")
+    deps.drivers.generator = FakeSessionGenerator(session_id="thr_gen")
+    object.__setattr__(deps, "inputs", deps.inputs.model_copy(update={"verify_command": "true"}))
+    status, used = await run_phases(deps, sm, ledger, None)
+    assert (status, used) == ("completed", 1)
+    payload = _read_sessions(deps.run_dir / "iteration-1")
+    phases = [p["phase"] for p in payload["phases"]]
+    assert phases == ["iter_generating", "iter_verifying", "iter_evaluating"]
+
+
+async def test_sessions_matrix_verify_unset_with_remediation_writes_four_entries(
+    tmp_path: Path,
+) -> None:
+    """Pin §C8 matrix row 3: verify_command unset + gaps + remediation → 4 entries.
+
+    Design: §C2.5 / C-Inv 4 — verify_command None suppresses iter_verifying; the
+        remediation branch still writes iter_remediating, giving four entries:
+        iter_generating, iter_evaluating, iter_triaging, iter_remediating.
+    Implementation: drive run_iteration_loop with FakeSessionEvaluator returning
+        gaps then no-gaps; leave verify_command=None (default); assert the
+        on-disk payload shape and ordering.
+    Example: pytest tests/test_phases.py -k verify_unset_with_remediation -v.
+    """
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    evaluator = FakeSessionEvaluator(
+        [
+            EvalResult(no_gaps=False, gaps=[_gap("g")], summary="bad"),
+            EvalResult(no_gaps=True, gaps=[], summary="ok"),
+        ],
+        evaluate_ids=["sess_eval_1", "sess_eval_2"],
+        triage_ids=["sess_triage_1"],
+        remediation_ids=["sess_rem_1"],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=2)
+    deps.drivers.planner = FakeSessionPlanner(session_id="sess_plan")
+    deps.drivers.generator = FakeSessionGenerator(session_id="thr_gen")
+    status, used = await run_phases(deps, sm, ledger, None)
+    assert (status, used) == ("completed", 2)
+    payload = _read_sessions(deps.run_dir / "iteration-1")
+    phases = [p["phase"] for p in payload["phases"]]
+    assert phases == [
+        "iter_generating",
+        "iter_evaluating",
+        "iter_triaging",
+        "iter_remediating",
+    ]
+
+
+async def test_sessions_matrix_verify_unset_no_gaps_writes_two_entries(tmp_path: Path) -> None:
+    """Pin §C8 matrix row 4: verify_command unset + no gaps → 2 entries (terminal).
+
+    Design: §C2.5 — the minimum-information terminal iteration writes exactly
+        two entries: iter_generating and iter_evaluating.
+    Implementation: single no-gaps evaluator return; default verify_command=None;
+        assert exactly two entries in the iteration-1 file.
+    Example: pytest tests/test_phases.py -k verify_unset_no_gaps -v.
+    """
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    evaluator = FakeSessionEvaluator(
+        [EvalResult(no_gaps=True, gaps=[], summary="ok")],
+        evaluate_ids=["sess_eval_1"],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=1)
+    deps.drivers.planner = FakeSessionPlanner(session_id="sess_plan")
+    deps.drivers.generator = FakeSessionGenerator(session_id="thr_gen")
+    status, used = await run_phases(deps, sm, ledger, None)
+    assert (status, used) == ("completed", 1)
+    payload = _read_sessions(deps.run_dir / "iteration-1")
+    phases = [p["phase"] for p in payload["phases"]]
+    assert phases == ["iter_generating", "iter_evaluating"]
+
+
+async def test_run_plan_phase_writes_sessions_json_before_planned(tmp_path: Path) -> None:
+    """Pin §C2.5 plan/sessions.json — single entry, written before sm.transition('planned').
+
+    Design: §C2.5 spells out the single planning entry shape and §C-Inv 4
+        requires the write to precede the planned-state transition so the
+        artifact is durable before the state change is visible.
+    Implementation: instrument sm.transition to snapshot whether
+        plan/sessions.json exists when 'planned' fires; assert single entry
+        with sdk=claude, the fake planner's session_id, started_at/completed_at
+        ISO Z strings; assert the file is 0600 on POSIX.
+    Example: pytest tests/test_phases.py -k sessions_json_before_planned -v.
+    """
+    import json
+    import os
+
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    evaluator = FakeSessionEvaluator(
+        [EvalResult(no_gaps=True, gaps=[], summary="ok")],
+        evaluate_ids=["sess_eval"],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=1)
+    deps.drivers.planner = FakeSessionPlanner(session_id="sess_plan_id")
+    deps.drivers.generator = FakeSessionGenerator(session_id="thr_gen")
+
+    sessions_path = deps.run_dir / "plan" / "sessions.json"
+    seen_before_planned: dict[str, bool] = {}
+    orig_transition = sm.transition
+
+    def transition(new_state, **fields):
+        """Snapshot sessions.json existence when sm.transition('planned') fires.
+
+        Design: C-Inv 4 requires the write to land before the state transition.
+        Implementation: capture existence as a boolean, then delegate.
+        Example: transition('planned') sets seen_before_planned['planned']=True.
+        """
+        if new_state == "planned":
+            seen_before_planned[new_state] = sessions_path.exists()
+        return orig_transition(new_state, **fields)
+
+    sm.transition = transition  # type: ignore[method-assign]
+
+    await run_plan_phase(deps, sm, ledger)
+
+    assert seen_before_planned.get("planned") is True
+    payload = json.loads(sessions_path.read_text())
+    assert payload["iteration"] == 0
+    assert len(payload["phases"]) == 1
+    entry = payload["phases"][0]
+    assert entry["phase"] == "planning"
+    assert entry["sdk"] == "claude"
+    assert entry["session_id"] == "sess_plan_id"
+    assert entry["started_at"].endswith("Z")
+    assert entry["completed_at"].endswith("Z")
+    if os.name == "posix":
+        mode = sessions_path.stat().st_mode & 0o777
+        assert mode == 0o600, oct(mode)
+
+
+async def test_sessions_json_records_null_when_driver_session_id_is_none(
+    tmp_path: Path,
+) -> None:
+    """Pin §C2.5 fail-soft — a driver with last_session_id=None yields null in sessions.json.
+
+    Design: §C11 risk 4 + C-Inv 3 — fail-soft id capture means a runner that
+        never emitted an init session_id (or SDK shape drift) MUST NOT crash
+        the run. The sessions.json entry stores JSON null for that phase.
+    Implementation: configure FakeSessionEvaluator/Generator/Planner with
+        session_id=None; run a one-iteration no-gaps loop; assert every
+        captured entry has session_id null and the run completes.
+    Example: pytest tests/test_phases.py -k records_null_when_driver_session_id_is_none -v.
+    """
+    import json
+
+    from fakes import FakeSessionEvaluator, FakeSessionGenerator, FakeSessionPlanner
+
+    evaluator = FakeSessionEvaluator(
+        [EvalResult(no_gaps=True, gaps=[], summary="ok")],
+        evaluate_ids=[None],
+    )
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=1)
+    deps.drivers.planner = FakeSessionPlanner(session_id=None)
+    deps.drivers.generator = FakeSessionGenerator(session_id=None)
+    status, used = await run_phases(deps, sm, ledger, None)
+    assert (status, used) == ("completed", 1)
+    iter_payload = json.loads((deps.run_dir / "iteration-1" / "sessions.json").read_text())
+    for entry in iter_payload["phases"]:
+        assert entry["session_id"] is None, entry
+    plan_payload = json.loads((deps.run_dir / "plan" / "sessions.json").read_text())
+    assert plan_payload["phases"][0]["session_id"] is None

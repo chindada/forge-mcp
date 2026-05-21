@@ -67,10 +67,16 @@ def _artifact_index(run_dir: Path, ledger: RunLedger) -> ArtifactIndex:
                 verify_path=str(iteration_dir / "verify.txt")
                 if (iteration_dir / "verify.txt").exists()
                 else None,
+                sessions_path=str(iteration_dir / "sessions.json")
+                if (iteration_dir / "sessions.json").exists()
+                else None,
             )
         )
     return ArtifactIndex(
         plan_path=str(run_dir / "plan" / "plan.md"),
+        plan_sessions_path=str(run_dir / "plan" / "sessions.json")
+        if (run_dir / "plan" / "sessions.json").exists()
+        else None,
         iterations=iterations,
         status_log_path=str(run_dir / "status.log"),
         state_json_path=str(run_dir / "state.json"),
@@ -92,14 +98,16 @@ def build_result(
     sm: RunStateMachine,
     ledger: RunLedger,
     started_at: datetime,
+    task_id: str | None = None,
 ) -> RunResult:
     """Build the terminal RunResult for completed/incomplete/failed runs.
 
     Design: §6.3 terminal states are normal returns; failed-only fields are set
         only for failed status and traceback is already truncated by lifecycle.
+        §C3 task_id is best-effort wire correlation, not ledger state.
     Implementation: compute runtime, discover artifacts numerically, and pass
         capped ledger lists into the Pydantic RunResult model.
-    Example: result = build_result(status='completed', ...).
+    Example: result = build_result(status='completed', task_id='t1', ...).
     """
     decided = ledger.decided_at or datetime.now(UTC)
     runtime_seconds = max(0, int((decided - started_at).total_seconds()))
@@ -123,6 +131,7 @@ def build_result(
     return RunResult(
         status=status,  # type: ignore[arg-type]
         run_id=run_id,
+        task_id=task_id,
         run_dir=str(run_dir),
         iterations_used=sm.iteration,
         runtime_seconds=runtime_seconds,

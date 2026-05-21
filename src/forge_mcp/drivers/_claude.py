@@ -50,14 +50,18 @@ class ClaudeTurn:
 
 @runtime_checkable
 class ClaudeRunner(Protocol):
-    """Protocol seam for the Claude SDK (§5.2).
+    """Protocol seam for the Claude SDK (§5.2, §C2).
 
     Design: concrete drivers depend only on this protocol, never SDK imports,
-        so tests can substitute small fakes.
+        so tests can substitute small fakes. §C2 adds a forensic-only
+        last_session_id read that does not carry live context across phases.
     Implementation: `run` returns drained content; `run_with_messages` also
-        returns raw messages for write-recovery helpers.
-    Example: isinstance(fake, ClaudeRunner) can validate fake runners.
+        returns raw messages for write-recovery helpers; implementations leave
+        last_session_id as None when the SDK omits it.
+    Example: await runner.run(...); sid = runner.last_session_id.
     """
+
+    last_session_id: str | None
 
     async def run(self, *, prompt: str, options: Any, system: str) -> StructuredResult: ...
     async def run_with_messages(self, *, prompt: str, options: Any, system: str) -> ClaudeTurn: ...
@@ -277,6 +281,38 @@ class ClaudeRunnerImpl:
         Example: runner = ClaudeRunnerImpl().
         """
         self._client: Any | None = None
+        self.last_session_id: str | None = None
+
+    def _reset_session_capture(self) -> None:
+        """Reset last_session_id at the start of a new Claude call (§C2.2).
+
+        Design: each public Claude turn creates a fresh SDK session, so the
+            exposed id must describe only the most recent call.
+        Implementation: assign None immediately before opening the stream.
+        Example: self._reset_session_capture(); await client.query(...).
+        """
+        self.last_session_id = None
+
+    def _absorb_system_message(self, msg: object) -> None:
+        """Capture session_id from an init SystemMessage fail-soft (§C2.2).
+
+        Design: §C11 risk 4 says missing or malformed SDK fields must not fail
+            the run; a null sessions.json entry is useful enough forensic data.
+        Implementation: support dict and object messages, require subtype init,
+            and ignore all exceptions.
+        Example: self._absorb_system_message({'subtype': 'init', 'session_id': 's'}).
+        """
+        try:
+            subtype = msg.get("subtype") if isinstance(msg, dict) else getattr(msg, "subtype", None)
+            if subtype != "init":
+                return
+            sid = (
+                msg.get("session_id") if isinstance(msg, dict) else getattr(msg, "session_id", None)
+            )
+            if isinstance(sid, str) and sid:
+                self.last_session_id = sid
+        except Exception:
+            return
 
     async def run(self, *, prompt: str, options: Any, system: str) -> StructuredResult:
         """Run one Claude turn and return the drained result.
@@ -300,10 +336,12 @@ class ClaudeRunnerImpl:
         from claude_agent_sdk import ClaudeSDKClient  # type: ignore
 
         messages: list[Any] = []
+        self._reset_session_capture()
         async with ClaudeSDKClient(options=options) as client:
             self._client = client
             await client.query(prompt=prompt)  # type: ignore[call-arg]
             async for msg in client.receive_messages():
+                self._absorb_system_message(msg)
                 messages.append(msg)
         self._client = None
         return ClaudeTurn(result=drain_text(messages), messages=messages)

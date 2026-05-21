@@ -144,3 +144,24 @@ def test_prune_keeps_newest_n_and_current(harness_dir) -> None:
     assert "dddddddd" in remaining and "cccccccc" in remaining
     assert "aaaaaaaa" in remaining
     assert "bbbbbbbb" not in remaining
+
+
+def test_write_sessions_json_creates_ordered_private_file(tmp_path):
+    """write_sessions_json records iteration and ordered phases (§C2.4).
+
+    Design: sessions.json preserves phase order as forensic data.
+    Implementation: write two entries and parse the resulting JSON.
+    Example: payload['phases'][0]['phase'] == 'iter_generating'.
+    """
+    import json
+    import os
+    import stat
+
+    from forge_mcp.artifacts import write_sessions_json
+
+    target = tmp_path / "sessions.json"
+    entries = [{"phase": "iter_generating"}, {"phase": "iter_evaluating"}]
+    write_sessions_json(target, 2, entries)
+    assert json.loads(target.read_text()) == {"iteration": 2, "phases": entries}
+    if os.name == "posix":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600

@@ -35,6 +35,18 @@ class PlannerDriver:
         """
         self._runner = runner
 
+    @property
+    def last_session_id(self) -> str | None:
+        """Expose the planner runner's last_session_id for artifacts (§C2.2).
+
+        Design: orchestrator code writes sessions.json without branching by
+            concrete SDK driver type.
+        Implementation: passthrough read with a None default for fakes and
+            fail-soft SDK capture paths.
+        Example: sid = driver.last_session_id after write_plan returns.
+        """
+        return getattr(self._runner, "last_session_id", None)
+
     async def write_plan(self, ctx: RunContext) -> str | None:
         """§10.3 write run_dir/plan/plan.md via Claude.
 

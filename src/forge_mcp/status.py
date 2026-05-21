@@ -6,7 +6,27 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+
+class TaskStatusSink(Protocol):
+    """Duck-typed task status sink (§C1.5).
+
+    Design: runtime values are MCP ServerTaskContext objects, but tests and
+        type-checking only need the update_status method.
+    Implementation: Protocol avoids a runtime mcp dependency in this module.
+    Example: await sink.update_status('line').
+    """
+
+    async def update_status(self, message: str) -> None:
+        """Update task-visible status text.
+
+        Design: mirrors ServerTaskContext.update_status without importing it.
+        Implementation: concrete sinks perform transport-specific fan-out.
+        Example: await task.update_status('running').
+        """
+        ...
+
 
 _PHASE_LABEL = {
     "planning": "plan",
@@ -35,19 +55,28 @@ class Status:
     Example: status = Status('abcd1234', ctx, run_dir / 'status.log').
     """
 
-    def __init__(self, run_id: str, ctx: Any, ndjson_path: Path) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        ctx: Any,
+        ndjson_path: Path,
+        *,
+        task: TaskStatusSink | None = None,
+    ) -> None:
         """Bind sink dependencies and initialize the status log.
 
         Design: the orchestrator constructs status only after the run dir
-            exists, avoiding deferred rebinding state.
+            exists, avoiding deferred rebinding state. §C1.5 adds an optional
+            MCP task sink while preserving direct-call behavior.
         Implementation: mkdir parent, touch the file, chmod private on POSIX,
-            and initialize progress counters.
-        Example: Status('abcd1234', ctx, Path('status.log')).
+            initialize progress counters, and store the optional task.
+        Example: Status('abcd1234', ctx, Path('status.log'), task=task).
         """
         self._run_id = run_id
         self._ctx = ctx
         self._path = ndjson_path
         self._progress = 0
+        self._task = task
         self._max_iters: int | None = None
         self._iteration: int | None = None
         self.last_update_ts: float = time.time()
@@ -74,16 +103,17 @@ class Status:
         kind: str = "phase",
         iteration: int | None = None,
     ) -> None:
-        """Emit one status event to MCP progress, info, and NDJSON (§12, §H4).
+        """Emit one status event to MCP progress, info, task, and NDJSON (§12).
 
         Design: §H4 uses real iteration/total progress when known and records
             last_update_ts so the advisory watchdog can distinguish silence
             from deep work; heartbeat events are advisory pings that do NOT
             refresh last_update_ts, so the hang clock measures genuine activity.
+            §C1.5 task.update_status is one additional best-effort sink.
         Implementation: track current iteration, skip progress/info fan-out for
             heartbeat pings, otherwise report progress with a real denominator,
-            suppress ctx failures, refresh last_update_ts for genuine activity,
-            and append NDJSON.
+            suppress ctx/task failures, refresh last_update_ts for genuine
+            activity, and append NDJSON.
         Example: await status.update(phase='planning', agent='planner', message='start').
         """
         if iteration is not None:
@@ -113,6 +143,11 @@ class Status:
                 await self._ctx.info(line)
             except Exception:
                 pass
+            if self._task is not None:
+                try:
+                    await self._task.update_status(line)
+                except Exception:
+                    pass
             # Only genuine phase/stream activity resets the hang clock (§H4.3).
             self.last_update_ts = time.time()
         record = {

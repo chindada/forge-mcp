@@ -33,6 +33,18 @@ class GeneratorDriver:
         """
         self._runner = runner
 
+    @property
+    def last_session_id(self) -> str | None:
+        """Expose Codex last_thread_id under the uniform driver name (§C2.2).
+
+        Design: sessions.json composition uses last_session_id for every phase
+            driver while the sdk field disambiguates Codex from Claude.
+        Implementation: read the Codex runner's fail-soft last_thread_id
+            property and default to None when absent.
+        Example: tid = driver.last_session_id after implement returns.
+        """
+        return getattr(self._runner, "last_thread_id", None)
+
     async def implement(
         self,
         ctx: RunContext,
