@@ -1,0 +1,152 @@
+"""Artifact file helpers and markdown rendering (§13, §10.4)."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from .models import EvalResult
+
+
+def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
+    """Atomically write text with private permissions.
+
+    Design: §13 requires sensitive artifacts to be private and durable enough
+        for file handoff without exposing partial writes.
+    Implementation: write a same-directory temp file, chmod it, and os.replace
+        it into place; cleanup removes temp files on error.
+    Example: atomic_write_text(Path('summary.md'), 'done').
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(content)
+        if os.name == "posix":
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        finally:
+            raise
+
+
+def atomic_write_json(path: Path, obj: Any, mode: int = 0o600) -> None:
+    """Atomically write JSON with deterministic formatting.
+
+    Design: §13 uses JSON artifacts as structured handoff files between fresh
+        agent sessions, so writes must be complete and private.
+    Implementation: json.dumps with indentation then delegate to the text
+        atomic writer for permission and replacement behavior.
+    Example: atomic_write_json(Path('eval.json'), {'no_gaps': True}).
+    """
+    atomic_write_text(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n", mode=mode)
+
+
+def create_run_dir(harness_dir: Path, run_id: str) -> Path:
+    """Create the initial run directory layout.
+
+    Design: §8.1 and §13 create only run, inputs, and plan directories before
+        iteration directories are needed.
+    Implementation: mkdir each directory with mode 0700 and chmod explicitly on
+        POSIX to avoid process umask surprises.
+    Example: run_dir = create_run_dir(Path('.harness'), 'abcd1234').
+    """
+    run_dir = harness_dir / run_id
+    for path in (run_dir, run_dir / "inputs", run_dir / "plan"):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix":
+            os.chmod(path, 0o700)
+    return run_dir
+
+
+def escape_md_inline(value: str) -> str:
+    """Escape markdown table-sensitive inline text.
+
+    Design: §10.4 pins backslash-before-pipe escaping so gap tables remain
+        parseable even when model output contains separators.
+    Implementation: replace backslashes first, then pipes, preserving all other
+        characters verbatim.
+    Example: escape_md_inline('a|b\\c') returns 'a\\|b\\\\c'.
+    """
+    return value.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def escape_md(value: str) -> str:
+    """Escape block markdown while guarding accidental headings/lists.
+
+    Design: §10.4 wants evaluator prose rendered as content, not interpreted as
+        table breaks, headings, blockquotes, or list structure.
+    Implementation: process line-by-line, prefix a backslash when the stripped
+        line begins with a markdown structural marker, then escape pipes.
+    Example: escape_md('# title') returns '\\# title'.
+    """
+    escaped: list[str] = []
+    for line in value.splitlines():
+        stripped = line.lstrip()
+        if (
+            stripped.startswith("#")
+            or stripped.startswith(">")
+            or stripped.startswith(("- ", "* ", "+ "))
+        ):
+            indent = line[: len(line) - len(stripped)]
+            line = f"{indent}\\{stripped}"
+        escaped.append(line.replace("|", "\\|"))
+    return "\n".join(escaped)
+
+
+def render_eval_md(eval_result: EvalResult, *, iteration_n: int) -> str:
+    """Render an EvalResult as a markdown artifact.
+
+    Design: §10.4 keeps a human-readable evaluator artifact while §15 removes
+        all legacy browser-probe reporting from the template.
+    Implementation: emit a header, no_gaps flag, summary, and either a table of
+        gaps or an explicit no-gaps marker.
+    Example: render_eval_md(EvalResult(no_gaps=True, summary='ok'), iteration_n=1).
+    """
+    lines = [
+        f"# Evaluation iteration {iteration_n}",
+        "",
+        f"**no_gaps:** `{str(eval_result.no_gaps).lower()}`",
+        "",
+        "## Summary",
+        "",
+        escape_md(eval_result.summary),
+        "",
+        "## Gaps",
+        "",
+    ]
+    if not eval_result.gaps:
+        lines.append("_no gaps reported_")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| Title | Severity | Design section | Current state | "
+            "Expected state | Suggested fix |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+    for gap in eval_result.gaps:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    escape_md_inline(gap.title),
+                    escape_md_inline(gap.severity),
+                    escape_md_inline(gap.design_doc_section),
+                    escape_md_inline(escape_md(gap.current_state)),
+                    escape_md_inline(escape_md(gap.expected_state)),
+                    escape_md_inline(escape_md(gap.suggested_fix)),
+                ]
+            )
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
