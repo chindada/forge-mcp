@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..artifacts import atomic_write_text
 from ..config import RunConfig
-from ..gitguard import capture_state, diff_state
+from ..drivers._claude import is_transient_error as is_transient_claude
+from ..drivers._codex import is_transient_error as is_transient_codex
+from ..gitguard import capture_state, changed_files, diff_state
 from ..models import EvalGap, EvalResult, RunForgeInput
 from ..runcontext import RunContext
+from ..verifier import render as render_verification
+from ..verifier import run_verification
+from .convergence import NON_PROGRESS_WINDOW, detect_non_progress, fingerprint_gaps
+from .handoff import validate_contract, validate_plan
 from .ledger import RunLedger
-from .retry import with_schema_retry
+from .retry import with_schema_retry, with_transient_retry
 from .statemachine import RunStateMachine
 from .triage import classify_gaps
+from .watchdog import with_phase_watchdog
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +78,24 @@ async def run_plan_phase(deps: PhaseDeps, sm: RunStateMachine, ledger: RunLedger
         claude_config_dir=deps.config.claude_config_dir,
         claude_cli_path=deps.config.claude_cli_path,
     )
-    warning = await deps.drivers.planner.write_plan(planner_ctx)
+    warning = await with_transient_retry(
+        lambda: deps.drivers.planner.write_plan(planner_ctx), is_transient=is_transient_claude
+    )
     if warning:
         ledger.warnings.append(warning)
+    plan_path = deps.run_dir / "plan" / "plan.md"
+    if plan_path.exists():
+        problems = validate_plan(plan_path.read_text())
+        if problems:
+            warning = await with_transient_retry(
+                lambda: deps.drivers.planner.write_plan(planner_ctx),
+                is_transient=is_transient_claude,
+            )
+            if warning:
+                ledger.warnings.append(warning)
+            problems = validate_plan(plan_path.read_text()) if plan_path.exists() else problems
+            if problems:
+                ledger.warnings.append(f"plan.md degenerate after re-author: {problems}")
     ledger.completed_phases.append("plan")  # §7 / §9.1
     sm.transition("planned")
 
@@ -108,22 +131,216 @@ def _make_status_cb(deps: PhaseDeps, phase: str, iteration_n: int) -> Any:
     return callback
 
 
-def _make_eval_call(deps: PhaseDeps, iteration_n: int) -> Any:
-    """Create a schema-retry callback for evaluation.
+async def _run_generator(deps: PhaseDeps, iteration_n: int) -> None:
+    """Invoke generator.implement with backward-compatible fake support (§H7).
 
-    Design: §11.6 expects a retry-flag callback without loop late binding.
-    Implementation: bind iteration_n in this helper and call evaluator.
+    Design: production drivers accept network_access, but existing test fakes
+        may model the earlier seam; hardening should not force unrelated tests
+        to update when behavior is otherwise identical.
+    Implementation: inspect the bound method signature and pass network_access
+        only when accepted; all other arguments match the production seam.
+    Example: await _run_generator(deps, 1).
+    """
+    implement = deps.drivers.generator.implement
+    kwargs: dict[str, Any] = {
+        "codex_bin": deps.config.codex_bin,
+        "status_cb": _make_status_cb(deps, "iter_generating", iteration_n),
+    }
+    if "network_access" in inspect.signature(implement).parameters:
+        kwargs["network_access"] = deps.inputs.network_access
+    await implement(_ctx(deps, iteration_n), **kwargs)
+
+
+async def _evaluate(
+    deps: PhaseDeps, iteration_n: int, retry: bool, changed: list[str] | None
+) -> EvalResult:
+    """Invoke evaluator.evaluate with backward-compatible fake support (§H8).
+
+    Design: production evaluation accepts changed_files, but older focused fakes
+        should continue to exercise the same loop behavior without that keyword.
+    Implementation: inspect the bound method and pass changed_files only when
+        accepted; retry is part of the original schema-retry seam.
+    Example: er = await _evaluate(deps, 1, False, ['x.py']).
+    """
+    evaluate = deps.drivers.evaluator.evaluate
+    kwargs: dict[str, Any] = {"retry": retry}
+    if "changed_files" in inspect.signature(evaluate).parameters:
+        kwargs["changed_files"] = changed
+    return await evaluate(_ctx(deps, iteration_n), **kwargs)
+
+
+async def _write_remediation(
+    deps: PhaseDeps,
+    iteration_n: int,
+    *,
+    next_iteration_n: int,
+    eval_result: EvalResult,
+    pivot: bool,
+) -> str | None:
+    """Invoke write_remediation with backward-compatible fake support (§H3).
+
+    Design: production remediation accepts pivot, but legacy tests may override
+        the method without that keyword while still validating loop behavior.
+    Implementation: inspect the bound method and pass pivot only when accepted.
+    Example: await _write_remediation(deps, 1, next_iteration_n=2, eval_result=er, pivot=False).
+    """
+    write_remediation = deps.drivers.evaluator.write_remediation
+    kwargs: dict[str, Any] = {"next_iteration_n": next_iteration_n, "eval_result": eval_result}
+    if "pivot" in inspect.signature(write_remediation).parameters:
+        kwargs["pivot"] = pivot
+    return await write_remediation(_ctx(deps, iteration_n), **kwargs)
+
+
+def _supports_hardened_remediation(deps: PhaseDeps) -> bool:
+    """Return True when the evaluator exposes the hardened remediation seam (§H6).
+
+    Design: §H6 validation is wired to the new pivot-capable remediation seam;
+        legacy focused fakes remain inert so old behavior tests still isolate
+        unrelated loop semantics.
+    Implementation: inspect the bound write_remediation signature for pivot.
+    Example: _supports_hardened_remediation(deps) is True for EvaluatorDriver.
+    """
+    return "pivot" in inspect.signature(deps.drivers.evaluator.write_remediation).parameters
+
+
+def _make_remediation_call(
+    deps: PhaseDeps,
+    iteration_n: int,
+    next_iteration_n: int,
+    eval_result: EvalResult,
+    pivot: bool,
+) -> Any:
+    """Bind remediation arguments for transient retry (§H3, §H5).
+
+    Design: retry must re-invoke the same remediation request without Python
+        loop-variable late binding hazards.
+    Implementation: copy arguments into an async zero-argument callback.
+    Example: await with_transient_retry(_make_remediation_call(...), is_transient=p).
+    """
+
+    async def call() -> str | None:
+        """Run one bound remediation attempt.
+
+        Design: each transient retry uses the same fresh RunContext values.
+        Implementation: delegate to _write_remediation with copied arguments.
+        Example: warning = await call().
+        """
+        return await _write_remediation(
+            deps,
+            iteration_n,
+            next_iteration_n=next_iteration_n,
+            eval_result=eval_result,
+            pivot=pivot,
+        )
+
+    return call
+
+
+async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iteration: int) -> None:
+    """Seed iteration-{start}/contract.md, branching on resume (§H13, §H2.5).
+
+    Design: §H13 seeds plan.md for start==1, but a resumed iteration (start>1)
+        must re-author from the prior remediation/eval reconstructed from
+        iteration-(start-1)/eval.json so accumulated direction is not lost;
+        seeding must never crash a resume, so unreadable artifacts fall back.
+    Implementation: skip if a contract already exists; for start==1 copy plan.md;
+        for start>1 first reuse the newest iteration-<start>.interrupted-*/contract.md
+        when it passes §H6 validate_contract, else reconstruct EvalResult from the
+        prior eval.json and call write_remediation, validating once via §H6 with a
+        single re-author, then fall back to plan.md (with a ledger warning) if still
+        degenerate.
+    Example: await _seed_start_contract(deps, ledger, 2).
+    """
+    contract = deps.run_dir / f"iteration-{start_iteration}" / "contract.md"
+    if contract.exists():
+        return
+    contract.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    plan_text = (deps.run_dir / "plan" / "plan.md").read_text()
+    if start_iteration == 1:
+        atomic_write_text(contract, plan_text)
+        return
+    # §H2.2 reuse durable contract: prepare_resume archived the in-flight
+    # iteration to iteration-<start>.interrupted-<ts>/; recover the prior run's
+    # remediation contract from the newest such archive before re-authoring.
+    archives = sorted(
+        deps.run_dir.glob(f"iteration-{start_iteration}.interrupted-*"),
+        key=lambda p: p.name,
+    )
+    if archives:
+        archived_contract = archives[-1] / "contract.md"
+        try:
+            archived_text = archived_contract.read_text()
+        except OSError:
+            archived_text = None
+        # §H2.5 reuse only a well-formed (§H6) durable contract; otherwise fall
+        # through to the re-author path below.
+        if archived_text is not None and not validate_contract(archived_text):
+            atomic_write_text(contract, archived_text)
+            ledger.warnings.append(
+                f"Resume reused durable contract for iteration-{start_iteration} from archive"
+            )
+            return
+    prior_eval_path = deps.run_dir / f"iteration-{start_iteration - 1}" / "eval.json"
+    try:
+        eval_result = EvalResult.model_validate_json(prior_eval_path.read_text())
+    except Exception:
+        # §H2.5: prior eval missing/corrupt — degrade to plan.md so resume proceeds.
+        atomic_write_text(contract, plan_text)
+        ledger.warnings.append(
+            f"Resume could not reconstruct eval for iteration-{start_iteration}; "
+            "seeded contract from plan.md"
+        )
+        return
+    await _write_remediation(
+        deps,
+        start_iteration - 1,
+        next_iteration_n=start_iteration,
+        eval_result=eval_result,
+        pivot=False,
+    )
+    if not _supports_hardened_remediation(deps):
+        return
+    problems = (
+        validate_contract(contract.read_text()) if contract.exists() else ["contract.md missing"]
+    )
+    if problems:
+        await _write_remediation(
+            deps,
+            start_iteration - 1,
+            next_iteration_n=start_iteration,
+            eval_result=eval_result,
+            pivot=False,
+        )
+        problems = (
+            validate_contract(contract.read_text())
+            if contract.exists()
+            else ["contract.md missing"]
+        )
+    if problems:
+        atomic_write_text(contract, plan_text)
+        ledger.warnings.append(
+            f"Resume re-author for iteration-{start_iteration} stayed degenerate "
+            f"({problems}); seeded contract from plan.md"
+        )
+
+
+def _make_eval_call(deps: PhaseDeps, iteration_n: int, changed: list[str] | None) -> Any:
+    """Create a schema-retry callback for evaluation (§11.6, §H8).
+
+    Design: §11.6 expects a retry-flag callback without loop late binding, and
+        §H8 adds a changed-files manifest as starting context.
+    Implementation: bind iteration_n and changed paths, then call evaluator.
     Example: await with_schema_retry(_make_eval_call(deps, 1)).
     """
 
     async def call(retry: bool) -> EvalResult:
-        """Run evaluator.evaluate with a retry flag.
+        """Run evaluator.evaluate with retry flag and changed-files manifest.
 
-        Design: each retry uses the same iteration context.
-        Implementation: build a fresh RunContext and pass retry through.
+        Design: each retry uses the same iteration context and manifest.
+        Implementation: build a fresh RunContext and pass retry/changed files.
         Example: await call(False).
         """
-        return await deps.drivers.evaluator.evaluate(_ctx(deps, iteration_n), retry=retry)
+        return await _evaluate(deps, iteration_n, retry, changed)
 
     return call
 
@@ -151,7 +368,12 @@ def _make_triage_call(deps: PhaseDeps, iteration_n: int, er: EvalResult) -> Any:
 
 
 async def run_iteration_loop(
-    deps: PhaseDeps, sm: RunStateMachine, ledger: RunLedger, base_git: str | None
+    deps: PhaseDeps,
+    sm: RunStateMachine,
+    ledger: RunLedger,
+    base_git: str | None,
+    *,
+    start_iteration: int = 1,
 ) -> tuple[str, int]:
     """Run generator/evaluator/remediation iterations (§9.2).
 
@@ -164,10 +386,10 @@ async def run_iteration_loop(
     Example: status, used = await run_iteration_loop(deps, sm, ledger, base_git).
     """
     design_text = (deps.run_dir / "inputs" / "design.md").read_text()
-    current_contract = deps.run_dir / "iteration-1" / "contract.md"
-    if not current_contract.exists():
-        atomic_write_text(current_contract, (deps.run_dir / "plan" / "plan.md").read_text())
-    for iteration_n in range(1, deps.inputs.max_iterations + 1):
+    # §H13/§H2.5: start==1 seeds plan.md; resume (start>1) re-authors from the
+    # prior remediation/eval so accumulated direction survives the restart.
+    await _seed_start_contract(deps, ledger, start_iteration)
+    for iteration_n in range(start_iteration, deps.inputs.max_iterations + 1):
         iteration_dir = deps.run_dir / f"iteration-{iteration_n}"
         iteration_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         sm.transition("iter_generating", iteration=iteration_n)
@@ -177,18 +399,53 @@ async def run_iteration_loop(
             message="implementing",
             iteration=iteration_n,
         )
-        await deps.drivers.generator.implement(
-            _ctx(deps, iteration_n),
-            codex_bin=deps.config.codex_bin,
-            status_cb=_make_status_cb(deps, "iter_generating", iteration_n),
+        gen_iteration = iteration_n
+        await with_phase_watchdog(
+            with_transient_retry(
+                lambda gen_iteration=gen_iteration: _run_generator(deps, gen_iteration),
+                is_transient=is_transient_codex,
+            ),
+            status=deps.status,
+            phase="iter_generating",
+            iteration=iteration_n,
         )
+        if deps.inputs.verify_command:
+            sm.transition("iter_verifying", iteration=iteration_n)
+            await deps.status.update(
+                phase="iter_verifying",
+                agent="orchestrator",
+                message="running verification command",
+                iteration=iteration_n,
+            )
+            outcome = run_verification(
+                deps.target_dir,
+                deps.inputs.verify_command,
+                timeout_seconds=deps.inputs.verify_timeout_seconds,
+            )
+            atomic_write_text(iteration_dir / "verify.txt", render_verification(outcome))
+            ledger.last_verification = outcome
         sm.transition("iter_evaluating", iteration=iteration_n)
-        er = await with_schema_retry(_make_eval_call(deps, iteration_n))
+        changed = changed_files(deps.target_dir)
+        eval_iteration = iteration_n
+        eval_changed = changed
+        er = await with_transient_retry(
+            lambda eval_iteration=eval_iteration, eval_changed=eval_changed: with_schema_retry(
+                _make_eval_call(deps, eval_iteration, eval_changed)
+            ),
+            is_transient=is_transient_claude,
+        )
         triage_ran = False
         eval_for_loop = er
         if er.gaps:
             sm.transition("iter_triaging", iteration=iteration_n)
-            triage_result = await with_schema_retry(_make_triage_call(deps, iteration_n, er))
+            triage_iteration = iteration_n
+            triage_er = er
+            triage_result = await with_transient_retry(
+                lambda triage_iteration=triage_iteration, triage_er=triage_er: with_schema_retry(
+                    _make_triage_call(deps, triage_iteration, triage_er)
+                ),
+                is_transient=is_transient_claude,
+            )
             triage_ran = True
             outcome = classify_gaps(er, triage_result, design_text, iteration_n)
             ledger.design_flaw_gaps.extend(outcome.design_flaws)
@@ -196,6 +453,14 @@ async def run_iteration_loop(
             eval_for_loop = EvalResult(
                 no_gaps=False, gaps=outcome.code_bug_gaps, summary=er.summary
             )
+        # §H6.3: drain gaps carried from the prior iteration (e.g. a degenerate
+        # remediation contract detected after that iteration's fingerprint ran)
+        # into this iteration's eval_for_loop, so they are fingerprinted, block a
+        # false "completed", land in unresolved_gaps, and feed the next contract —
+        # mirroring the git-violation / verify-fail synthesis placement below.
+        if ledger.carried_gaps:
+            eval_for_loop.gaps.extend(ledger.carried_gaps)
+            ledger.carried_gaps = []
         git_diff = diff_state(base_git, capture_state(deps.target_dir))
         if git_diff:
             violation_path = iteration_dir / "git-violation.txt"  # §13 artifact tree
@@ -210,24 +475,105 @@ async def run_iteration_loop(
                     suggested_fix="undo git mutations and rerun without prohibited git commands",
                 )
             )
-        sm.transition("iter_done", iteration=iteration_n)
+        if (
+            deps.inputs.verify_command
+            and ledger.last_verification is not None
+            and not ledger.last_verification.passed
+        ):
+            v = ledger.last_verification
+            eval_for_loop.gaps.append(
+                EvalGap(
+                    title="Verification command failed",
+                    severity="high",
+                    design_doc_section="§H1",
+                    current_state=(
+                        f"`{deps.inputs.verify_command}` exited {v.exit_code} "
+                        f"(timed_out={v.timed_out})"
+                    ),
+                    expected_state="verification command exits 0",
+                    suggested_fix="make the verification command pass; see iteration-N/verify.txt",
+                )
+            )
+        sm.transition("iter_done", iteration=iteration_n, last_completed_iteration=iteration_n)
         ledger.completed_phases.append(f"iter-{iteration_n}")  # §7 / §9.2 step 6
+        ledger.gap_fingerprints.append(fingerprint_gaps(eval_for_loop.gaps))
+        signal = detect_non_progress(ledger.gap_fingerprints, window=NON_PROGRESS_WINDOW)
         effective_no_gaps = (not eval_for_loop.gaps) and (er.no_gaps or triage_ran)
-        if effective_no_gaps:
+        verify_passed = deps.inputs.verify_command is None or bool(
+            ledger.last_verification and ledger.last_verification.passed
+        )
+        if effective_no_gaps and verify_passed:
             ledger.decided_at = None
             return ("completed", iteration_n)
+        if signal.kind == "break":  # §H13 step 7: break before the cap (H-Inv 4)
+            ledger.stop_reason = signal.reason
+            return ("incomplete", iteration_n)
         if iteration_n == deps.inputs.max_iterations:
             # §8.3: unresolved_gaps is filled by the engine from the latest
             # eval.json via collect_unresolved_gaps — not by the loop.
             return ("incomplete", iteration_n)
         sm.transition("iter_remediating", iteration=iteration_n)
-        warning = await deps.drivers.evaluator.write_remediation(
-            _ctx(deps, iteration_n),
-            next_iteration_n=iteration_n + 1,
-            eval_result=eval_for_loop,  # §9.2 step 8: triage-filtered subset
+        next_n = iteration_n + 1
+        warning = await with_transient_retry(
+            _make_remediation_call(
+                deps,
+                iteration_n,
+                next_n,
+                eval_for_loop,
+                signal.kind == "pivot",
+            ),
+            is_transient=is_transient_claude,
         )
         if warning:
             ledger.warnings.append(warning)
+        next_contract = deps.run_dir / f"iteration-{next_n}" / "contract.md"
+        problems: list[str] = []
+        if _supports_hardened_remediation(deps):
+            problems = (
+                validate_contract(next_contract.read_text())
+                if next_contract.exists()
+                else ["contract.md missing"]
+            )
+        if problems:
+            warning = await with_transient_retry(
+                _make_remediation_call(
+                    deps,
+                    iteration_n,
+                    next_n,
+                    eval_for_loop,
+                    signal.kind == "pivot",
+                ),
+                is_transient=is_transient_claude,
+            )
+            if warning:
+                ledger.warnings.append(warning)
+            problems = (
+                validate_contract(next_contract.read_text())
+                if next_contract.exists()
+                else ["contract.md missing"]
+            )
+            if problems:
+                ledger.warnings.append(
+                    f"Degenerate remediation contract for iteration-{next_n}: {problems}"
+                )
+                # §H6.3: park the synthesized gap on the ledger so it reaches the
+                # NEXT iteration's eval_for_loop (drained at the top of the loop) —
+                # appending to eval_for_loop here would be dead, since the fingerprint
+                # and remediation for this iteration already consumed it.
+                ledger.carried_gaps.append(
+                    EvalGap(
+                        title="Degenerate remediation contract",
+                        severity="high",
+                        design_doc_section="§H6",
+                        current_state=(
+                            f"contract.md for iteration-{next_n} failed validation: {problems}"
+                        ),
+                        expected_state="a well-formed remediation contract",
+                        suggested_fix=(
+                            "re-author a contract with a heading and actionable acceptance criteria"
+                        ),
+                    )
+                )
     return ("incomplete", deps.inputs.max_iterations)
 
 

@@ -21,6 +21,7 @@ class RunConfig:
     codex_bin: str = "codex"
     claude_config_dir: Path | None = None
     claude_cli_path: Path | None = None
+    keep_runs: int = 10
 
     @classmethod
     def from_env(cls) -> RunConfig:
@@ -38,4 +39,5 @@ class RunConfig:
             codex_bin=os.environ.get("FORGE_CODEX_BIN", "codex"),
             claude_config_dir=Path(claude_config_dir) if claude_config_dir else None,
             claude_cli_path=Path(claude_cli_path) if claude_cli_path else None,
+            keep_runs=int(os.environ.get("FORGE_KEEP_RUNS", "10")),
         )

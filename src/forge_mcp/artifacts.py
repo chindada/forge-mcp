@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,39 @@ def create_run_dir(harness_dir: Path, run_id: str) -> Path:
         if os.name == "posix":
             os.chmod(path, 0o700)
     return run_dir
+
+
+def prune_old_runs(harness_dir: Path, *, keep_last: int, current_run_id: str | None = None) -> None:
+    """Delete all but newest run dirs under harness_dir (§H9).
+
+    Design: §H9 bounds sensitive artifact retention while never deleting the
+        current or resumed run directory.
+    Implementation: sort 8-hex run dirs by state.json started_at with mtime
+        fallback, keep newest keep_last plus current, and rmtree the rest.
+    Example: prune_old_runs(Path('/repo/.harness'), keep_last=10).
+    """
+    from .state import read_state
+
+    if keep_last < 0:
+        return
+    entries: list[tuple[float, Path]] = []
+    for path in harness_dir.glob("*"):
+        if not path.is_dir() or len(path.name) != 8:
+            continue
+        try:
+            sort_key = read_state(path / "state.json").started_at.timestamp()
+        except Exception:
+            try:
+                sort_key = path.stat().st_mtime
+            except OSError:
+                sort_key = 0.0
+        entries.append((sort_key, path))
+    entries.sort(key=lambda item: item[0], reverse=True)
+    keep = {path for _, path in entries[:keep_last]}
+    for _, path in entries:
+        if path in keep or path.name == current_run_id:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def escape_md_inline(value: str) -> str:

@@ -241,6 +241,71 @@ async def test_engine_success_emits_terminal_status(tmp_path: Path, monkeypatch)
     assert records[-1]["phase"] == "completed"
 
 
+async def test_engine_resume_skips_planning_and_starts_at_anchor(tmp_path, monkeypatch) -> None:
+    """Pin §H2 engine resume: skip run_phases, start loop at L+1.
+
+    Design: a resumed run must not re-plan; it enters run_iteration_loop at
+        last_completed_iteration+1 so completed iterations stay append-only.
+    Implementation: build a PreparedRun carrying a ResumePoint, replace
+        run_phases with a sentinel that records if called, and capture the
+        start_iteration passed to a fake run_iteration_loop.
+    Example: await Orchestrator(prepared_with_resume, ...).run().
+    """
+    from forge_mcp.orchestrator.resume import ResumePoint
+
+    base = _prepared(tmp_path)
+    run_dir = base.harness_dir / base.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    point = ResumePoint(
+        run_id=base.run_id,
+        run_dir=run_dir,
+        last_completed_iteration=4,
+        start_iteration=5,
+    )
+    prepared = PreparedRun(
+        harness_dir=base.harness_dir,
+        lock=base.lock,
+        run_id=base.run_id,
+        config=base.config,
+        resume_point=point,
+    )
+
+    planning_called = {"run_phases": False}
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Fail the test if planning is reached on the resume path.
+
+        Design: resume must bypass run_phases entirely.
+        Implementation: record the call so the assertion can fail loudly.
+        Example: await fake_run_phases(...) should never run here.
+        """
+        planning_called["run_phases"] = True
+        return ("completed", 0)
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_iteration_loop(deps, sm, ledger, base_git, *, start_iteration=1):
+        """Capture the start_iteration the engine resumes at.
+
+        Design: pins resume entry at last_completed_iteration+1.
+        Implementation: record start_iteration and return a completed result.
+        Example: await fake_run_iteration_loop(..., start_iteration=5).
+        """
+        captured["start_iteration"] = start_iteration
+        ledger.completed_phases.append("iter-5")
+        return ("completed", 5)
+
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "run_iteration_loop", fake_run_iteration_loop)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+
+    await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+
+    assert planning_called["run_phases"] is False
+    assert captured["start_iteration"] == 5
+
+
 async def test_engine_cancellation_propagates_and_skips_result(tmp_path: Path, monkeypatch) -> None:
     """Pin §8.5 cancellation propagation through engine.run.
 

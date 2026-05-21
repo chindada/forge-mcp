@@ -39,14 +39,15 @@ class GeneratorDriver:
         *,
         codex_bin: str,
         status_cb: Callable[..., Awaitable[None]],
+        network_access: bool = True,
         env: dict | None = None,
     ) -> None:
         """Run one Codex implementation turn for the current iteration.
 
         Design: §9.2 generator reads iteration-N/contract.md and writes only to
             target_dir plus that iteration directory; no MCP servers are passed.
-        Implementation: construct seam configs, stream notable events to status,
-            and write a backstop summary if the agent omitted one.
+        Implementation: construct seam configs with §H7 network toggle, stream
+            notable events to status, and write a backstop summary if omitted.
         Example: await driver.implement(ctx, codex_bin='codex', status_cb=cb).
         """
         if ctx.iteration_n is None:
@@ -61,7 +62,9 @@ class GeneratorDriver:
             instructions=instructions,
             server_config=build_app_server_config(codex_bin=codex_bin, cwd=ctx.target_dir, env=env),
             sandbox_policy=sandbox_policy_for(
-                target_dir=ctx.target_dir, iteration_dir=iteration_dir
+                target_dir=ctx.target_dir,
+                iteration_dir=iteration_dir,
+                network_access=network_access,
             ),
             approval_mode=never_approval_mode(),
             env=env,

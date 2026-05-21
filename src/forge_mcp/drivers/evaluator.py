@@ -16,8 +16,15 @@ from ._claude import (
     ClaudeRunner,
     build_options,
     collect_writes_to_basename,
+    git_deny_hooks,
     maybe_append_retry_suffix,
     truncate_for_warning,
+)
+
+PIVOT_DIRECTIVE = (
+    "Prior iterations repeatedly produced the same gaps. Do NOT refine the "
+    "current approach — choose a different implementation strategy and state it "
+    "explicitly in the contract.\n\n"
 )
 
 
@@ -40,13 +47,15 @@ class EvaluatorDriver:
         """
         self._runner = runner
 
-    async def evaluate(self, ctx: RunContext, *, retry: bool = False) -> EvalResult:
+    async def evaluate(
+        self, ctx: RunContext, *, retry: bool = False, changed_files: list[str] | None = None
+    ) -> EvalResult:
         """Evaluate the current iteration and write eval artifacts.
 
         Design: §10.3 returns structured EvalResult with one orchestrator-owned
             schema retry on parse failure.
-        Implementation: run Claude with EVAL_RESULT_SCHEMA, parse once, validate
-            via Pydantic, then write eval.json and eval.md.
+        Implementation: run Claude with EVAL_RESULT_SCHEMA and optional §H8
+            changed-files manifest, parse once, then write eval artifacts.
         Example: er = await driver.evaluate(ctx, retry=False).
         """
         if ctx.iteration_n is None:
@@ -55,9 +64,14 @@ class EvaluatorDriver:
             raise RuntimeError("EvaluatorDriver.evaluate requires ctx.target_dir")
         iteration_dir = ctx.run_dir / f"iteration-{ctx.iteration_n}"
         system = (files("forge_mcp.prompts") / "evaluator_system.md").read_text()
-        prompt = maybe_append_retry_suffix(
-            "Evaluate target_dir against inputs/design.md and return EvalResult JSON.", retry
-        )
+        base_prompt = "Evaluate target_dir against inputs/design.md and return EvalResult JSON."
+        if changed_files:
+            manifest = "\n".join(f"- {path}" for path in changed_files)
+            base_prompt += (
+                "\n\nThe generator changed these files this iteration; review them first, "
+                f"then anything they affect:\n{manifest}"
+            )
+        prompt = maybe_append_retry_suffix(base_prompt, retry)
         result = await self._runner.run(
             prompt=prompt,
             options=build_options(
@@ -67,6 +81,7 @@ class EvaluatorDriver:
                 disallowed_tools=("Edit",),
                 cwd=iteration_dir,
                 cli_path=ctx.claude_cli_path,
+                hooks=git_deny_hooks(),
             ),
             system=system,
         )
@@ -106,6 +121,7 @@ class EvaluatorDriver:
                 disallowed_tools=("Edit", "Write"),
                 cwd=iteration_dir,
                 cli_path=ctx.claude_cli_path,
+                hooks=git_deny_hooks(),
             ),
             system=system,
         )
@@ -114,14 +130,19 @@ class EvaluatorDriver:
         return triage
 
     async def write_remediation(
-        self, ctx: RunContext, *, next_iteration_n: int, eval_result: EvalResult
+        self,
+        ctx: RunContext,
+        *,
+        next_iteration_n: int,
+        eval_result: EvalResult,
+        pivot: bool = False,
     ) -> str | None:
         """Write the next iteration contract.md via Claude.
 
         Design: §9.2 transitions to iter_remediating before this call so a
             failure is attributed to remediation, not evaluation.
-        Implementation: run Claude in the next iteration directory and recover
-            off-cwd Write tool content for contract.md when needed.
+        Implementation: run Claude in the next iteration directory, optionally
+            prepend the §H3 pivot directive, and recover Write tool content.
         Example: await driver.write_remediation(ctx, next_iteration_n=2, eval_result=er).
         """
         next_dir = ctx.run_dir / f"iteration-{next_iteration_n}"
@@ -129,6 +150,8 @@ class EvaluatorDriver:
         system = (files("forge_mcp.prompts") / "evaluator_remediation.md").read_text()
         prompt = "Write contract.md for the next generator iteration from this EvalResult:\n"
         prompt += eval_result.model_dump_json(indent=2)
+        if pivot:
+            prompt = PIVOT_DIRECTIVE + prompt
         turn = await self._runner.run_with_messages(
             prompt=prompt,
             options=build_options(
@@ -137,6 +160,7 @@ class EvaluatorDriver:
                 disallowed_tools=("Edit",),
                 cwd=next_dir,
                 cli_path=ctx.claude_cli_path,
+                hooks=git_deny_hooks(),
             ),
             system=system,
         )

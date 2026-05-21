@@ -74,3 +74,38 @@ def test_generator_implement_has_no_mcp_servers_param() -> None:
     from forge_mcp.drivers.generator import GeneratorDriver
 
     assert "mcp_servers" not in inspect.signature(GeneratorDriver.implement).parameters
+
+
+def test_sandbox_policy_network_access_flip(tmp_path) -> None:
+    """Pin §H7 network_access flips the Codex SandboxPolicy network toggle.
+
+    Design: §H7 makes network access a caller knob; False must disable network
+        in the produced policy while the default remains enabled.
+    Implementation: build policies with network_access False and True and read
+        the policy's network attribute (network_access or networkAccess).
+    Example: sandbox_policy_for(..., network_access=False) disables network.
+    """
+    import pytest as _pytest
+
+    codex_mod = _pytest.importorskip("openai_codex")
+    if not hasattr(codex_mod, "SandboxPolicy"):
+        _pytest.skip("openai_codex.SandboxPolicy is unavailable")
+    from forge_mcp.drivers._codex import sandbox_policy_for
+
+    def _net(policy) -> bool:
+        """Read the network-access flag under either SDK attribute name.
+
+        Design: SDK may expose snake_case or camelCase; the pin tolerates both.
+        Implementation: prefer network_access, fall back to networkAccess.
+        Example: _net(policy) is False for a network-disabled policy.
+        """
+        return bool(getattr(policy, "network_access", getattr(policy, "networkAccess", None)))
+
+    off = sandbox_policy_for(
+        target_dir=tmp_path, iteration_dir=tmp_path / "iter", network_access=False
+    )
+    on = sandbox_policy_for(
+        target_dir=tmp_path, iteration_dir=tmp_path / "iter", network_access=True
+    )
+    assert _net(off) is False
+    assert _net(on) is True

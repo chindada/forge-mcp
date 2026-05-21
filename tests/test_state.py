@@ -139,3 +139,72 @@ def test_runstate_defaults_timestamp(tmp_path):
     )
     assert state.last_updated_at.tzinfo is UTC
     assert state.last_updated_at <= datetime.now(UTC)
+
+
+def test_write_state_fsyncs_file(tmp_path, monkeypatch) -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    import os
+    from datetime import UTC, datetime
+
+    from forge_mcp import state as state_mod
+    from forge_mcp.state import RunState, write_state
+
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        """Record fsync calls then delegate to the real fsync.
+
+        Design: §H2 requires write_state to fsync the file before replace.
+        Implementation: append the fd and call through to os.fsync.
+        Example: spy(3) records and forwards.
+        """
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(state_mod.os, "fsync", spy)
+    now = datetime.now(UTC)
+    write_state(
+        tmp_path / "state.json",
+        RunState(
+            state="iter_done",
+            run_id="abcd1234",
+            target_dir=str(tmp_path),
+            iteration=1,
+            started_at=now,
+            last_completed_iteration=1,
+        ),
+    )
+    assert len(calls) >= 1
+
+
+def test_last_completed_iteration_round_trips(tmp_path) -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from datetime import UTC, datetime
+
+    from forge_mcp.state import RunState, read_state, write_state
+
+    now = datetime.now(UTC)
+    path = tmp_path / "state.json"
+    write_state(
+        path,
+        RunState(
+            state="iter_done",
+            run_id="abcd1234",
+            target_dir=str(tmp_path),
+            iteration=7,
+            started_at=now,
+            last_completed_iteration=7,
+        ),
+    )
+    assert read_state(path).last_completed_iteration == 7

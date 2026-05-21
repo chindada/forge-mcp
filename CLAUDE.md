@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `docs/specs/forge-mcp-design.md` is the **normative implementation brief** (~900 lines). Read the relevant section before any non-trivial decision; code comments cite it by section (e.g. `# §8.5 cancellation ordering`). When this file and the design doc disagree, the design doc wins.
 
+A companion normative brief, the **long-run hardening** doc, adds convergence
+and durability behavior in its own `§H*`, `H-Invariant N`, and `H-Decision N`
+namespaces (cite as e.g. `# §H1 verify gate`, `# §H-Inv 3 resume append-only`).
+The base design doc still wins on anything it already specifies; the companion
+only adds new behavior.
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is

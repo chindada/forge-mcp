@@ -93,3 +93,13 @@ End-to-end tests marked `@pytest.mark.slow` exercise the real `claude` and `code
 ## License
 
 MIT — see `LICENSE`.
+
+## Security model (§H7)
+
+The Generator executes arbitrary commands in `target_dir` for the duration of a
+run. `network_access` is a convenience knob (defaulting to `true` so dependency
+installation and `verify_command` work), **not a security boundary**. forge-mcp
+deliberately does not ship an in-process command denylist (it would be security
+theater for an agent that can author and execute scripts). The real isolation
+boundary is the deployer's OS/container sandbox: run forge-mcp against a
+disposable/scratch checkout inside an OS/container sandbox you control.

@@ -55,6 +55,10 @@ async def run_forge(
     design_doc_content: str | None = None,
     max_iterations: Annotated[int, Field(ge=1, le=100)] = 10,
     max_runtime_minutes: Annotated[int, Field(ge=1, le=24 * 60)] = 600,
+    verify_command: str | None = None,
+    verify_timeout_seconds: Annotated[int, Field(ge=1, le=24 * 60 * 60)] = 1800,
+    resume: bool = False,
+    network_access: bool = True,
     *,
     ctx: Context,
 ) -> RunResult:
@@ -74,6 +78,10 @@ async def run_forge(
             design_doc_content=design_doc_content,
             max_iterations=max_iterations,
             max_runtime_minutes=max_runtime_minutes,
+            verify_command=verify_command,
+            verify_timeout_seconds=verify_timeout_seconds,
+            resume=resume,
+            network_access=network_access,
         )
     except ValidationError as exc:
         raise McpError(ErrorData(code=INVALID_PARAMS, message=str(exc))) from exc

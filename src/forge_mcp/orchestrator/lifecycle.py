@@ -16,18 +16,24 @@ from .statemachine import RunStateMachine
 
 
 async def close_drivers(deps: Any) -> None:
-    """Close all phase drivers with a 5-second graceful budget.
+    """Close all phase drivers with interrupt and terminate escalation (§H10).
 
-    Design: §8.5 cancellation first asks SDK runners to close before escalating
-        to terminate so subprocesses do not outlive the run lock.
-    Implementation: inspect planner/generator/evaluator drivers and their
-        `_runner` attributes, wait_for aclose, then call terminate on timeout.
+    Design: §8.5 cancellation first asks SDK runners to close before escalating;
+        §H10 adds best-effort SDK-native interrupt before that close.
+    Implementation: inspect drivers and `_runner`, wait_for interrupt with 2s,
+        wait_for aclose with 5s, then call terminate on timeout/error.
     Example: await close_drivers(deps).
     """
     for driver in (deps.drivers.planner, deps.drivers.generator, deps.drivers.evaluator):
         runner = getattr(driver, "_runner", driver)
         if runner is None:
             continue
+        interrupt = getattr(runner, "interrupt", None)
+        if interrupt is not None:
+            try:
+                await asyncio.wait_for(interrupt(), timeout=2)
+            except Exception:
+                pass
         try:
             await asyncio.wait_for(runner.aclose(), timeout=5)
         except Exception:

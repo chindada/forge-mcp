@@ -29,6 +29,10 @@ class RunForgeInput(BaseModel):
     design_doc_content: str | None = None
     max_iterations: Annotated[int, Field(ge=1, le=100)] = 10
     max_runtime_minutes: Annotated[int, Field(ge=1, le=24 * 60)] = 600
+    verify_command: str | None = None
+    verify_timeout_seconds: Annotated[int, Field(ge=1, le=24 * 60 * 60)] = 1800
+    resume: bool = False
+    network_access: bool = True
 
     @model_validator(mode="after")
     def _exactly_one_design_doc(self) -> RunForgeInput:
@@ -201,6 +205,7 @@ class IterationArtifacts(BaseModel):
     eval_md_path: str | None = None
     triage_json_path: str | None = None
     git_violation_path: str | None = None
+    verify_path: str | None = None
 
 
 class ArtifactIndex(BaseModel):
@@ -221,6 +226,23 @@ class ArtifactIndex(BaseModel):
     git_uncommitted_path: str | None = None
     unresolved_gaps_overflow_path: str | None = None
     design_flaw_gaps_overflow_path: str | None = None
+
+
+class VerificationSummary(BaseModel):
+    """Public summary of the last iteration's verification run (§H1).
+
+    Design: §H1 surfaces the deterministic gate's outcome on the tool boundary
+        without leaking the bounded output_tail that VerificationOutcome keeps
+        for evaluator context and verify.txt.
+    Implementation: small object-root model; exit_code is None iff timed_out.
+    Example: VerificationSummary(command='uv run pytest', exit_code=0,
+        passed=True, timed_out=False).
+    """
+
+    command: str
+    exit_code: int | None = None
+    passed: bool
+    timed_out: bool
 
 
 class RunResult(BaseModel):
@@ -248,3 +270,5 @@ class RunResult(BaseModel):
     error_class: str | None = None
     error_message: str | None = None
     traceback_truncated: str | None = Field(default=None, max_length=4096)
+    verification: VerificationSummary | None = None
+    resumed_from_iteration: int | None = None

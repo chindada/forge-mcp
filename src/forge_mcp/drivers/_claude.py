@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 CLAUDE_SETTING_SOURCES = ["user", "project", "local"]
 SCHEMA_RETRY_SUFFIX = (
     "\n\nIMPORTANT: your previous response did not match the required "
     "output schema. Re-emit the full structured object that satisfies the "
     "schema exactly. Do not include any prose outside the structured channel."
+)
+_GIT_MUTATION_RE = re.compile(
+    r"\bgit\b[^\n;&|]*\b(commit|push|branch|tag|worktree|rebase|reset\s+--hard)\b"
 )
 
 
@@ -57,6 +61,7 @@ class ClaudeRunner(Protocol):
 
     async def run(self, *, prompt: str, options: Any, system: str) -> StructuredResult: ...
     async def run_with_messages(self, *, prompt: str, options: Any, system: str) -> ClaudeTurn: ...
+    async def interrupt(self) -> None: ...
     async def aclose(self) -> None: ...
     def terminate(self) -> None: ...
 
@@ -71,13 +76,14 @@ def build_options(
     cwd: Path | None = None,
     cli_path: Path | None = None,
     run_log_path: Path | None = None,
+    hooks: dict | None = None,
 ) -> Any:
     """Build ClaudeAgentOptions for every Claude call site (§10.1).
 
     Design: a single chokepoint prevents option drift and threads the §6.5
         Claude CLI runtime hatch into actual SDK calls.
     Implementation: import the SDK lazily and populate only non-None options;
-        `run_log_path` is accepted for call-site symmetry but not SDK-native.
+        `run_log_path` is accepted for call-site symmetry; hooks thread §H10.
     Example: build_options(setting_sources=CLAUDE_SETTING_SOURCES).
     """
     from claude_agent_sdk import ClaudeAgentOptions  # type: ignore
@@ -100,7 +106,71 @@ def build_options(
         kwargs["cwd"] = str(cwd)
     if cli_path is not None:
         kwargs["cli_path"] = str(cli_path)
+    if hooks is not None:
+        kwargs["hooks"] = hooks
     return ClaudeAgentOptions(**kwargs)
+
+
+async def _deny_git_mutation_hook(
+    input_data: Any, tool_use_id: str | None, context: Any
+) -> dict[str, Any]:
+    """PreToolUse hook denying git-mutating Bash commands (§H10, Rule 11).
+
+    Design: deterministic in-band guard for Claude phases, layered atop prompt
+        forbids and post-iteration gitguard checks.
+    Implementation: pass non-Bash tools; deny Bash commands matching mutating
+        git subcommands with a permissionDecision reason.
+    Example: await _deny_git_mutation_hook({'tool_name':'Bash'}, 'id', None).
+    """
+    _ = (tool_use_id, context)
+    if not isinstance(input_data, dict):
+        input_data = getattr(input_data, "model_dump", lambda: {})()
+    if input_data.get("tool_name") != "Bash":
+        return {}
+    command = str(input_data.get("tool_input", {}).get("command", ""))
+    if not _GIT_MUTATION_RE.search(command):
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Rule 11: git mutations are forbidden in target_dir.",
+        }
+    }
+
+
+def git_deny_hooks() -> dict:
+    """Build the PreToolUse hook map denying git mutations (§H10.2).
+
+    Design: centralizes SDK hook construction in the Claude seam so callers do
+        not import SDK hook types directly.
+    Implementation: lazily import HookMatcher and match only the Bash tool.
+    Example: build_options(hooks=git_deny_hooks()).
+    """
+    from claude_agent_sdk import HookMatcher  # type: ignore
+
+    return {"PreToolUse": [HookMatcher(matcher="Bash", hooks=cast(Any, [_deny_git_mutation_hook]))]}
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Classify a Claude-seam exception as a transient transport fault (§H5.2).
+
+    Design: retry only transport-shaped failures — connection reset, timeout,
+        broken pipe, and the SDK's own connection error. Filesystem/permission
+        OSErrors and schema/validation/logic errors must propagate immediately
+        (§H19 note 5: a mis-classified logic error would retry a doomed call).
+    Implementation: match the stdlib transport tuple, then lazily import the
+        SDK's CLIConnectionError and match it too; the bare OSError base is
+        deliberately NOT in the tuple.
+    Example: is_transient_error(ConnectionResetError()) is True.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, BrokenPipeError)):
+        return True
+    try:
+        from claude_agent_sdk import CLIConnectionError  # type: ignore
+    except ImportError:
+        return False
+    return isinstance(exc, CLIConnectionError)
 
 
 def maybe_append_retry_suffix(prompt: str, retry: bool) -> str:
@@ -246,6 +316,26 @@ class ClaudeRunnerImpl:
         Example: await runner.aclose().
         """
         return None
+
+    async def interrupt(self) -> None:
+        """Best-effort SDK-native interrupt of an in-flight turn (§H10).
+
+        Design: graceful interrupt before hard teardown improves cancellation
+            forensics but must never fail a run.
+        Implementation: if a tracked client exposes interrupt(), await it and
+            suppress all errors; no client means no-op.
+        Example: await runner.interrupt().
+        """
+        client = self._client
+        if client is None:
+            return
+        interrupt = getattr(client, "interrupt", None)
+        if interrupt is None:
+            return
+        try:
+            await interrupt()
+        except Exception:
+            pass
 
     def terminate(self) -> None:
         """Force-clear any tracked SDK client.

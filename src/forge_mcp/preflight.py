@@ -21,6 +21,7 @@ from .doctor import (
 from .drivers._claude import ClaudeRunnerImpl
 from .lockfile import LockBusy, TargetLock
 from .models import RunForgeInput
+from .orchestrator.resume import ResumePoint, find_resumable_run
 from .skills import probe_required_skills
 
 INVALID_PARAMS = -32602
@@ -42,6 +43,7 @@ class PreparedRun:
     lock: TargetLock
     run_id: str
     config: RunConfig
+    resume_point: ResumePoint | None = None
 
 
 def _canonicalize_target_dir(path: str) -> Path:
@@ -140,8 +142,13 @@ async def prepare_run(inputs: RunForgeInput, config: RunConfig) -> PreparedRun:
     _ensure_harness(harness_dir)
     _fail_if_not_ok(check_harness_writable(harness_dir), code=SERVER_ERROR)
     lock = TargetLock(harness_dir / "run.lock")
+    resume_point: ResumePoint | None = None
+    if inputs.resume:
+        resume_point = find_resumable_run(harness_dir)
+        if resume_point is None:
+            _raise(SERVER_ERROR, "no resumable run for target")
     try:
-        lock.acquire()
+        lock.acquire(adopt_run_id=resume_point.run_id if resume_point else None)
     except LockBusy as exc:
         _raise(SERVER_ERROR, str(exc))
     try:
@@ -154,4 +161,10 @@ async def prepare_run(inputs: RunForgeInput, config: RunConfig) -> PreparedRun:
     except Exception:
         lock.release()
         raise
-    return PreparedRun(harness_dir=harness_dir, lock=lock, run_id=lock.run_id, config=config)
+    return PreparedRun(
+        harness_dir=harness_dir,
+        lock=lock,
+        run_id=lock.run_id,
+        config=config,
+        resume_point=resume_point,
+    )

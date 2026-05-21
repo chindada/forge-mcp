@@ -12,6 +12,7 @@ import pytest
 from forge_mcp.lockfile import TargetLock
 from forge_mcp.orchestrator.ledger import RunLedger
 from forge_mcp.orchestrator.lifecycle import (
+    close_drivers,
     collect_unresolved_gaps,
     emit_terminal_status,
     handle_cancellation,
@@ -76,6 +77,73 @@ def _deps(tmp_path: Path):
         status=status,
         logger=MagicMock(),
     )
+
+
+class _OrderRunner:
+    """Driver runner double recording the order of close lifecycle calls.
+
+    Design: §H10/§8.5 require interrupt() to be awaited before aclose()/
+        terminate(); asserting on a shared call log makes that ordering
+        observable in a unit test.
+    Implementation: each method appends its name to a shared list; aclose can
+        be configured to raise so terminate escalation is exercised.
+    Example: r = _OrderRunner(calls); await r.interrupt().
+    """
+
+    def __init__(self, calls: list[str], *, aclose_fails: bool = False) -> None:
+        """Store the shared call log and aclose failure mode.
+
+        Design: tests inspect a single ordered log across all runners.
+        Implementation: keep the list reference and the failure flag.
+        Example: _OrderRunner([], aclose_fails=True).
+        """
+        self.calls = calls
+        self._aclose_fails = aclose_fails
+
+    async def interrupt(self) -> None:
+        """Record an interrupt invocation.
+
+        Design: §H10 best-effort interrupt precedes the hard close.
+        Implementation: append a marker to the shared log.
+        Example: await runner.interrupt().
+        """
+        self.calls.append("interrupt")
+
+    async def aclose(self) -> None:
+        """Record an aclose invocation and optionally fail.
+
+        Design: aclose is the graceful close before terminate escalation.
+        Implementation: append a marker; raise when configured to force escalation.
+        Example: await runner.aclose().
+        """
+        self.calls.append("aclose")
+        if self._aclose_fails:
+            raise RuntimeError("aclose boom")
+
+    def terminate(self) -> None:
+        """Record a terminate invocation.
+
+        Design: terminate is the hard escalation after a failed/slow aclose.
+        Implementation: append a marker to the shared log.
+        Example: runner.terminate().
+        """
+        self.calls.append("terminate")
+
+
+def _order_deps(*runners: object):
+    """Bundle the given runners as the three phase drivers for close_drivers.
+
+    Design: close_drivers iterates planner/generator/evaluator and reads each
+        driver's _runner; tests supply purpose-built runners here.
+    Implementation: wrap each runner in a MagicMock exposing it as _runner.
+    Example: deps = _order_deps(r1, r2, r3).
+    """
+    drivers = MagicMock(
+        planner=MagicMock(_runner=runners[0]),
+        generator=MagicMock(_runner=runners[1]),
+        evaluator=MagicMock(_runner=runners[2]),
+    )
+    return MagicMock(drivers=drivers)
 
 
 async def test_cancellation_releases_lock_before_final_state(target_dir: Path) -> None:
@@ -153,6 +221,95 @@ async def test_handle_cancellation_re_raises(tmp_path: Path) -> None:
     assert ledger.lock_released is True
     assert sm.current.state == "failed"
     assert sm.current.cancelled is True
+
+
+async def test_close_drivers_interrupts_before_terminate() -> None:
+    """Pin §H10 close ordering: interrupt precedes aclose and terminate.
+
+    Design: §8.5 escalation must call SDK-native interrupt() before the hard
+        terminate(); a forced aclose failure ensures terminate is reached.
+    Implementation: use runners that fail aclose and assert interrupt appears
+        before both aclose and terminate in the shared call log.
+    Example: await close_drivers(deps).
+    """
+    calls: list[str] = []
+    runners = [_OrderRunner(calls, aclose_fails=True) for _ in range(3)]
+    await close_drivers(_order_deps(*runners))
+    assert calls[:3] == ["interrupt", "aclose", "terminate"]
+    assert calls.index("interrupt") < calls.index("terminate")
+
+
+async def test_close_drivers_without_interrupt_degrades_silently() -> None:
+    """Pin §H19 note 1: a runner lacking interrupt() still closes cleanly.
+
+    Design: interrupt() is best-effort; runners predating §H10 expose only
+        aclose/terminate and must not raise during close.
+    Implementation: build runners with no interrupt attribute and assert only
+        aclose runs (no terminate, no exception) on a successful close.
+    Example: await close_drivers(deps) returns without raising.
+    """
+    calls: list[str] = []
+
+    def _make():
+        """Build a runner double exposing only aclose/terminate.
+
+        Design: models a pre-interrupt runner shape.
+        Implementation: AsyncMock aclose appends 'aclose'; terminate appends.
+        Example: r = _make().
+        """
+        runner = MagicMock(spec=["aclose", "terminate"])
+
+        async def _aclose() -> None:
+            """Record a successful aclose.
+
+            Design: graceful close path for a no-interrupt runner.
+            Implementation: append marker to the shared log.
+            Example: await runner.aclose().
+            """
+            calls.append("aclose")
+
+        runner.aclose = _aclose
+        runner.terminate = lambda: calls.append("terminate")
+        return runner
+
+    await close_drivers(_order_deps(_make(), _make(), _make()))
+    assert "aclose" in calls
+    assert "interrupt" not in calls
+    assert "terminate" not in calls
+
+
+async def test_close_drivers_interrupt_timeout_still_escalates() -> None:
+    """Pin §H10 interrupt failure still proceeds to aclose then terminate.
+
+    Design: a hung/raising interrupt must be swallowed and must not block the
+        aclose-then-terminate escalation.
+    Implementation: a runner whose interrupt raises and whose aclose fails;
+        assert the log is interrupt -> aclose -> terminate.
+    Example: await close_drivers(deps).
+    """
+    calls: list[str] = []
+
+    class _BadInterrupt(_OrderRunner):
+        """Runner whose interrupt raises before the close escalation.
+
+        Design: exercises the swallowed-interrupt branch of close_drivers.
+        Implementation: record then raise from interrupt; inherit aclose/terminate.
+        Example: r = _BadInterrupt(calls, aclose_fails=True).
+        """
+
+        async def interrupt(self) -> None:
+            """Record then raise to simulate an interrupt failure.
+
+            Design: close_drivers must swallow this and continue.
+            Implementation: append marker, then raise RuntimeError.
+            Example: await runner.interrupt() raises.
+            """
+            self.calls.append("interrupt")
+            raise RuntimeError("interrupt boom")
+
+    runner = _BadInterrupt(calls, aclose_fails=True)
+    await close_drivers(_order_deps(runner, _OrderRunner([]), _OrderRunner([])))
+    assert calls == ["interrupt", "aclose", "terminate"]
 
 
 async def test_timeout_goes_finalizing_then_incomplete_not_cancelling(target_dir: Path) -> None:

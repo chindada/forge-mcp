@@ -16,6 +16,7 @@ StateLiteral = Literal[
     "planning",
     "planned",
     "iter_generating",
+    "iter_verifying",
     "iter_evaluating",
     "iter_triaging",
     "iter_done",
@@ -52,15 +53,18 @@ class RunState(BaseModel):
     last_updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     reason: str | None = None
     cancelled: bool = False
+    last_completed_iteration: int = Field(default=0, ge=0)
 
 
 def write_state(path: Path, state: RunState) -> None:
-    """Atomically write a RunState JSON file with private permissions.
+    """Atomically and durably persist RunState (§7, §H2 closing G5).
 
-    Design: only orchestrator state machinery writes this file (§8.2), and
-        artifacts use 0600 to preserve sensitive run details (§13).
-    Implementation: create a same-directory temp file, chmod it, write JSON,
-        then replace the destination; failures unlink the temp path.
+    Design: resume (§H2) and crash-forensics (§8.2) require the resume point
+        to survive power-loss/OOM, so the write is fsync'd around os.replace;
+        transitions are rare enough that this cost is acceptable.
+    Implementation: write temp, flush + os.fsync(fd), chmod 0600, os.replace,
+        then best-effort fsync the parent directory on POSIX so rename is
+        durable; failures unlink the temp path.
     Example: write_state(Path('state.json'), RunState(...)).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,9 +74,19 @@ def write_state(path: Path, state: RunState) -> None:
         with os.fdopen(fd, "w") as handle:
             handle.write(state.model_dump_json(indent=2))
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         if os.name == "posix":
             os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
+        if os.name == "posix":
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)

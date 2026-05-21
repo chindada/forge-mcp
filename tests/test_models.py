@@ -258,3 +258,32 @@ def test_models_imported_for_public_api():
     """
     assert EvalResult(no_gaps=True, summary="ok").gaps == []
     assert TriageResult(summary="ok").triages == []
+
+
+def test_run_forge_input_new_optional_fields_default() -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    inp = RunForgeInput(target_dir="/repo", design_doc_content="d")
+    assert inp.verify_command is None
+    assert inp.verify_timeout_seconds == 1800
+    assert inp.resume is False
+    assert inp.network_access is True
+
+
+def test_verify_timeout_seconds_bounds_enforced() -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    with pytest.raises(ValidationError):
+        RunForgeInput(target_dir="/repo", design_doc_content="d", verify_timeout_seconds=0)
+    with pytest.raises(ValidationError):
+        RunForgeInput(
+            target_dir="/repo", design_doc_content="d", verify_timeout_seconds=24 * 60 * 60 + 1
+        )

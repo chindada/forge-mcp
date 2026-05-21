@@ -53,6 +53,7 @@ class CodexRunner(Protocol):
         approval_mode: Any,
         env: dict | None,
     ) -> CodexSession: ...
+    async def interrupt(self) -> None: ...
     async def aclose(self) -> None: ...
     def terminate(self) -> None: ...
 
@@ -70,21 +71,45 @@ def build_app_server_config(*, codex_bin: str, cwd: Path, env: dict | None = Non
     return AppServerConfig(executable=codex_bin, cwd=str(cwd), env=env or {})  # type: ignore[call-arg]
 
 
-def sandbox_policy_for(*, target_dir: Path, iteration_dir: Path) -> Any:
-    """Return a workspace-write sandbox with network access (§10.2).
+def sandbox_policy_for(*, target_dir: Path, iteration_dir: Path, network_access: bool) -> Any:
+    """Return a workspace-write sandbox with network toggle (§H7).
 
-    Design: generator may edit target_dir and write iteration artifacts, but no
-        other filesystem roots should be writable.
-    Implementation: lazily import SandboxPolicy and pass the two writable roots.
-    Example: sandbox_policy_for(target_dir=t, iteration_dir=i).
+    Design: §H7 makes network access a convenience knob, not a security
+        boundary; writable_roots still bound filesystem writes.
+    Implementation: lazily import SandboxPolicy and pass roots plus the supplied
+        network_access flag.
+    Example: sandbox_policy_for(target_dir=t, iteration_dir=i, network_access=False).
     """
     from openai_codex import SandboxPolicy  # type: ignore
 
     return SandboxPolicy(
         mode="workspaceWrite",
         writable_roots=[str(target_dir), str(iteration_dir)],
-        network_access=True,
+        network_access=network_access,
     )
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Classify a Codex-seam exception as a transient transport fault (§H5.2).
+
+    Design: retry only transport-shaped failures — connection reset, timeout,
+        broken pipe, the SDK's TransportClosedError, and SDK overload errors
+        (ServerBusyError / overloaded JsonRpcError via is_retryable_error).
+        Filesystem/permission OSErrors and schema/validation/logic errors must
+        propagate (§H19 note 5: mis-classified logic errors retry a doomed call).
+    Implementation: match the stdlib transport tuple, then lazily import the SDK
+        helpers; the bare OSError base is deliberately NOT in the tuple.
+    Example: is_transient_error(ConnectionResetError()) is True.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, BrokenPipeError)):
+        return True
+    try:
+        from openai_codex import TransportClosedError, is_retryable_error  # type: ignore
+    except ImportError:
+        return False
+    if isinstance(exc, TransportClosedError):
+        return True
+    return bool(is_retryable_error(exc))
 
 
 def never_approval_mode() -> Any:
@@ -224,6 +249,28 @@ class CodexRunnerImpl:
             except Exception:
                 pass
             self._session = None
+
+    async def interrupt(self) -> None:
+        """Best-effort SDK-native interrupt of the active Codex run (§H10).
+
+        Design: interrupt before hard teardown lets an in-flight turn flush
+            partial state; missing SDK support is a safe no-op.
+        Implementation: call session.interrupt() or session.cancel() when
+            present, awaiting awaitable results and suppressing errors.
+        Example: await runner.interrupt().
+        """
+        session = self._session
+        if session is None:
+            return
+        interrupt = getattr(session, "interrupt", None) or getattr(session, "cancel", None)
+        if interrupt is None:
+            return
+        try:
+            result = interrupt()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            pass
 
     def terminate(self) -> None:
         """Force-clear the tracked session (§8.5).

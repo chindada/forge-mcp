@@ -55,6 +55,32 @@ def capture_uncommitted(target_dir: Path) -> str | None:
     return _run_git(target_dir, ["status", "--porcelain"])
 
 
+def changed_files(target_dir: Path) -> list[str]:
+    """Return uncommitted changed paths for diff-scoped evaluation (§H8).
+
+    Design: the generator never commits, so git status --porcelain is the
+        natural starting focus for the evaluator without restricting review.
+    Implementation: parse porcelain path columns, using rename targets after
+        ' -> ', and return [] outside git repos or on git errors.
+    Example: changed_files(Path('/repo')) == ['src/app.py'].
+    """
+    if not _git_available():
+        return []
+    out = _run_git(target_dir, ["status", "--porcelain"])
+    if not out:
+        return []
+    paths: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        path_part = line[3:].strip()
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1].strip()
+        if path_part:
+            paths.append(path_part)
+    return paths
+
+
 def diff_state(base: str | None, end: str | None) -> str:
     """Return a report iff any captured git section differs.
 

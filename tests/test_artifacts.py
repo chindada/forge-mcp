@@ -109,3 +109,38 @@ def test_render_eval_md_with_gaps():
     assert "removed browser surface" not in md
     assert "gap\\|one" in md
     assert "| high |" in md
+
+
+def test_prune_keeps_newest_n_and_current(harness_dir) -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from forge_mcp.artifacts import prune_old_runs
+    from forge_mcp.state import RunState, write_state
+
+    now = datetime.now(UTC)
+    ids = ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"]
+    for i, rid in enumerate(ids):
+        rd = harness_dir / rid
+        rd.mkdir()
+        write_state(
+            rd / "state.json",
+            RunState(
+                state="completed",
+                run_id=rid,
+                target_dir=str(harness_dir.parent),
+                iteration=1,
+                started_at=now - timedelta(hours=len(ids) - i),
+                last_completed_iteration=1,
+            ),
+        )
+    prune_old_runs(harness_dir, keep_last=2, current_run_id="aaaaaaaa")
+    remaining = {p.name for p in harness_dir.iterdir() if p.is_dir()}
+    assert "dddddddd" in remaining and "cccccccc" in remaining
+    assert "aaaaaaaa" in remaining
+    assert "bbbbbbbb" not in remaining

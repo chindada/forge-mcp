@@ -72,14 +72,15 @@ class TargetLock:
             raise RuntimeError("TargetLock.run_id read before acquire()")
         return self._run_id
 
-    def acquire(self) -> None:
-        """Acquire the lock, stealing stale holders per §6.5.
+    def acquire(self, adopt_run_id: str | None = None) -> None:
+        """Acquire the lock, stealing stale holders; optionally adopt a run_id.
 
-        Design: a holder is stale iff its pid is dead or mtime exceeds 36h,
-            which avoids stealing a healthy run within the 24h max runtime.
-        Implementation: inspect and unlink stale payloads before a nonblocking
-            filelock acquire; write a fresh private JSON payload on success.
-        Example: lock.acquire(); payload = json.loads(path.read_text()).
+        Design: §H2 resume adopts the located run id so lockfile, run dir,
+            state.json, and RunResult retain continuity; §H9 makes staleness
+            PID-reuse-safe with process create_time.
+        Implementation: unlink stale payloads, acquire filelock nonblocking,
+            set adopted or minted run_id, and write private JSON with create_time.
+        Example: lock.acquire(adopt_run_id='abcd1234').
         """
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self._path.exists() and self._is_stale():
@@ -88,12 +89,17 @@ class TargetLock:
             self._fl.acquire(timeout=0)
         except filelock.Timeout as exc:
             raise LockBusy(self._path) from exc
-        self._run_id = secrets.token_hex(4)
+        self._run_id = adopt_run_id if adopt_run_id is not None else secrets.token_hex(4)
+        try:
+            create_time = psutil.Process(os.getpid()).create_time()
+        except Exception:
+            create_time = 0.0
         payload = {
             "pid": os.getpid(),
             "run_id": self._run_id,
             "started_at": datetime.now(UTC).isoformat(),
             "target_dir": str(self._path.parent),
+            "create_time": create_time,
         }
         self._path.write_text(json.dumps(payload, indent=2) + "\n")
         if os.name == "posix":
@@ -121,12 +127,13 @@ class TargetLock:
             self._released = True
 
     def _is_stale(self) -> bool:
-        """Decide whether an existing lockfile may be stolen.
+        """Decide whether an existing lockfile may be stolen (§H9).
 
-        Design: §6.5 permits steal-on-dead-pid or stale mtime; unreadable
-            payloads are treated as stale to avoid permanent deadlocks.
-        Implementation: parse pid from JSON, compare mtime, then ask psutil.
-        Example: old lock mtime older than STALE_AFTER_SECONDS returns True.
+        Design: pid_exists alone misclassifies recycled PIDs as live holders;
+            comparing stored and live create_time detects reuse precisely.
+        Implementation: unreadable payload, old mtime, dead pid, missing
+            create_time, or create_time mismatch all count as stale.
+        Example: a dead run whose PID was reused returns True.
         """
         try:
             data = json.loads(self._path.read_text())
@@ -138,4 +145,13 @@ class TargetLock:
                 return True
         except FileNotFoundError:
             return True
-        return not psutil.pid_exists(pid)
+        if not psutil.pid_exists(pid):
+            return True
+        stored_create_time = data.get("create_time")
+        if stored_create_time is None:
+            return True
+        try:
+            live_create_time = psutil.Process(pid).create_time()
+        except Exception:
+            return True
+        return live_create_time != stored_create_time

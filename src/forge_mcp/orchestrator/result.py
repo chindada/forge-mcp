@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..models import ArtifactIndex, IterationArtifacts, RunForgeInput, RunResult
+from ..models import (
+    ArtifactIndex,
+    IterationArtifacts,
+    RunForgeInput,
+    RunResult,
+    VerificationSummary,
+)
 from .ledger import RunLedger
 from .statemachine import RunStateMachine
 
@@ -58,6 +64,9 @@ def _artifact_index(run_dir: Path, ledger: RunLedger) -> ArtifactIndex:
                 git_violation_path=str(iteration_dir / "git-violation.txt")
                 if (iteration_dir / "git-violation.txt").exists()
                 else None,
+                verify_path=str(iteration_dir / "verify.txt")
+                if (iteration_dir / "verify.txt").exists()
+                else None,
             )
         )
     return ArtifactIndex(
@@ -99,6 +108,17 @@ def build_result(
         "incomplete": "forge-mcp run reached iteration or runtime cap",
         "failed": "forge-mcp run failed",
     }[status]
+    if ledger.stop_reason:
+        message += f" (stopped early: {ledger.stop_reason})"
+    verification = None
+    if ledger.last_verification is not None:
+        v = ledger.last_verification
+        verification = VerificationSummary(
+            command=v.command,
+            exit_code=v.exit_code,
+            passed=v.passed,
+            timed_out=v.timed_out,
+        )
     failed = status == "failed"
     return RunResult(
         status=status,  # type: ignore[arg-type]
@@ -116,4 +136,6 @@ def build_result(
         error_class=ledger.error_class if failed else None,
         error_message=ledger.error_message if failed else None,
         traceback_truncated=ledger.traceback_truncated if failed else None,
+        verification=verification,
+        resumed_from_iteration=ledger.resumed_from_iteration,
     )

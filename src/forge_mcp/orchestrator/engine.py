@@ -9,13 +9,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..artifacts import atomic_write_text, create_run_dir
+from ..artifacts import atomic_write_text, create_run_dir, prune_old_runs
 from ..doctor import disk_space_warn_if_low
 from ..gitguard import capture_state, capture_uncommitted
-from ..models import RunForgeInput, RunResult
+from ..models import EvalResult, RunForgeInput, RunResult
 from ..preflight import PreparedRun
 from ..state import RunState
 from ..status import Status
+from .convergence import fingerprint_gaps
 from .ledger import RunLedger
 from .lifecycle import (
     apply_caps_and_overflow,
@@ -25,11 +26,34 @@ from .lifecycle import (
     handle_failure,
     handle_timeout,
 )
-from .phases import PhaseDeps, run_phases
+from .phases import PhaseDeps, run_iteration_loop, run_phases
 from .result import build_result
+from .resume import ResumePoint, prepare_resume
 from .statemachine import RunStateMachine
 
 DESIGN_DOC_LARGE_BYTES = 1024 * 1024  # §8.1 — warn over 1 MB without truncating
+
+
+def _reconstruct_fingerprints(run_dir: Path, point: ResumePoint) -> list[frozenset[str]]:
+    """Rebuild oscillation history from durable eval.json files (§H2.5, §H3).
+
+    Design: non-progress detection must survive resume without live context, so
+        history is reconstructed from completed iteration artifacts.
+    Implementation: read eval.json for iterations 1..last_completed and append
+        fingerprint_gaps(gaps), skipping missing/corrupt artifacts.
+    Example: history = _reconstruct_fingerprints(run_dir, point).
+    """
+    history: list[frozenset[str]] = []
+    for iteration_n in range(1, point.last_completed_iteration + 1):
+        eval_path = run_dir / f"iteration-{iteration_n}" / "eval.json"
+        if not eval_path.exists():
+            continue
+        try:
+            gaps = EvalResult.model_validate_json(eval_path.read_text()).gaps
+        except Exception:
+            continue
+        history.append(fingerprint_gaps(gaps))
+    return history
 
 
 def canonicalize_design(inputs: RunForgeInput, run_dir: Path, ledger: RunLedger) -> None:
@@ -162,20 +186,43 @@ class Orchestrator:
         )
         previous_umask = os.umask(0o077)  # §8.1 — captured just before the try
         try:
+            try:
+                prune_old_runs(
+                    self._prepared.harness_dir,
+                    keep_last=self._config.keep_runs,
+                    current_run_id=self._prepared.run_id,
+                )
+            except Exception:
+                ledger.warnings.append("run retention pruning failed (non-fatal)")
             terminal_status = "failed"
             try:
-                sm.transition("canonicalizing")  # §8.1
-                canonicalize_design(self._inputs, run_dir, ledger)
-                git_state = capture_state(deps.target_dir)
-                if git_state is not None:
-                    atomic_write_text(run_dir / "inputs" / "git-state.txt", git_state)
-                uncommitted = capture_uncommitted(deps.target_dir)
-                if uncommitted:
-                    path = run_dir / "inputs" / "git-uncommitted.txt"
-                    atomic_write_text(path, uncommitted)
-                    ledger.git_uncommitted_path = str(path)
-                await warn_if_missing_target_agents_md(deps.target_dir, ledger, status)  # §8.1
-                phase_task = run_phases(deps, sm, ledger, git_state)
+                resume_point = self._prepared.resume_point
+                if resume_point is None:
+                    sm.transition("canonicalizing")  # §8.1
+                    canonicalize_design(self._inputs, run_dir, ledger)
+                    git_state = capture_state(deps.target_dir)
+                    if git_state is not None:
+                        atomic_write_text(run_dir / "inputs" / "git-state.txt", git_state)
+                    uncommitted = capture_uncommitted(deps.target_dir)
+                    if uncommitted:
+                        path = run_dir / "inputs" / "git-uncommitted.txt"
+                        atomic_write_text(path, uncommitted)
+                        ledger.git_uncommitted_path = str(path)
+                    await warn_if_missing_target_agents_md(deps.target_dir, ledger, status)  # §8.1
+                    phase_task = run_phases(deps, sm, ledger, git_state)
+                else:
+                    ledger.resumed_from_iteration = resume_point.last_completed_iteration
+                    prepare_resume(run_dir, resume_point)
+                    git_state_path = run_dir / "inputs" / "git-state.txt"
+                    git_state = git_state_path.read_text() if git_state_path.exists() else None
+                    ledger.gap_fingerprints = _reconstruct_fingerprints(run_dir, resume_point)
+                    phase_task = run_iteration_loop(
+                        deps,
+                        sm,
+                        ledger,
+                        git_state,
+                        start_iteration=resume_point.start_iteration,
+                    )
                 terminal_status, _ = await asyncio.wait_for(
                     phase_task, timeout=self._inputs.max_runtime_minutes * 60
                 )

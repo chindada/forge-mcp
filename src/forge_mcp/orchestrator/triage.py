@@ -9,6 +9,7 @@ from ..models import DesignFlawGap, EvalGap, EvalResult, TriageResult
 
 _WS = re.compile(r"\s+")
 _MIN_CITATION_CHARS = 20
+_MAX_CITATION_SCAN_CHARS = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -69,13 +70,18 @@ def classify_gaps(
     Example: outcome = classify_gaps(er, tr, design_text, 1).
     """
     canon = canonicalize_for_citation(canonical_design_doc)
+    warnings: list[str] = []
+    if len(canon) > _MAX_CITATION_SCAN_CHARS:
+        warnings.append(
+            f"design doc citation scan over {_MAX_CITATION_SCAN_CHARS} chars ({len(canon)}); "
+            "checks still run"
+        )
     by_title: dict[str, list[EvalGap]] = {}
     for gap in eval_result.gaps:
         by_title.setdefault(gap.title, []).append(gap)
     triage_by_title = {row.gap_title: row for row in triage.triages}
     design_flaws: list[DesignFlawGap] = []
     code_bug_gaps: list[EvalGap] = []
-    warnings: list[str] = []
     for row in triage.triages:
         for entry in row._coercion_log:
             warnings.append(f"triage drift on '{row.gap_title}': {entry}")

@@ -49,3 +49,33 @@ def test_diff_state_empty_when_same_nonempty_when_different() -> None:
     """
     assert diff_state("a", "a") == ""
     assert diff_state("a", "b") != ""
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git unavailable")
+def test_changed_files_parses_porcelain(tmp_path: Path) -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.gitguard import changed_files
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "a.py").write_text("x = 1\n")
+    files = changed_files(repo)
+    assert "a.py" in files
+
+
+def test_changed_files_empty_outside_repo(tmp_path: Path) -> None:
+    """Pin a forge-mcp behavior.
+
+    Design: CI catches regressions for this behavior.
+    Implementation: call focused production code and assert output.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.gitguard import changed_files
+
+    assert changed_files(tmp_path / "not-a-repo") == []

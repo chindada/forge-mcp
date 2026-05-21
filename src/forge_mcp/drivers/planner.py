@@ -11,6 +11,7 @@ from ._claude import (
     ClaudeRunner,
     build_options,
     collect_writes_to_basename,
+    git_deny_hooks,
     truncate_for_warning,
 )
 
@@ -53,6 +54,7 @@ class PlannerDriver:
             disallowed_tools=("Edit",),
             cwd=plan_dir,
             cli_path=ctx.claude_cli_path,
+            hooks=git_deny_hooks(),
         )
         turn = await self._runner.run_with_messages(prompt=prompt, options=options, system=system)
         plan_path = plan_dir / "plan.md"

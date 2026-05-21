@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..models import DesignFlawGap, EvalGap
+from ..verifier import VerificationOutcome
 
 
 @dataclass
@@ -32,3 +33,12 @@ class RunLedger:
     error_class: str | None = None
     error_message: str | None = None
     traceback_truncated: str | None = None
+    last_verification: VerificationOutcome | None = None
+    gap_fingerprints: list[frozenset[str]] = field(default_factory=list)
+    # §H6.3: high-severity gaps synthesized during iteration n (e.g. a degenerate
+    # remediation contract detected after that iteration's fingerprint/remediation
+    # already ran) are parked here and drained into iteration n+1's eval_for_loop,
+    # so the condition reaches the next iteration's evaluation/seed.
+    carried_gaps: list[EvalGap] = field(default_factory=list)
+    stop_reason: str | None = None
+    resumed_from_iteration: int | None = None
