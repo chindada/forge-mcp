@@ -32,6 +32,13 @@ The doctor command runs seven checks: `target_dir` writable, `.harness` writable
 claude mcp add forge-mcp -- uv run --directory $PWD forge serve
 ```
 
+```sh
+claude mcp add --scope user forge-mcp \
+  -e CLAUDE_CONFIG_DIR=$HOME/.claude \
+  -e FORGE_CODEX_BIN=$(which codex) \
+  -- uv run --directory $PWD forge serve
+```
+
 Place the server name before any `-e` environment flags to avoid parsing errors.
 
 **5. Run the example:**
