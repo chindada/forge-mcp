@@ -33,59 +33,127 @@ def _iteration_dirs(run_dir: Path) -> list[Path]:
     return [path for _, path in sorted(found)]
 
 
-def _artifact_index(run_dir: Path, ledger: RunLedger) -> ArtifactIndex:
+def _maybe_uri(harness_token: str | None, run_id: str, subpath: str) -> str | None:
+    """Return encode_uri(...) when harness_token is set, else None (§R4.2/§R4.3).
+
+    Design: §R4.2 — URI companions are populated only when the orchestrator
+        was given a harness_token, preserving legacy direct-call results.
+    Implementation: ternary on harness_token; encode_uri is pure and
+        stdlib-only, and the local import avoids widening module load order.
+    Example: _maybe_uri('aBcDeFgHiJkL', '12345678', 'plan/plan.md') starts
+        with 'forge://'.
+    """
+    from ..resources import encode_uri
+
+    return encode_uri(harness_token, run_id, subpath) if harness_token else None
+
+
+def _artifact_index(
+    run_dir: Path,
+    ledger: RunLedger,
+    *,
+    harness_token: str | None = None,
+    run_id: str | None = None,
+) -> ArtifactIndex:
     """Build the public artifact index while omitting run.log.
 
     Design: §13 exposes useful handoff paths but never crosses run.log over the
-        MCP tool boundary because it may contain sensitive details.
-    Implementation: inspect known files under plan/ and iteration-N dirs and
-        include optional paths only when files exist.
-    Example: artifacts = _artifact_index(Path('.harness/abcd1234'), ledger).
+        MCP tool boundary because it may contain sensitive details. §R4.2 /
+        §R4.3 add optional forge:// URI companions next to each existing path.
+    Implementation: inspect known files under plan/, inputs/, and iteration-N
+        directories; include optional paths only when files exist and mirror
+        each with a URI populated by _maybe_uri when tokenized.
+    Example: artifacts = _artifact_index(Path('.harness/abcd1234'), ledger,
+        harness_token='aBcDeFgHiJkL', run_id='abcd1234').
     """
     iterations: list[IterationArtifacts] = []
     for iteration_dir in _iteration_dirs(run_dir):
         n = int(iteration_dir.name.split("-", 1)[1])
+        sub_prefix = iteration_dir.name
+        summary_exists = (iteration_dir / "summary.md").exists()
+        eval_json_exists = (iteration_dir / "eval.json").exists()
+        eval_md_exists = (iteration_dir / "eval.md").exists()
+        triage_json_exists = (iteration_dir / "triage.json").exists()
+        git_violation_exists = (iteration_dir / "git-violation.txt").exists()
+        verify_exists = (iteration_dir / "verify.txt").exists()
+        sessions_exists = (iteration_dir / "sessions.json").exists()
         iterations.append(
             IterationArtifacts(
                 n=n,
                 contract_path=str(iteration_dir / "contract.md"),
-                summary_path=str(iteration_dir / "summary.md")
-                if (iteration_dir / "summary.md").exists()
+                contract_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/contract.md")
+                if run_id
                 else None,
-                eval_json_path=str(iteration_dir / "eval.json")
-                if (iteration_dir / "eval.json").exists()
+                summary_path=str(iteration_dir / "summary.md") if summary_exists else None,
+                summary_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/summary.md")
+                if (summary_exists and run_id)
                 else None,
-                eval_md_path=str(iteration_dir / "eval.md")
-                if (iteration_dir / "eval.md").exists()
+                eval_json_path=str(iteration_dir / "eval.json") if eval_json_exists else None,
+                eval_json_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/eval.json")
+                if (eval_json_exists and run_id)
                 else None,
-                triage_json_path=str(iteration_dir / "triage.json")
-                if (iteration_dir / "triage.json").exists()
+                eval_md_path=str(iteration_dir / "eval.md") if eval_md_exists else None,
+                eval_md_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/eval.md")
+                if (eval_md_exists and run_id)
+                else None,
+                triage_json_path=str(iteration_dir / "triage.json") if triage_json_exists else None,
+                triage_json_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/triage.json")
+                if (triage_json_exists and run_id)
                 else None,
                 git_violation_path=str(iteration_dir / "git-violation.txt")
-                if (iteration_dir / "git-violation.txt").exists()
+                if git_violation_exists
                 else None,
-                verify_path=str(iteration_dir / "verify.txt")
-                if (iteration_dir / "verify.txt").exists()
+                git_violation_uri=_maybe_uri(
+                    harness_token, run_id, f"{sub_prefix}/git-violation.txt"
+                )
+                if (git_violation_exists and run_id)
                 else None,
-                sessions_path=str(iteration_dir / "sessions.json")
-                if (iteration_dir / "sessions.json").exists()
+                verify_path=str(iteration_dir / "verify.txt") if verify_exists else None,
+                verify_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/verify.txt")
+                if (verify_exists and run_id)
+                else None,
+                sessions_path=str(iteration_dir / "sessions.json") if sessions_exists else None,
+                sessions_uri=_maybe_uri(harness_token, run_id, f"{sub_prefix}/sessions.json")
+                if (sessions_exists and run_id)
                 else None,
             )
         )
+    plan_sessions_exists = (run_dir / "plan" / "sessions.json").exists()
+    git_state_exists = (run_dir / "inputs" / "git-state.txt").exists()
     return ArtifactIndex(
         plan_path=str(run_dir / "plan" / "plan.md"),
+        plan_uri=_maybe_uri(harness_token, run_id, "plan/plan.md") if run_id else None,
         plan_sessions_path=str(run_dir / "plan" / "sessions.json")
-        if (run_dir / "plan" / "sessions.json").exists()
+        if plan_sessions_exists
+        else None,
+        plan_sessions_uri=_maybe_uri(harness_token, run_id, "plan/sessions.json")
+        if (plan_sessions_exists and run_id)
         else None,
         iterations=iterations,
         status_log_path=str(run_dir / "status.log"),
+        status_log_uri=_maybe_uri(harness_token, run_id, "status.log") if run_id else None,
         state_json_path=str(run_dir / "state.json"),
-        git_state_path=str(run_dir / "inputs" / "git-state.txt")
-        if (run_dir / "inputs" / "git-state.txt").exists()
+        state_json_uri=_maybe_uri(harness_token, run_id, "state.json") if run_id else None,
+        git_state_path=str(run_dir / "inputs" / "git-state.txt") if git_state_exists else None,
+        git_state_uri=_maybe_uri(harness_token, run_id, "inputs/git-state.txt")
+        if (git_state_exists and run_id)
         else None,
         git_uncommitted_path=ledger.git_uncommitted_path,
+        git_uncommitted_uri=_maybe_uri(harness_token, run_id, "inputs/git-uncommitted.txt")
+        if (ledger.git_uncommitted_path and run_id)
+        else None,
         unresolved_gaps_overflow_path=ledger.unresolved_overflow_path,
+        unresolved_gaps_overflow_uri=_maybe_uri(
+            harness_token, run_id, "unresolved-gaps-overflow.md"
+        )
+        if (ledger.unresolved_overflow_path and run_id)
+        else None,
         design_flaw_gaps_overflow_path=ledger.design_flaw_overflow_path,
+        design_flaw_gaps_overflow_uri=_maybe_uri(
+            harness_token, run_id, "design-flaw-gaps-overflow.md"
+        )
+        if (ledger.design_flaw_overflow_path and run_id)
+        else None,
     )
 
 
@@ -99,15 +167,17 @@ def build_result(
     ledger: RunLedger,
     started_at: datetime,
     task_id: str | None = None,
+    harness_token: str | None = None,
 ) -> RunResult:
     """Build the terminal RunResult for completed/incomplete/failed runs.
 
     Design: §6.3 terminal states are normal returns; failed-only fields are set
         only for failed status and traceback is already truncated by lifecycle.
-        §C3 task_id is best-effort wire correlation, not ledger state.
+        §C3 task_id is best-effort wire correlation, not ledger state. §R4.2 /
+        §R4.3 URI companions populate only when harness_token is supplied.
     Implementation: compute runtime, discover artifacts numerically, and pass
-        capped ledger lists into the Pydantic RunResult model.
-    Example: result = build_result(status='completed', task_id='t1', ...).
+        capped ledger lists plus optional harness_token into the result model.
+    Example: result = build_result(status='completed', harness_token='tok', ...).
     """
     decided = ledger.decided_at or datetime.now(UTC)
     runtime_seconds = max(0, int((decided - started_at).total_seconds()))
@@ -138,7 +208,7 @@ def build_result(
         completed_phases=ledger.completed_phases,
         unresolved_gaps=ledger.unresolved_gaps,
         design_flaw_gaps=ledger.design_flaw_gaps,
-        artifacts=_artifact_index(run_dir, ledger),
+        artifacts=_artifact_index(run_dir, ledger, harness_token=harness_token, run_id=run_id),
         warnings=ledger.warnings,
         message=message,
         failed_phase=ledger.failed_phase if failed else None,

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from .resources import compute_harness_token
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +24,8 @@ class RunConfig:
     claude_config_dir: Path | None = None
     claude_cli_path: Path | None = None
     keep_runs: int = 10
+    harness_roots: tuple[Path, ...] = ()  # §R3.3
+    harness_root_tokens: dict[str, Path] = field(default_factory=dict)  # §R3.3 token -> root
 
     @classmethod
     def from_env(cls) -> RunConfig:
@@ -35,9 +39,34 @@ class RunConfig:
         """
         claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
         claude_cli_path = os.environ.get("FORGE_CLAUDE_CLI_PATH")
+        roots_raw = os.environ.get("FORGE_HARNESS_ROOTS", "").strip()
+        roots: tuple[Path, ...] = ()
+        tokens: dict[str, Path] = {}
+        if roots_raw:
+            parsed: list[Path] = []
+            for entry in roots_raw.split(","):
+                raw_path = entry.strip()
+                if not raw_path:
+                    continue
+                root = Path(raw_path)
+                if not root.is_absolute():
+                    raise ValueError(
+                        f"FORGE_HARNESS_ROOTS entry must be an absolute path: {raw_path!r}"
+                    )
+                if not root.exists():
+                    raise ValueError(f"FORGE_HARNESS_ROOTS entry does not exist: {root}")
+                if not root.is_dir():
+                    raise ValueError(f"FORGE_HARNESS_ROOTS entry is not a directory: {root}")
+                if not os.access(root, os.R_OK):
+                    raise ValueError(f"FORGE_HARNESS_ROOTS entry is not readable: {root}")
+                parsed.append(root)
+                tokens[compute_harness_token(root)] = root
+            roots = tuple(parsed)
         return cls(
             codex_bin=os.environ.get("FORGE_CODEX_BIN", "codex"),
             claude_config_dir=Path(claude_config_dir) if claude_config_dir else None,
             claude_cli_path=Path(claude_cli_path) if claude_cli_path else None,
             keep_runs=int(os.environ.get("FORGE_KEEP_RUNS", "10")),
+            harness_roots=roots,
+            harness_root_tokens=tokens,
         )

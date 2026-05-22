@@ -1,0 +1,489 @@
+"""§R9.1 / §R9.2 unit tests for the resources.py leaf module."""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+import pytest
+
+from forge_mcp.resources import (
+    _ACTIVE_RUNS,
+    _ALLOWED_ARTIFACTS,
+    _ResourceScope,
+    compute_harness_token,
+    decode_uri,
+    deregister_active_run,
+    encode_uri,
+    expand_scope_to_resources,
+    list_active_runs,
+    match_artifact,
+    register_active_run,
+    resolve_harness_dir,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry():
+    """Each test starts with an empty _ACTIVE_RUNS dict.
+
+    Design: §R tests pin the resource-surface behavior required by the plan.
+    Implementation: The test constructs focused fixtures and asserts direct outputs.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    _ACTIVE_RUNS.clear()
+    yield
+    _ACTIVE_RUNS.clear()
+
+
+class TestUri:
+    """Pin strict forge:// URI encoding and decoding."""
+
+    def test_encode_decode_roundtrip_plan(self):
+        """Verify plan URI roundtrips.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        uri = encode_uri("aBcDeFgHiJkL", "12345678", "plan/plan.md")
+        assert uri == "forge://aBcDeFgHiJkL/12345678/plan/plan.md"
+        assert decode_uri(uri) == ("aBcDeFgHiJkL", "12345678", "plan/plan.md")
+
+    def test_encode_decode_roundtrip_iteration(self):
+        """Verify iteration URI roundtrips.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        uri = encode_uri("aBcDeFgHiJkL", "deadbeef", "iteration-3/eval.md")
+        assert decode_uri(uri) == ("aBcDeFgHiJkL", "deadbeef", "iteration-3/eval.md")
+
+    def test_decode_rejects_non_forge_scheme(self):
+        """Reject a non-forge URI scheme.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        with pytest.raises(ValueError):
+            decode_uri("https://example/plan/plan.md")
+
+    def test_decode_rejects_query(self):
+        """Reject query parts.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        with pytest.raises(ValueError):
+            decode_uri("forge://aBcDeFgHiJkL/12345678/plan/plan.md?x=1")
+
+    def test_decode_rejects_fragment(self):
+        """Reject fragment parts.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        with pytest.raises(ValueError):
+            decode_uri("forge://aBcDeFgHiJkL/12345678/plan/plan.md#frag")
+
+    def test_decode_rejects_short_token(self):
+        """Reject bad token shape.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        with pytest.raises(ValueError):
+            decode_uri("forge://short/12345678/plan/plan.md")
+
+    def test_decode_rejects_bad_run_id_shape(self):
+        """Reject bad run id shape.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        with pytest.raises(ValueError):
+            decode_uri("forge://aBcDeFgHiJkL/NOTHEX12/plan/plan.md")
+
+    def test_decode_lstrip_not_naive_split(self):
+        """Verify lstrip handles the leading path slash.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        token, rid, sub = decode_uri("forge://aBcDeFgHiJkL/12345678/plan/plan.md")
+        assert token == "aBcDeFgHiJkL"
+        assert rid == "12345678"
+        assert sub == "plan/plan.md"
+
+
+class TestHarnessToken:
+    """Pin harness token stability and shape."""
+
+    def test_token_stability(self, tmp_path):
+        """Same path hashes to same token.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        t1 = compute_harness_token(tmp_path / ".harness")
+        t2 = compute_harness_token(tmp_path / ".harness")
+        assert t1 == t2
+
+    def test_token_shape(self, tmp_path):
+        """Token has twelve base64url characters.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        token = compute_harness_token(tmp_path / ".harness")
+        assert re.match(r"^[A-Za-z0-9_-]{12}$", token), token
+
+    def test_token_distinct_dirs(self, tmp_path):
+        """Distinct paths hash to distinct tokens.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        t1 = compute_harness_token(tmp_path / "a" / ".harness")
+        t2 = compute_harness_token(tmp_path / "b" / ".harness")
+        assert t1 != t2
+
+    def test_token_symlink_aliases_distinct(self, tmp_path):
+        """Abspath identity keeps symlink aliases distinct.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "alias"
+        link.symlink_to(real)
+        t_real = compute_harness_token(real)
+        t_alias = compute_harness_token(link)
+        assert t_real != t_alias
+
+
+class TestMatchArtifact:
+    """Pin the allowlist and permanent exclusions."""
+
+    @pytest.mark.parametrize(
+        ("subpath", "mime"),
+        [
+            ("inputs/design.md", "text/markdown"),
+            ("inputs/git-state.txt", "text/plain"),
+            ("inputs/git-uncommitted.txt", "text/plain"),
+            ("plan/plan.md", "text/markdown"),
+            ("plan/sessions.json", "application/json"),
+            ("iteration-1/contract.md", "text/markdown"),
+            ("iteration-1/summary.md", "text/markdown"),
+            ("iteration-2/eval.json", "application/json"),
+            ("iteration-2/eval.md", "text/markdown"),
+            ("iteration-3/triage.json", "application/json"),
+            ("iteration-3/sessions.json", "application/json"),
+            ("iteration-4/git-violation.txt", "text/plain"),
+            ("iteration-4/verify.txt", "text/plain"),
+            ("state.json", "application/json"),
+            ("status.log", "application/x-ndjson"),
+            ("unresolved-gaps-overflow.md", "text/markdown"),
+            ("design-flaw-gaps-overflow.md", "text/markdown"),
+        ],
+    )
+    def test_allowed_match(self, subpath, mime):
+        """Allowed artifacts return the expected MIME.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        pat = match_artifact(subpath)
+        assert pat is not None, subpath
+        assert pat.mime == mime
+
+    def test_iteration_zero_rejected(self):
+        """Reject iteration zero.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        assert match_artifact("iteration-0/eval.md") is None
+
+    def test_iteration_leading_zero_rejected(self):
+        """Reject leading-zero iterations.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        assert match_artifact("iteration-007/eval.md") is None
+
+    def test_unknown_subpath_rejected(self):
+        """Reject unknown subpaths.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        assert match_artifact("foo/bar.md") is None
+
+    def test_traversal_rejected(self):
+        """Reject traversal and absolute subpaths.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        assert match_artifact("../foo") is None
+        assert match_artifact("iteration-1/../../etc/passwd") is None
+        assert match_artifact("/abs/path") is None
+
+    def test_run_log_and_lock_never_allowlisted(self):
+        """Pin run.log and run.lock exclusion.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        subpaths = {p.subpath for p in _ALLOWED_ARTIFACTS}
+        assert "run.log" not in subpaths
+        assert "run.lock" not in subpaths
+        forbidden = [
+            "run.log",
+            "run.lock",
+            "iteration-1/run.log",
+            "iteration-99/run.log",
+            "plan/run.log",
+            "inputs/run.log",
+        ]
+        for p in forbidden:
+            assert match_artifact(p) is None, f"{p} unexpectedly allowlisted"
+
+
+class TestRegistry:
+    """Pin active-run registry behavior."""
+
+    def test_register_deregister_leaves_empty(self, tmp_path):
+        """Register then deregister empties the registry.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        scope = _ResourceScope(
+            run_id="12345678", harness_dir=tmp_path / ".harness", harness_token="aBcDeFgHiJkL"
+        )
+        register_active_run(scope)
+        assert list_active_runs() == [scope]
+        deregister_active_run("aBcDeFgHiJkL", "12345678")
+        assert list_active_runs() == []
+
+    def test_deregister_idempotent(self):
+        """Deregistering a missing key is a no-op.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        deregister_active_run("zzzzzzzzzzzz", "00000000")
+        deregister_active_run("zzzzzzzzzzzz", "00000000")
+
+    def test_register_collision_asserts(self, tmp_path):
+        """Double-registering a key asserts.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        scope = _ResourceScope("12345678", tmp_path / ".harness", "aBcDeFgHiJkL")
+        register_active_run(scope)
+        with pytest.raises(AssertionError):
+            register_active_run(scope)
+
+    def test_distinct_tokens_same_run_id_independent(self, tmp_path):
+        """Same run id under distinct tokens is independent.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        s1 = _ResourceScope("12345678", tmp_path / "a" / ".harness", "tokenAtokenA")
+        s2 = _ResourceScope("12345678", tmp_path / "b" / ".harness", "tokenBtokenB")
+        register_active_run(s1)
+        register_active_run(s2)
+        assert len(list_active_runs()) == 2
+
+    def test_list_active_runs_is_snapshot(self, tmp_path):
+        """Snapshot list survives later registry mutation.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        scope = _ResourceScope("12345678", tmp_path / ".harness", "tokenXtokenX")
+        register_active_run(scope)
+        snap = list_active_runs()
+        deregister_active_run("tokenXtokenX", "12345678")
+        assert snap == [scope]
+
+
+class TestResolveHarnessDir:
+    """Pin token resolution precedence."""
+
+    def test_active_scope_wins(self, tmp_path):
+        """Active scope wins over configured roots.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        scope = _ResourceScope("12345678", tmp_path / ".harness", "tokenAtokenA")
+        register_active_run(scope)
+        result = resolve_harness_dir("tokenAtokenA", {"tokenAtokenA": tmp_path / "other"})
+        assert result == tmp_path / ".harness"
+
+    def test_falls_back_to_config(self, tmp_path):
+        """Configured root resolves when active scope is absent.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        result = resolve_harness_dir("tokenAtokenA", {"tokenAtokenA": tmp_path / "root"})
+        assert result == tmp_path / "root"
+
+    def test_missing_returns_none(self):
+        """Unknown token returns None.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        assert resolve_harness_dir("zzzzzzzzzzzz", {}) is None
+
+
+class TestExpandScope:
+    """Pin scope expansion walks and error behavior."""
+
+    def test_emits_one_per_existing_allowlisted(self, tmp_path):
+        """Emit one row per existing allowlisted artifact.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        harness = tmp_path / ".harness"
+        run_dir = harness / "12345678"
+        (run_dir / "inputs").mkdir(parents=True)
+        (run_dir / "plan").mkdir()
+        (run_dir / "iteration-1").mkdir()
+        (run_dir / "iteration-2").mkdir()
+        (run_dir / "state.json").write_text("{}")
+        (run_dir / "status.log").write_text("")
+        (run_dir / "inputs" / "design.md").write_text("# spec")
+        (run_dir / "plan" / "plan.md").write_text("# plan")
+        (run_dir / "iteration-1" / "contract.md").write_text("# c")
+        (run_dir / "iteration-2" / "eval.md").write_text("# e")
+        scope = _ResourceScope("12345678", harness, "tokenAtokenA")
+        rows = expand_scope_to_resources(scope)
+        subpaths = sorted(sp for _, _, _, sp in rows)
+        assert subpaths == [
+            "inputs/design.md",
+            "iteration-1/contract.md",
+            "iteration-2/eval.md",
+            "plan/plan.md",
+            "state.json",
+            "status.log",
+        ]
+        uri, name, mime, subpath = next(r for r in rows if r[3] == "plan/plan.md")
+        assert uri == "forge://tokenAtokenA/12345678/plan/plan.md"
+        assert name == "plan.md"
+        assert mime == "text/markdown"
+        assert subpath == "plan/plan.md"
+
+    def test_non_iteration_dirs_skipped(self, tmp_path):
+        """Skip non-strict iteration directories.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        harness = tmp_path / ".harness"
+        run_dir = harness / "12345678"
+        run_dir.mkdir(parents=True)
+        (run_dir / "iteration-0").mkdir()
+        (run_dir / "iteration-0" / "eval.md").write_text("# decoy")
+        (run_dir / "scratch").mkdir()
+        (run_dir / "scratch" / "eval.md").write_text("# decoy")
+        rows = expand_scope_to_resources(_ResourceScope("12345678", harness, "tokenAtokenA"))
+        assert rows == []
+
+    def test_runs_propagate_oserror(self, tmp_path, monkeypatch):
+        """Propagate OSError raised by iteration scanning.
+
+        Design: §R tests pin the resource-surface behavior required by the plan.
+        Implementation: The test constructs focused fixtures and asserts direct outputs.
+        Example: pytest runs this test in the non-slow suite.
+        """
+        scope = _ResourceScope("12345678", tmp_path / "missing", "tokenAtokenA")
+        assert expand_scope_to_resources(scope) == []
+        harness = tmp_path / ".harness"
+        run_dir = harness / "12345678"
+        run_dir.mkdir(parents=True)
+
+        def boom(self):
+            """Raise for the synthetic run-root scan only.
+
+            Design: §R3.1 helper errors must propagate for handler-level skip logic.
+            Implementation: replace Path.iterdir with a narrow test double.
+            Example: expand_scope_to_resources(scope) raises OSError.
+            """
+            if self == run_dir:
+                raise OSError("synthetic")
+            return original_iterdir(self)
+
+        original_iterdir = Path.iterdir
+        monkeypatch.setattr(Path, "iterdir", boom)
+        with pytest.raises(OSError):
+            expand_scope_to_resources(_ResourceScope("12345678", harness, "tokenAtokenA"))
+
+
+def test_resources_module_imports_stdlib_only():
+    """Pin resources.py to stdlib-only imports.
+
+    Design: §R tests pin the resource-surface behavior required by the plan.
+    Implementation: The test constructs focused fixtures and asserts direct outputs.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    src = (Path(__file__).resolve().parents[1] / "src" / "forge_mcp" / "resources.py").read_text()
+    tree = ast.parse(src)
+    allowed_top_levels = {
+        "hashlib",
+        "base64",
+        "os",
+        "pathlib",
+        "re",
+        "urllib",
+        "dataclasses",
+        "typing",
+        "__future__",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".", 1)[0]
+                assert top in allowed_top_levels, f"forbidden import: {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            top = (node.module or "").split(".", 1)[0]
+            assert top in allowed_top_levels, f"forbidden from-import: {node.module}"

@@ -90,6 +90,30 @@ await session.experimental.call_tool_as_task(
 )
 ```
 
+## Reading run artifacts over MCP
+
+`forge-mcp` exposes a standard MCP resources surface so a host can read on-disk
+artifacts (`plan.md`, `eval.md`, `state.json`, `sessions.json`, `status.log`, …)
+over the MCP transport instead of filesystem-poking. Two RPC methods are
+advertised on the same stdio server that owns `run_forge`:
+
+- `list_resources` — enumerate active and optionally past-run artifacts, with
+  cursor pagination via `nextCursor` and a page size of 50.
+- `read_resource(uri: AnyUrl)` — read one artifact by its `forge://` URI.
+
+URI shape: `forge://<harness_token>/<run_id>/<artifact_subpath>`, where
+`harness_token` is a 12-character `base64url(sha256(abs_harness_dir))[:12]` and
+`run_id` is the existing 8-character hex id.
+
+Set `FORGE_HARNESS_ROOTS=/abs/path1,/abs/path2` to make completed runs under
+known harness dirs appear in `list_resources` across server restarts. Past runs
+remain readable by stable URI; this setting only affects discovery.
+
+`run.log` and `run.lock` are never served. Path traversal, symlink escape, and
+non-allowlisted subpaths all yield `McpError(-32002)`. Capability flags are
+advertised honestly: `resources.subscribe=false` and
+`resources.listChanged=false`.
+
 ## Security
 
 The `run.log` file may contain sensitive prompt/output snippets and is written with mode `0600`. It never crosses the tool boundary — `RunResult.artifacts` deliberately omits its path.

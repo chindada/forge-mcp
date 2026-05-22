@@ -215,6 +215,18 @@ class IterationArtifacts(BaseModel):
     sessions_path: str | None = Field(
         default=None, description="Path to iteration-N/sessions.json when present (§C2)."
     )
+    # §R4.3 — optional forge:// URI companions; populated by build_result only
+    # when the orchestrator has a harness_token. R-Inv 3 absence of run_log_uri.
+    contract_uri: str | None = None
+    summary_uri: str | None = None
+    eval_json_uri: str | None = None
+    eval_md_uri: str | None = None
+    triage_json_uri: str | None = None
+    sessions_uri: str | None = Field(
+        default=None, description="forge:// URI for iteration-N/sessions.json (§R4.3)."
+    )
+    git_violation_uri: str | None = None
+    verify_uri: str | None = None
 
 
 class ArtifactIndex(BaseModel):
@@ -238,6 +250,16 @@ class ArtifactIndex(BaseModel):
     git_uncommitted_path: str | None = None
     unresolved_gaps_overflow_path: str | None = None
     design_flaw_gaps_overflow_path: str | None = None
+    # §R4.2 — optional forge:// URI companions. run.log/run_log_uri DELIBERATELY
+    # ABSENT (R-Inv 3, allowlist not denylist).
+    plan_uri: str | None = None
+    plan_sessions_uri: str | None = None
+    status_log_uri: str | None = None
+    state_json_uri: str | None = None
+    git_state_uri: str | None = None
+    git_uncommitted_uri: str | None = None
+    unresolved_gaps_overflow_uri: str | None = None
+    design_flaw_gaps_overflow_uri: str | None = None
 
 
 class VerificationSummary(BaseModel):

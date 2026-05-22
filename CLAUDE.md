@@ -21,6 +21,16 @@ this brief only adds new behavior. The §18 schema-pin tests now derive from
 `RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` through
 the low-level `Server` registration, not FastMCP `@mcp.tool` introspection.
 
+A third companion normative brief, the **resource surface** doc, adds the
+standard MCP `list_resources` / `read_resource` surface in its own `§R*`,
+`R-Invariant N`, and `R-Decision N` namespaces (cite as e.g. `# §R1.1
+list_resources handler`, `# §R-Inv 3 allowlist not denylist`). The base doc
+still wins on anything it already specifies; the hardening doc still wins on
+anything it specifies; the continuity doc still wins on anything it specifies;
+this brief only adds new behavior. The §18 schema-pin tests continue to derive
+from `RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` — no
+shift for this brief.
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is

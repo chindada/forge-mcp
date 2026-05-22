@@ -153,15 +153,19 @@ class Orchestrator:
         *,
         task: ServerTaskContext | None = None,
         task_id: str | None = None,
+        harness_token: str | None = None,
     ) -> None:
         """Store constructor dependencies for run().
 
         Design: preflight owns validation/lock acquisition; orchestrator accepts
             the PreparedRun handoff and injected drivers. §C5 adds optional task
-            context and id while preserving direct-call construction.
+            context and id while preserving direct-call construction. §R3.2
+            adds optional harness_token for active-run resource discovery.
         Implementation: plain attribute storage, no IO until run(). Store task
-            for Status/phase polling and task_id for terminal RunResult.
-        Example: Orchestrator(prepared, inputs, config, ctx, drivers, task=task).
+            for Status/phase polling, task_id for terminal RunResult, and
+            harness_token for the §R3 active-run registry.
+        Example: Orchestrator(prepared, inputs, config, ctx, drivers,
+            task=task, harness_token='aBcDeFgHiJkL').
         """
         self._prepared = prepared
         self._inputs = inputs
@@ -170,6 +174,7 @@ class Orchestrator:
         self._drivers = drivers
         self._task = task
         self._task_id = task_id
+        self._harness_token = harness_token
 
     async def run(self) -> RunResult:
         """Execute the run and return a terminal RunResult.
@@ -220,7 +225,20 @@ class Orchestrator:
             config=self._config,
         )
         previous_umask = os.umask(0o077)  # §8.1 — captured just before the try
+        # §R3.2 — scope is built before the try so finally can see it; registry
+        # mutation itself stays inside the try that also releases the lock.
+        from ..resources import _ResourceScope, deregister_active_run, register_active_run
+
+        scope: _ResourceScope | None = None
+        if self._harness_token is not None:
+            scope = _ResourceScope(
+                run_id=self._prepared.run_id,
+                harness_dir=self._prepared.harness_dir,
+                harness_token=self._harness_token,
+            )
         try:
+            if scope is not None:
+                register_active_run(scope)  # §R3.2 — inside try
             try:
                 prune_old_runs(
                     self._prepared.harness_dir,
@@ -304,6 +322,7 @@ class Orchestrator:
                 ledger=ledger,
                 started_at=started_at,
                 task_id=self._task_id,
+                harness_token=self._harness_token,
             )
             return result
         finally:
@@ -314,3 +333,6 @@ class Orchestrator:
                 handler.close()
                 logger.removeHandler(handler)
             os.umask(previous_umask)
+            if scope is not None:
+                # §R3.2 — idempotent and after lock release/umask restore.
+                deregister_active_run(scope.harness_token, scope.run_id)

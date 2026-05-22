@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from mcp import types
 from mcp.server import Server
 from mcp.server.experimental.task_context import ServerTaskContext
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.shared.exceptions import McpError
 from mcp.types import (
     TASK_OPTIONAL,
     CallToolResult,
     CreateTaskResult,
     ErrorData,
+    ListResourcesResult,
+    Resource,
     TextContent,
     Tool,
     ToolExecution,
 )
-from pydantic import ValidationError
+from pydantic import AnyUrl, ValidationError
 
 from .config import RunConfig
 from .drivers._claude import ClaudeRunnerImpl
@@ -29,12 +36,41 @@ from .drivers.planner import PlannerDriver
 from .models import RunForgeInput, RunResult
 from .orchestrator import Orchestrator
 from .preflight import prepare_run
+from .resources import (
+    _ResourceScope,
+    compute_harness_token,
+    decode_uri,
+    expand_scope_to_resources,
+    list_active_runs,
+    match_artifact,
+    resolve_harness_dir,
+)
 
 INVALID_PARAMS = -32602
 RUN_FORGE_DESCRIPTION = "Run the Planner / Generator / Evaluator loop (§C1)."
 
 server = Server("forge-mcp")
 server.experimental.enable_tasks()
+
+# §R3.3 — startup-bound resource discovery config for completed runs.
+_RESOURCE_CONFIG: RunConfig = RunConfig.from_env()
+_RESOURCE_LOGGER: logging.Logger = logging.getLogger("forge_mcp.resources")
+_RESOURCE_NOT_FOUND_CODE = -32002  # §R-Decision 8 — MCP-spec, not exported.
+_RUN_ID_DIR_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _resource_not_found(uri: AnyUrl) -> McpError:
+    """Build the MCP resource-not-found error shape (§R1.1).
+
+    Design: §R-Decision 8 / §R-Inv 5 require -32002 on every resource reject
+        path, distinct from invalid-params and server-error tool failures.
+    Implementation: return McpError(ErrorData(...)); callers use `raise` so
+        all handler branches share exactly one wire code and message shape.
+    Example: raise _resource_not_found(uri).
+    """
+    return McpError(
+        ErrorData(code=_RESOURCE_NOT_FOUND_CODE, message=f"resource not found: {uri}", data=None)
+    )
 
 
 class _Drivers:
@@ -73,6 +109,126 @@ class ToolSchemaForTests:
 
     inputSchema: dict[str, Any]
     outputSchema: dict[str, Any]
+
+
+@server.list_resources()
+async def list_resources_handler(request: types.ListResourcesRequest) -> ListResourcesResult:
+    """Enumerate run artifacts across active and configured harnesses (§R1.1).
+
+    Design: §R1.1 sources are active-run registry first, then optional
+        FORGE_HARNESS_ROOTS for completed runs. Pagination is cursor-based and
+        eager (R-Decision 7), with OSError logged and skipped per scope/root.
+    Implementation: deduplicate scopes by (harness_token, run_id), expand via
+        stdlib-only resources.py helpers, sort Resource rows by URI, and slice
+        a fixed page size of fifty using a forgiving numeric cursor.
+    Example: result = await list_resources_handler(ListResourcesRequest(...)).
+    """
+    cursor = request.params.cursor if request.params is not None else None
+    scopes_by_key: dict[tuple[str, str], _ResourceScope] = {
+        (scope.harness_token, scope.run_id): scope for scope in list_active_runs()
+    }
+
+    for root_token, root_dir in _RESOURCE_CONFIG.harness_root_tokens.items():
+        try:
+            run_id_dirs = list(root_dir.iterdir())
+        except OSError as exc:
+            _RESOURCE_LOGGER.warning("root iterdir failed: %s root=%r", exc, root_dir)
+            continue
+        for run_id_dir in run_id_dirs:
+            if not run_id_dir.is_dir() or not _RUN_ID_DIR_RE.match(run_id_dir.name):
+                continue
+            key = (root_token, run_id_dir.name)
+            if key in scopes_by_key:
+                continue
+            scopes_by_key[key] = _ResourceScope(
+                run_id=run_id_dir.name,
+                harness_dir=root_dir,
+                harness_token=root_token,
+            )
+
+    rows: list[Resource] = []
+    for scope in scopes_by_key.values():
+        try:
+            for uri_str, name, mime_type, _subpath in expand_scope_to_resources(scope):
+                rows.append(Resource(uri=AnyUrl(uri_str), name=name, mimeType=mime_type))
+        except OSError as exc:
+            _RESOURCE_LOGGER.warning("expand failed: %s scope=%r", exc, scope)
+            continue
+
+    rows.sort(key=lambda resource: str(resource.uri))
+    page_size = 50
+    try:
+        start = int(cursor) if cursor is not None else 0
+    except ValueError:
+        start = 0
+    start = max(0, min(start, len(rows)))
+    items = rows[start : start + page_size]
+    next_cursor = str(start + page_size) if start + page_size < len(rows) else None
+    return ListResourcesResult(resources=items, nextCursor=next_cursor)
+
+
+@server.read_resource()
+async def read_resource_handler(uri: AnyUrl) -> list[ReadResourceContents]:
+    """Resolve a forge:// URI and serve the artifact's contents (§R1.1).
+
+    Design: §R1.1 read-only access serves one allowlisted artifact under a
+        registered or configured harness. §R6 containment runs before reading:
+        abspath commonpath, realpath commonpath, leaf symlink rejection, then
+        is_file. Every reject path maps to -32002 (R-Inv 5).
+    Implementation: decode URI, check allowlist, resolve token to harness dir,
+        validate containment, and read JSON strictly while text/log artifacts
+        use replacement decoding. No SDK/driver/orchestrator callback occurs.
+    Example: await read_resource_handler(AnyUrl('forge://token/run/state.json')).
+    """
+    return _read_resource_contents_sync(uri)
+
+
+def _read_resource_contents_sync(uri: AnyUrl) -> list[ReadResourceContents]:
+    """Synchronously validate and read one resource artifact (§R6).
+
+    Design: §R6's four containment checks are ordinary filesystem operations;
+        keeping them in a sync helper preserves their exact ordering and avoids
+        accidental async framework path substitutions.
+    Implementation: decode URI, check allowlist, resolve token, run abspath and
+        realpath commonpath checks, reject leaf symlinks, require a file, then
+        decode content according to MIME.
+    Example: contents = _read_resource_contents_sync(AnyUrl('forge://t/r/state.json')).
+    """
+    try:
+        harness_token, run_id, subpath = decode_uri(str(uri))
+    except ValueError:
+        raise _resource_not_found(uri) from None
+
+    pattern = match_artifact(subpath)
+    if pattern is None:
+        raise _resource_not_found(uri)
+
+    harness_dir = resolve_harness_dir(harness_token, _RESOURCE_CONFIG.harness_root_tokens)
+    if harness_dir is None:
+        raise _resource_not_found(uri)
+
+    abs_run_root = Path(os.path.abspath(harness_dir / run_id))
+    abs_full = Path(os.path.abspath(harness_dir / run_id / subpath))
+    try:
+        if os.path.commonpath([str(abs_full), str(abs_run_root)]) != str(abs_run_root):
+            raise _resource_not_found(uri)
+        real_run_root = Path(os.path.realpath(abs_run_root))
+        real_full = Path(os.path.realpath(abs_full))
+        if os.path.commonpath([str(real_full), str(real_run_root)]) != str(real_run_root):
+            raise _resource_not_found(uri)
+    except ValueError:
+        raise _resource_not_found(uri) from None
+    if abs_full.is_symlink():
+        raise _resource_not_found(uri)
+    if not abs_full.is_file():
+        raise _resource_not_found(uri)
+
+    json_mime = pattern.mime == "application/json"
+    try:
+        text = abs_full.read_text(encoding="utf-8", errors="strict" if json_mime else "replace")
+    except (OSError, UnicodeDecodeError):
+        raise _resource_not_found(uri) from None
+    return [ReadResourceContents(content=text, mime_type=pattern.mime)]
 
 
 @server.list_tools()
@@ -131,22 +287,29 @@ async def run_forge_handler(arguments: dict[str, Any]) -> CallToolResult | Creat
     config = RunConfig.from_env()
     prepared = await prepare_run(inputs, config)
     ctx = server.request_context
+    # §R3.2 — compute once so task-mode and direct-call branches share identity.
+    harness_token = compute_harness_token(prepared.harness_dir)
     if _client_requested_task_mode(ctx):
 
         async def work(task: ServerTaskContext) -> CallToolResult:
             """Run the orchestrator inside the server task context (§C1.4).
 
             Design: task mode survives client disconnect while preserving fresh
-                phase sessions and normal RunResult construction.
+                phase sessions and normal RunResult construction. §R3.2 threads
+                the precomputed harness_token through.
             Implementation: delegate to _orchestrator_entry and adapt the model
                 to CallToolResult for task completion storage.
             Example: result = await work(task).
             """
-            result = await _orchestrator_entry(prepared, inputs, config, ctx, task=task)
+            result = await _orchestrator_entry(
+                prepared, inputs, config, ctx, task=task, harness_token=harness_token
+            )
             return _result_to_call_tool_result(result)
 
         return await ctx.experimental.run_task(work)
-    result = await _orchestrator_entry(prepared, inputs, config, ctx, task=None)
+    result = await _orchestrator_entry(
+        prepared, inputs, config, ctx, task=None, harness_token=harness_token
+    )
     return _result_to_call_tool_result(result)
 
 
@@ -196,14 +359,17 @@ async def _orchestrator_entry(
     ctx: Any,
     *,
     task: ServerTaskContext | None,
+    harness_token: str | None = None,
 ) -> RunResult:
     """Construct and run Orchestrator with optional task state (§C5).
 
     Design: server.py is the only runtime owner of MCP task context; engine and
-        status receive it as a duck-typed optional value.
+        status receive it as a duck-typed optional value. §R3.2 forwards the
+        precomputed harness_token into Orchestrator for resource discovery.
     Implementation: construct fresh concrete drivers and pass task plus
-        best-effort task_id into Orchestrator.
-    Example: result = await _orchestrator_entry(prepared, inputs, config, ctx, task=None).
+        best-effort task_id and harness_token into Orchestrator.
+    Example: result = await _orchestrator_entry(prepared, inputs, config, ctx,
+        task=None, harness_token='aBcDeFgHiJkL').
     """
     return await Orchestrator(
         prepared,
@@ -213,6 +379,7 @@ async def _orchestrator_entry(
         _Drivers(),
         task=task,
         task_id=_extract_task_id(task),
+        harness_token=harness_token,
     ).run()
 
 

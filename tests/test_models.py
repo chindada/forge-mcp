@@ -303,3 +303,77 @@ def test_long_run_continuity_optional_fields_are_in_schema():
     assert "sessions_path" not in IterationArtifacts.model_json_schema().get("required", [])
     assert "plan_sessions_path" in ArtifactIndex.model_json_schema()["properties"]
     assert "plan_sessions_path" not in ArtifactIndex.model_json_schema().get("required", [])
+
+
+def test_iteration_artifacts_uri_companions_default_none():
+    """§R4.3 optional companions stay None by default.
+
+    Design: URI companions are additive and must not break old payloads.
+    Implementation: instantiate with only existing required path fields.
+    Example: IterationArtifacts(...).contract_uri is None.
+    """
+    from forge_mcp.models import IterationArtifacts
+
+    art = IterationArtifacts(n=1, contract_path="/x/iteration-1/contract.md")
+    assert art.contract_uri is None
+    assert art.summary_uri is None
+    assert art.eval_json_uri is None
+    assert art.eval_md_uri is None
+    assert art.triage_json_uri is None
+    assert art.sessions_uri is None
+    assert art.git_violation_uri is None
+    assert art.verify_uri is None
+
+
+def test_iteration_artifacts_uri_companions_set():
+    """§R4.3 explicit URI assignment works.
+
+    Design: Result builders can populate URI companions when tokenized.
+    Implementation: pass a contract_uri through the Pydantic model.
+    Example: art.contract_uri starts with forge://.
+    """
+    from forge_mcp.models import IterationArtifacts
+
+    art = IterationArtifacts(
+        n=1,
+        contract_path="/x/iteration-1/contract.md",
+        contract_uri="forge://aBcDeFgHiJkL/12345678/iteration-1/contract.md",
+    )
+    assert art.contract_uri == "forge://aBcDeFgHiJkL/12345678/iteration-1/contract.md"
+
+
+def test_artifact_index_uri_companions_default_none():
+    """§R4.2 artifact-index URI companions default to None.
+
+    Design: URI companions are optional and nullable in the schema.
+    Implementation: construct ArtifactIndex with pre-existing required paths.
+    Example: ArtifactIndex(...).plan_uri is None.
+    """
+    from forge_mcp.models import ArtifactIndex
+
+    idx = ArtifactIndex(
+        plan_path="/x/plan/plan.md",
+        status_log_path="/x/status.log",
+        state_json_path="/x/state.json",
+    )
+    assert idx.plan_uri is None
+    assert idx.plan_sessions_uri is None
+    assert idx.status_log_uri is None
+    assert idx.state_json_uri is None
+    assert idx.git_state_uri is None
+    assert idx.git_uncommitted_uri is None
+    assert idx.unresolved_gaps_overflow_uri is None
+    assert idx.design_flaw_gaps_overflow_uri is None
+
+
+def test_artifact_index_has_no_run_log_uri():
+    """§R-Inv 3 keeps run.log structurally unreachable.
+
+    Design: The public result is allowlist-based and excludes run.log.
+    Implementation: inspect Pydantic model fields for absent path and URI.
+    Example: 'run_log_uri' not in ArtifactIndex.model_fields.
+    """
+    from forge_mcp.models import ArtifactIndex
+
+    assert "run_log_uri" not in ArtifactIndex.model_fields
+    assert "run_log_path" not in ArtifactIndex.model_fields
