@@ -499,3 +499,271 @@ def test_engine_run_does_not_re_transition_failed_after_build_result() -> None:
     after_build = src.split("build_result(", 1)[1] if "build_result(" in src else ""
     assert 'sm.transition("failed"' not in after_build
     assert "sm.transition('failed'" not in after_build
+
+
+async def test_engine_writes_fingerprint_after_canonicalize(tmp_path: Path, monkeypatch) -> None:
+    """§L10 — fingerprint file lands next to design.md after canonicalize.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Return completed without invoking drivers.
+
+        Design: lineage wiring is pre-loop orchestration behavior, independent
+            of planner/generator/evaluator phase internals.
+        Implementation: return a completed terminal tuple immediately.
+        Example: await fake_run_phases(...) == ("completed", 0).
+        """
+        return ("completed", 0)
+
+    prepared = _prepared(tmp_path)
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+    text = (
+        (prepared.harness_dir / prepared.run_id / "inputs" / "design.fingerprint")
+        .read_text()
+        .strip()
+    )
+    assert len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _write_prior_lineage_run(
+    harness: Path, run_id: str, design_text: str, *, hours_old: int = 1
+) -> None:
+    """Write a synthetic prior terminal run for engine lineage tests.
+
+    Design: §L13.3 engine tests need prior-run artifacts realistic enough for
+        find_lineage_runs and summarize_prior_run to accept them.
+    Implementation: write design.fingerprint, terminal state.json, and a small
+        latest eval.json under the requested run id.
+    Example: _write_prior_lineage_run(harness, "aaaa0001", "design").
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from forge_mcp.models import EvalGap, EvalResult
+    from forge_mcp.orchestrator.lineage import fingerprint_design
+
+    run_dir = harness / run_id
+    (run_dir / "inputs").mkdir(parents=True)
+    (run_dir / "iteration-1").mkdir()
+    (run_dir / "inputs" / "design.fingerprint").write_text(fingerprint_design(design_text) + "\n")
+    now = datetime.now(UTC) - timedelta(hours=hours_old)
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "state": "incomplete",
+                "run_id": run_id,
+                "target_dir": str(harness.parent),
+                "iteration": 1,
+                "started_at": (now - timedelta(minutes=5)).isoformat(),
+                "last_updated_at": now.isoformat(),
+                "cancelled": False,
+                "last_completed_iteration": 1,
+                "reason": "non-progress: synthetic prior",
+            }
+        )
+    )
+    gap = EvalGap(
+        title=f"prior gap {run_id}",
+        severity="high",
+        design_doc_section="§1",
+        current_state="missing",
+        expected_state="present",
+        suggested_fix="different strategy",
+    )
+    (run_dir / "iteration-1" / "eval.json").write_text(
+        EvalResult(no_gaps=False, gaps=[gap], summary="prior failed").model_dump_json()
+    )
+
+
+async def test_engine_links_prior_run_and_writes_digest(tmp_path: Path, monkeypatch) -> None:
+    """§L13.3 — eligible prior run feeds planner digest and RunResult linkage.
+
+    Design: engine wiring must connect fingerprinting, sibling scan, summary,
+        digest write, result linked_prior_runs, and ArtifactIndex path fields.
+    Implementation: synthesize one matching prior run and run mocked phases to
+        terminal completed, then assert disk and model outputs.
+    Example: pytest runs this test in the non-slow suite.
+    """
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Return completed without invoking drivers.
+
+        Design: lineage integration is independent of phase implementation.
+        Implementation: return a completed terminal tuple immediately.
+        Example: await fake_run_phases(...) == ("completed", 0).
+        """
+        return ("completed", 0)
+
+    prepared = _prepared(tmp_path)
+    design_text = _inputs(prepared).design_doc_content or ""
+    _write_prior_lineage_run(prepared.harness_dir, "aaaa0001", design_text)
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+    prior_path = prepared.harness_dir / prepared.run_id / "inputs" / "prior_attempts.md"
+    assert result.linked_prior_runs == ["aaaa0001"]
+    assert prior_path.exists()
+    assert result.artifacts.prior_attempts_path == str(prior_path)
+
+
+async def test_engine_ignore_prior_attempts_still_writes_fingerprint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """§L13.3 — per-call opt-out skips digest but keeps fingerprint.
+
+    Design: §L-Inv 2 fingerprint recording is independent of whether this run
+        elects to consume prior attempts.
+    Implementation: synthesize a matching prior run, set ignore_prior_attempts,
+        then assert no digest/linkage but fingerprint exists.
+    Example: pytest runs this test in the non-slow suite.
+    """
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Return completed without invoking drivers.
+
+        Design: opt-out behavior is pre-loop orchestration behavior.
+        Implementation: return a completed terminal tuple immediately.
+        Example: await fake_run_phases(...) == ("completed", 0).
+        """
+        return ("completed", 0)
+
+    prepared = _prepared(tmp_path)
+    inputs = _inputs(prepared).model_copy(update={"ignore_prior_attempts": True})
+    _write_prior_lineage_run(prepared.harness_dir, "aaaa0001", inputs.design_doc_content or "")
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    result = await Orchestrator(prepared, inputs, RunConfig(), Ctx(), _drivers()).run()
+    inputs_dir = prepared.harness_dir / prepared.run_id / "inputs"
+    assert result.linked_prior_runs == []
+    assert not (inputs_dir / "prior_attempts.md").exists()
+    assert (inputs_dir / "design.fingerprint").exists()
+
+
+async def test_engine_fingerprint_write_oserror_skips_lineage_and_warns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """§L13.3 / §L16 risk 2 — fingerprint-write OSError forces cold start.
+
+    Design: when write_design_fingerprint raises OSError (ENOSPC / EROFS),
+        engine.run MUST catch it, set fp=None, surface a ledger warning, and
+        skip the lineage discovery block even when an eligible prior run
+        exists — proving the §L-Inv 1 cold-start fallback covers the §L10
+        fingerprint write per §L16 risk 2.
+    Implementation: synthesize one matching prior run via the existing
+        helper, monkeypatch engine_mod.write_design_fingerprint to raise
+        OSError, drive the orchestrator to completed via a fake run_phases,
+        and assert no linkage and no prior_attempts.md plus a warning whose
+        text contains "design.fingerprint write failed".
+    Example: pytest runs this in the non-slow suite.
+    """
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Return completed without invoking drivers.
+
+        Design: this test exercises the pre-loop lineage block only.
+        Implementation: return the completed terminal tuple immediately.
+        Example: await fake_run_phases(...) == ("completed", 0).
+        """
+        return ("completed", 0)
+
+    def fake_write_design_fingerprint(_inputs_dir, _fp):
+        """Simulate a disk-full failure at the §L10 fingerprint write site.
+
+        Design: §L16 risk 2 demands the fingerprint write be best-effort;
+            OSError must short-circuit lineage without failing the run.
+        Implementation: raise OSError unconditionally so the engine's
+            except branch fires.
+        Example: monkeypatch.setattr(engine_mod, "write_design_fingerprint",
+            fake_write_design_fingerprint).
+        """
+        raise OSError(28, "No space left on device")
+
+    prepared = _prepared(tmp_path)
+    design_text = _inputs(prepared).design_doc_content or ""
+    # §L13.3 — prior run is OTHERWISE eligible; only the failed fingerprint
+    # write should suppress lineage. If the fix regresses, this run would
+    # link to "aaaa0001" and write prior_attempts.md.
+    _write_prior_lineage_run(prepared.harness_dir, "aaaa0001", design_text)
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "write_design_fingerprint", fake_write_design_fingerprint)
+    result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+    inputs_dir = prepared.harness_dir / prepared.run_id / "inputs"
+    # §L10 — fp must be None on the OSError branch, so lineage block is
+    # skipped and prior_attempts.md is never written.
+    assert result.linked_prior_runs == []
+    assert not (inputs_dir / "prior_attempts.md").exists()
+    # §L-Inv 1 — the ledger surfaces the failure as a warning so the caller
+    # can audit the cold-start fallback.
+    assert any("design.fingerprint write failed" in warning for warning in result.warnings), (
+        f"expected fingerprint-write warning in result.warnings; got {result.warnings!r}"
+    )
+
+
+async def test_engine_stop_reason_persists_to_state_json_and_prior_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """§L13.3 / §L16 risk 4 — §H3 break reason round-trips through state.json.
+
+    Design: when the iteration loop sets ledger.stop_reason and returns
+        ("incomplete", N), engine.run MUST call
+        sm.transition("incomplete", reason=ledger.stop_reason) so the
+        durable state.json carries the text; summarize_prior_run MUST then
+        read it back as PriorRunSummary.reason. This is the load-bearing
+        signal the next planner uses to avoid replaying a plateau (§L5.2,
+        §L16 risk 4).
+    Implementation: monkeypatch run_phases to set ledger.stop_reason and
+        return an incomplete terminal, run the orchestrator, then (a)
+        re-read state.json from disk and assert reason matches; (b) call
+        summarize_prior_run on the run directory and assert the
+        PriorRunSummary.reason equals the same text.
+    Example: pytest runs this in the non-slow suite.
+    """
+    from forge_mcp.orchestrator.lineage import summarize_prior_run
+
+    expected_reason = "non-progress: oscillation detected at iteration 3"
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Simulate a §H3 non-progress break.
+
+        Design: phases.py sets ledger.stop_reason before returning
+            ("incomplete", N) when the §H3 break fires (see
+            phases.py:613). This fake mirrors that contract.
+        Implementation: assign expected_reason to ledger.stop_reason and
+            return the incomplete terminal tuple.
+        Example: await fake_run_phases(deps, sm, ledger, git) sets reason.
+        """
+        ledger.stop_reason = expected_reason
+        return ("incomplete", 1)
+
+    prepared = _prepared(tmp_path)
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+
+    run_dir = prepared.harness_dir / prepared.run_id
+    # §L10 — assert the durable state.json carries the reason text.
+    state_payload = json.loads((run_dir / "state.json").read_text())
+    assert state_payload.get("state") == "incomplete"
+    assert state_payload.get("reason") == expected_reason, (
+        f"state.json.reason must carry the §H3 stop_reason; got {state_payload.get('reason')!r}"
+    )
+
+    # §L5.2 — assert summarize_prior_run reads it back as
+    # PriorRunSummary.reason (the load-bearing field for next-planner
+    # plateau-avoidance signaling per §L16 risk 4).
+    summary = summarize_prior_run(run_dir)
+    assert summary is not None
+    assert summary.reason == expected_reason

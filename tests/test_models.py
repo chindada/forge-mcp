@@ -377,3 +377,112 @@ def test_artifact_index_has_no_run_log_uri():
 
     assert "run_log_uri" not in ArtifactIndex.model_fields
     assert "run_log_path" not in ArtifactIndex.model_fields
+
+
+def test_run_forge_input_ignore_prior_attempts_default_false() -> None:
+    """§L8.1 — ignore_prior_attempts defaults to False.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.models import RunForgeInput
+
+    inp = RunForgeInput(target_dir="/r", design_doc_content="x")
+    assert inp.ignore_prior_attempts is False
+
+
+def test_run_forge_input_ignore_prior_attempts_true_accepted() -> None:
+    """§L8.1 — ignore_prior_attempts=True is accepted.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.models import RunForgeInput
+
+    inp = RunForgeInput(target_dir="/r", design_doc_content="x", ignore_prior_attempts=True)
+    assert inp.ignore_prior_attempts is True
+
+
+def test_run_result_linked_prior_runs_defaults_empty() -> None:
+    """§L8.2 — linked_prior_runs defaults to [] on cold starts.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.models import ArtifactIndex, RunResult
+
+    r = RunResult(
+        status="completed",
+        run_id="abcd1234",
+        run_dir="/r/.harness/abcd1234",
+        iterations_used=1,
+        runtime_seconds=10,
+        artifacts=ArtifactIndex(
+            plan_path="/r/plan/plan.md",
+            status_log_path="/r/status.log",
+            state_json_path="/r/state.json",
+        ),
+        message="ok",
+    )
+    assert r.linked_prior_runs == []
+
+
+def test_artifact_index_new_fields_default_none() -> None:
+    """§L8.3 — lineage ArtifactIndex companions default None.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.models import ArtifactIndex
+
+    ai = ArtifactIndex(
+        plan_path="/r/plan/plan.md",
+        status_log_path="/r/status.log",
+        state_json_path="/r/state.json",
+    )
+    assert ai.prior_attempts_path is None
+    assert ai.prior_attempts_uri is None
+    assert ai.design_flaws_path is None
+    assert ai.design_flaws_uri is None
+
+
+def test_run_forge_input_schema_still_object_root_lineage() -> None:
+    """§L8.7 — RunForgeInput schema stays object-root.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.models import RunForgeInput
+
+    schema = RunForgeInput.model_json_schema()
+    assert schema["type"] == "object"
+    assert "anyOf" not in schema and "oneOf" not in schema and "allOf" not in schema
+
+
+def test_run_result_schema_still_object_root_lineage() -> None:
+    """§L8.7 — RunResult schema stays object-root.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.models import RunResult
+
+    assert RunResult.model_json_schema()["type"] == "object"

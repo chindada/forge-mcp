@@ -487,3 +487,68 @@ def test_resources_module_imports_stdlib_only():
         elif isinstance(node, ast.ImportFrom):
             top = (node.module or "").split(".", 1)[0]
             assert top in allowed_top_levels, f"forbidden from-import: {node.module}"
+
+
+def test_allowlist_includes_lineage_artifacts() -> None:
+    """§L9.2 — allowlist entries cover lineage artifacts.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.resources import match_artifact
+
+    fingerprint = match_artifact("inputs/design.fingerprint")
+    prior_attempts = match_artifact("inputs/prior_attempts.md")
+    overflow = match_artifact("inputs/prior_attempts-overflow.md")
+    design_flaws = match_artifact("design_flaws.json")
+    assert fingerprint is not None and fingerprint.mime == "text/plain"
+    assert prior_attempts is not None and prior_attempts.mime == "text/markdown"
+    assert overflow is not None
+    assert design_flaws is not None and design_flaws.mime == "application/json"
+
+
+def test_allowlist_still_excludes_run_log_lineage() -> None:
+    """§R9.1 — run.log MUST remain absent.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.resources import match_artifact
+
+    assert match_artifact("run.log") is None
+
+
+def test_expand_scope_includes_lineage_artifacts(tmp_path: Path) -> None:
+    """§L9.2 — expand_scope_to_resources lists lineage artifacts when present.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp.resources import _ResourceScope, expand_scope_to_resources
+
+    harness = tmp_path / "harness"
+    run_id = "abcd1234"
+    run_root = harness / run_id
+    (run_root / "inputs").mkdir(parents=True)
+    (run_root / "inputs" / "design.md").write_text("d")
+    (run_root / "inputs" / "design.fingerprint").write_text("a" * 64 + "\n")
+    (run_root / "inputs" / "prior_attempts.md").write_text("# p\n")
+    (run_root / "inputs" / "prior_attempts-overflow.md").write_text("tail\n")
+    (run_root / "design_flaws.json").write_text('{"gaps":[]}')
+    (run_root / "state.json").write_text("{}")
+    (run_root / "status.log").write_text("")
+    scope = _ResourceScope(run_id=run_id, harness_dir=harness, harness_token="aBcDeFgHiJkL")
+    subpaths = {row[3] for row in expand_scope_to_resources(scope)}
+    assert "inputs/design.fingerprint" in subpaths
+    assert "inputs/prior_attempts.md" in subpaths
+    assert "inputs/prior_attempts-overflow.md" in subpaths
+    assert "design_flaws.json" in subpaths

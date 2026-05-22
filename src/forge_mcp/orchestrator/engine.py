@@ -13,13 +13,21 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from mcp.server.experimental.task_context import ServerTaskContext
 
-from ..artifacts import atomic_write_text, create_run_dir, prune_old_runs
+from ..artifacts import (
+    atomic_write_text,
+    create_run_dir,
+    prune_old_runs,
+    write_design_fingerprint,
+    write_design_flaws,
+    write_prior_attempts,
+)
 from ..doctor import disk_space_warn_if_low
 from ..gitguard import capture_state, capture_uncommitted
 from ..models import EvalResult, RunForgeInput, RunResult
 from ..preflight import PreparedRun
 from ..state import RunState
 from ..status import Status
+from . import lineage
 from .convergence import fingerprint_gaps
 from .ledger import RunLedger
 from .lifecycle import (
@@ -250,9 +258,65 @@ class Orchestrator:
             terminal_status = "failed"
             try:
                 resume_point = self._prepared.resume_point
+                inputs_dir = run_dir / "inputs"
                 if resume_point is None:
                     sm.transition("canonicalizing")  # §8.1
                     canonicalize_design(self._inputs, run_dir, ledger)
+
+                fp: str | None = None
+                try:
+                    design_text = (inputs_dir / "design.md").read_text(encoding="utf-8")
+                    fp = lineage.fingerprint_design(design_text)
+                    write_design_fingerprint(inputs_dir, fp)
+                except OSError as exc:
+                    fp = None  # §L10 — disables lineage block below; §L-Inv 2
+                    ledger.warnings.append(
+                        f"design.fingerprint write failed (cold start): {type(exc).__name__}: {exc}"
+                    )
+                    logger.warning("design.fingerprint write failed", exc_info=True)
+
+                if (
+                    fp is not None
+                    and not self._inputs.ignore_prior_attempts
+                    and self._config.lineage_top_k > 0
+                ):
+                    try:
+                        candidates = lineage.find_lineage_runs(
+                            self._prepared.harness_dir,
+                            fp,
+                            current_run_id=self._prepared.run_id,
+                            top_k=self._config.lineage_top_k,
+                        )
+                        summaries = [
+                            summary
+                            for summary in (
+                                lineage.summarize_prior_run(candidate.run_dir)
+                                for candidate in candidates
+                            )
+                            if summary is not None
+                        ]
+                        if summaries:
+                            digest = lineage.render_prior_attempts(summaries)
+                            overflow_path = write_prior_attempts(inputs_dir, digest)
+                            ledger.linked_prior_runs = [summary.run_id for summary in summaries]
+                            ledger.lineage_overflow_path = overflow_path
+                            if overflow_path is not None:
+                                ledger.warnings.append(
+                                    "lineage digest exceeded 32768 bytes; "
+                                    f"overflow at {overflow_path.name}"
+                                )
+                            await status.update(
+                                phase="canonicalizing",
+                                agent="orchestrator",
+                                message=f"lineage: {len(summaries)} prior runs feeding planner",
+                            )
+                    except Exception as exc:  # noqa: BLE001 — §L-Inv 1 best-effort.
+                        ledger.warnings.append(
+                            f"lineage discovery failed (cold start): {type(exc).__name__}: {exc}"
+                        )
+                        logger.warning("lineage discovery failed", exc_info=True)
+
+                if resume_point is None:
                     git_state = capture_state(deps.target_dir)
                     if git_state is not None:
                         atomic_write_text(run_dir / "inputs" / "git-state.txt", git_state)
@@ -298,7 +362,19 @@ class Orchestrator:
                     ledger.unresolved_gaps = collect_unresolved_gaps(run_dir)
                 sm.transition("finalizing")
                 ledger.decided_at = datetime.now(UTC)
-                sm.transition(terminal_status)  # type: ignore[arg-type]
+                if terminal_status == "incomplete" and ledger.stop_reason:
+                    sm.transition("incomplete", reason=ledger.stop_reason)
+                else:
+                    sm.transition(terminal_status)  # type: ignore[arg-type]
+                design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
+                try:
+                    write_design_flaws(run_dir, design_flaws_full)
+                except OSError as exc:
+                    ledger.warnings.append(
+                        "design_flaws.json write failed (lineage feed-forward disabled): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.warning("design_flaws.json write failed", exc_info=True)
                 await emit_terminal_status(status, terminal_status)  # §8.1
             except TimeoutError:
                 terminal_status = "incomplete"

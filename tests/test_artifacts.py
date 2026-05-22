@@ -165,3 +165,169 @@ def test_write_sessions_json_creates_ordered_private_file(tmp_path):
     assert json.loads(target.read_text()) == {"iteration": 2, "phases": entries}
     if os.name == "posix":
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_write_design_fingerprint_atomic(tmp_path):
+    """§L2.3 — writes one-line hex digest + newline; 0600 on POSIX.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    fp = "a" * 64
+    artifacts.write_design_fingerprint(inputs_dir, fp)
+    p = inputs_dir / "design.fingerprint"
+    assert p.read_text() == fp + "\n"
+    if os.name == "posix":
+        assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_write_design_fingerprint_idempotent(tmp_path):
+    """§L2.3 — re-writing with the same content replaces atomically.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    fp = "b" * 64
+    artifacts.write_design_fingerprint(inputs_dir, fp)
+    artifacts.write_design_fingerprint(inputs_dir, fp)
+    assert (inputs_dir / "design.fingerprint").read_text() == fp + "\n"
+
+
+def test_write_prior_attempts_under_cap_no_overflow(tmp_path):
+    """§L6.2 — text under cap writes whole, returns None.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    text = "# small\n\nbody\n"
+    overflow = artifacts.write_prior_attempts(inputs_dir, text)
+    assert overflow is None
+    assert (inputs_dir / "prior_attempts.md").read_text() == text
+    assert not (inputs_dir / "prior_attempts-overflow.md").exists()
+
+
+def test_write_prior_attempts_over_cap_splits(tmp_path):
+    """§L6.2 — text over cap writes head + overflow; returns overflow path.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    body = ("a" * 79 + "\n") * 600
+    overflow = artifacts.write_prior_attempts(inputs_dir, body)
+    assert overflow is not None
+    assert overflow == inputs_dir / "prior_attempts-overflow.md"
+    head = (inputs_dir / "prior_attempts.md").read_text()
+    tail = overflow.read_text()
+    assert len(head.encode("utf-8")) <= 32_768 + 200
+    assert "truncated" in head.lower()
+    assert body.startswith(head.split("\n... truncated")[0].rstrip("\n"))
+    assert body.rstrip("\n").endswith(tail.rstrip("\n"))
+
+
+def test_write_prior_attempts_posix_0600(tmp_path):
+    """§L6.2 — head + overflow are 0600 on POSIX.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    artifacts.write_prior_attempts(inputs_dir, "line\n" * 10_000)
+    if os.name == "posix":
+        assert (inputs_dir / "prior_attempts.md").stat().st_mode & 0o777 == 0o600
+        assert (inputs_dir / "prior_attempts-overflow.md").stat().st_mode & 0o777 == 0o600
+
+
+def test_write_design_flaws_empty_list(tmp_path):
+    """§L8.4 — empty list still writes the artifact envelope.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    artifacts.write_design_flaws(tmp_path, [])
+    assert json.loads((tmp_path / "design_flaws.json").read_text()) == {"gaps": []}
+
+
+def test_write_design_flaws_nonempty(tmp_path):
+    """§L8.4 — non-empty list serializes via model_dump(mode='json').
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+    from forge_mcp.models import DesignFlawGap
+
+    flaw = DesignFlawGap(
+        gap=EvalGap(
+            title="t",
+            severity="high",
+            design_doc_section="§1",
+            current_state="c",
+            expected_state="e",
+            suggested_fix="f",
+        ),
+        iteration_n=2,
+        fault_kind="ambiguity",
+        cited_sections=["§3.4 says one thing and §5.2 says the opposite"],
+        explanation="contradiction",
+    )
+    artifacts.write_design_flaws(tmp_path, [flaw])
+    payload = json.loads((tmp_path / "design_flaws.json").read_text())
+    assert payload["gaps"][0]["fault_kind"] == "ambiguity"
+
+
+def test_write_design_flaws_0600(tmp_path):
+    """§L8.4 — 0600 on POSIX, same as every §13 artifact.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    from forge_mcp import artifacts
+
+    artifacts.write_design_flaws(tmp_path, [])
+    if os.name == "posix":
+        assert (tmp_path / "design_flaws.json").stat().st_mode & 0o777 == 0o600

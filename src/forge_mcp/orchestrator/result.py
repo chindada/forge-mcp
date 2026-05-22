@@ -120,6 +120,8 @@ def _artifact_index(
         )
     plan_sessions_exists = (run_dir / "plan" / "sessions.json").exists()
     git_state_exists = (run_dir / "inputs" / "git-state.txt").exists()
+    prior_attempts_exists = (run_dir / "inputs" / "prior_attempts.md").exists()  # §L8.3
+    design_flaws_exists = (run_dir / "design_flaws.json").exists()
     return ArtifactIndex(
         plan_path=str(run_dir / "plan" / "plan.md"),
         plan_uri=_maybe_uri(harness_token, run_id, "plan/plan.md") if run_id else None,
@@ -153,6 +155,16 @@ def _artifact_index(
             harness_token, run_id, "design-flaw-gaps-overflow.md"
         )
         if (ledger.design_flaw_overflow_path and run_id)
+        else None,
+        prior_attempts_path=str(run_dir / "inputs" / "prior_attempts.md")
+        if prior_attempts_exists
+        else None,
+        prior_attempts_uri=_maybe_uri(harness_token, run_id, "inputs/prior_attempts.md")
+        if (prior_attempts_exists and run_id)
+        else None,
+        design_flaws_path=str(run_dir / "design_flaws.json") if design_flaws_exists else None,
+        design_flaws_uri=_maybe_uri(harness_token, run_id, "design_flaws.json")
+        if (design_flaws_exists and run_id)
         else None,
     )
 
@@ -217,4 +229,5 @@ def build_result(
         traceback_truncated=ledger.traceback_truncated if failed else None,
         verification=verification,
         resumed_from_iteration=ledger.resumed_from_iteration,
+        linked_prior_runs=list(ledger.linked_prior_runs),
     )

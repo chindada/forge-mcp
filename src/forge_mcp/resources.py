@@ -41,6 +41,9 @@ _ALLOWED_ARTIFACTS: tuple[_ArtifactPattern, ...] = (
     _ArtifactPattern("inputs/design.md", None, "text/markdown"),
     _ArtifactPattern("inputs/git-state.txt", None, "text/plain"),
     _ArtifactPattern("inputs/git-uncommitted.txt", None, "text/plain"),
+    _ArtifactPattern("inputs/design.fingerprint", None, "text/plain"),  # §L9.2
+    _ArtifactPattern("inputs/prior_attempts.md", None, "text/markdown"),
+    _ArtifactPattern("inputs/prior_attempts-overflow.md", None, "text/markdown"),
     _ArtifactPattern("plan/plan.md", None, "text/markdown"),
     _ArtifactPattern("plan/sessions.json", None, "application/json"),
     _ArtifactPattern(None, re.compile(r"^iteration-([1-9]\d*)/contract\.md$"), "text/markdown"),
@@ -57,6 +60,7 @@ _ALLOWED_ARTIFACTS: tuple[_ArtifactPattern, ...] = (
     _ArtifactPattern("status.log", None, "application/x-ndjson"),
     _ArtifactPattern("unresolved-gaps-overflow.md", None, "text/markdown"),
     _ArtifactPattern("design-flaw-gaps-overflow.md", None, "text/markdown"),
+    _ArtifactPattern("design_flaws.json", None, "application/json"),  # §L9.2
 )
 
 
@@ -265,12 +269,20 @@ def expand_scope_to_resources(scope: _ResourceScope) -> list[tuple[str, str, str
         "status.log",
         "unresolved-gaps-overflow.md",
         "design-flaw-gaps-overflow.md",
+        "design_flaws.json",
     ):
         _append_if_file(out, scope, run_root / name, name)
 
     inputs_dir = run_root / "inputs"
     if inputs_dir.is_dir():
-        for name in ("design.md", "git-state.txt", "git-uncommitted.txt"):
+        for name in (
+            "design.md",
+            "git-state.txt",
+            "git-uncommitted.txt",
+            "design.fingerprint",
+            "prior_attempts.md",
+            "prior_attempts-overflow.md",
+        ):
             _append_if_file(out, scope, inputs_dir / name, f"inputs/{name}")
 
     plan_dir = run_root / "plan"

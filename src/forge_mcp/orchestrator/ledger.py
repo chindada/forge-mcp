@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from ..models import DesignFlawGap, EvalGap
 from ..verifier import VerificationOutcome
@@ -42,3 +43,6 @@ class RunLedger:
     carried_gaps: list[EvalGap] = field(default_factory=list)
     stop_reason: str | None = None
     resumed_from_iteration: int | None = None
+    # §L8.5 — forensic fields for cross-run learning.
+    linked_prior_runs: list[str] = field(default_factory=list)
+    lineage_overflow_path: Path | None = None

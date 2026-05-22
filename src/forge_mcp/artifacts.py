@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .models import EvalResult
+from .models import DesignFlawGap, EvalResult
 
 
 def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
@@ -197,3 +197,60 @@ def render_eval_md(eval_result: EvalResult, *, iteration_n: int) -> str:
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def write_design_fingerprint(inputs_dir: Path, fingerprint: str) -> None:
+    """Atomically write inputs/design.fingerprint with 0600 perms (§L2.3).
+
+    Design: §L2.3 uses a glob-friendly one-line fingerprint sidecar next to
+        inputs/design.md so later runs can match exact canonical design docs.
+    Implementation: write hex digest plus LF through atomic_write_text, inheriting
+        same-directory temp replacement and POSIX 0600 permissions.
+    Example: write_design_fingerprint(run_dir / "inputs", "a" * 64).
+    """
+    atomic_write_text(inputs_dir / "design.fingerprint", fingerprint + "\n")
+
+
+_PRIOR_ATTEMPTS_MAX_BYTES = 32_768
+
+
+def write_prior_attempts(inputs_dir: Path, text: str) -> Path | None:
+    """Write capped inputs/prior_attempts.md plus overflow if needed (§L6.2).
+
+    Design: §L6.2 caps the planner digest so cross-run learning cannot consume
+        unbounded context; overflow is preserved as a forensic artifact.
+    Implementation: if UTF-8 bytes fit, atomically write the whole file;
+        otherwise split at the last newline before the cap, append a pointer to
+        the head, and atomically write prior_attempts-overflow.md.
+    Example: overflow = write_prior_attempts(run_dir / "inputs", digest).
+    """
+    encoded = text.encode("utf-8")
+    path = inputs_dir / "prior_attempts.md"
+    if len(encoded) <= _PRIOR_ATTEMPTS_MAX_BYTES:
+        atomic_write_text(path, text)
+        return None
+    cut = encoded.rfind(b"\n", 0, _PRIOR_ATTEMPTS_MAX_BYTES)
+    if cut == -1:
+        cut = _PRIOR_ATTEMPTS_MAX_BYTES
+        while cut > 0 and (encoded[cut - 1] & 0xC0) == 0x80:
+            cut -= 1
+    head_text = encoded[:cut].decode("utf-8", errors="replace")
+    tail_text = encoded[cut:].lstrip(b"\n").decode("utf-8", errors="replace")
+    atomic_write_text(path, head_text + "\n... truncated; see prior_attempts-overflow.md\n")
+    overflow_path = inputs_dir / "prior_attempts-overflow.md"
+    atomic_write_text(overflow_path, tail_text)
+    return overflow_path
+
+
+def write_design_flaws(run_dir: Path, flaws: list[DesignFlawGap]) -> None:
+    """Atomically write <run_dir>/design_flaws.json sidecar (§L8.4).
+
+    Design: §L8.4 persists full structured design-flaw records before result
+        caps truncate in-memory lists, enabling later lineage summaries.
+    Implementation: serialize an envelope {"gaps": [...]} using
+        model_dump(mode="json") for each flaw and atomic_write_text for 0600
+        replacement semantics.
+    Example: write_design_flaws(run_dir, ledger.design_flaw_gaps).
+    """
+    payload = {"gaps": [flaw.model_dump(mode="json") for flaw in flaws]}
+    atomic_write_text(run_dir / "design_flaws.json", json.dumps(payload, indent=2) + "\n")

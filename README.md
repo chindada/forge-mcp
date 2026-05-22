@@ -152,3 +152,29 @@ deliberately does not ship an in-process command denylist (it would be security
 theater for an agent that can author and execute scripts). The real isolation
 boundary is the deployer's OS/container sandbox: run forge-mcp against a
 disposable/scratch checkout inside an OS/container sandbox you control.
+
+## Cross-run learning (§L)
+
+Each `run_forge` invocation auto-detects prior terminal runs on the same
+design document (matched by SHA-256 fingerprint over the canonicalized
+design text) and feeds the planner a structured digest of what didn't
+work. The digest is rendered to `inputs/prior_attempts.md` and read by
+the planner through the same `add_dirs=[inputs/]` surface as `design.md`.
+
+**Anti-anchoring is load-bearing.** The planner prompt directs the model
+to propose a *different* implementation strategy when prior gaps recur,
+not to refine a multiply-failed approach.
+
+**Controls:**
+
+- `ignore_prior_attempts: bool = False` on `RunForgeInput` — per-call
+  opt-out.
+- `FORGE_LINEAGE_TOP_K` env var (default 4, validated `[0, 10]`,
+  `0` = kill switch) — per-deployment opt-out.
+
+**Threat model.** Lineage is bounded to a single `target_dir` — two
+tenants would need to share both `target_dir` AND write byte-identical
+design docs for any cross-tenant bleed. Operators with sensitive
+workloads should set `FORGE_LINEAGE_TOP_K=0`. See
+`docs/specs/forge-mcp-cross-run-learning.md` §L16 for the full risk
+catalog.

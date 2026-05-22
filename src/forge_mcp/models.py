@@ -39,6 +39,14 @@ class RunForgeInput(BaseModel):
     verify_timeout_seconds: Annotated[int, Field(ge=1, le=24 * 60 * 60)] = 1800
     resume: bool = False
     network_access: bool = True
+    ignore_prior_attempts: bool = Field(
+        default=False,
+        description=(
+            "§L8 — explicit opt-out from cross-run learning. When True, "
+            "the planner gets no inputs/prior_attempts.md even when "
+            "matching prior runs exist."
+        ),
+    )
 
     @model_validator(mode="after")
     def _exactly_one_design_doc(self) -> RunForgeInput:
@@ -250,6 +258,9 @@ class ArtifactIndex(BaseModel):
     git_uncommitted_path: str | None = None
     unresolved_gaps_overflow_path: str | None = None
     design_flaw_gaps_overflow_path: str | None = None
+    # §L8.3 — cross-run learning artifacts; absent on cold-start and legacy runs.
+    prior_attempts_path: str | None = None
+    design_flaws_path: str | None = None
     # §R4.2 — optional forge:// URI companions. run.log/run_log_uri DELIBERATELY
     # ABSENT (R-Inv 3, allowlist not denylist).
     plan_uri: str | None = None
@@ -260,6 +271,8 @@ class ArtifactIndex(BaseModel):
     git_uncommitted_uri: str | None = None
     unresolved_gaps_overflow_uri: str | None = None
     design_flaw_gaps_overflow_uri: str | None = None
+    prior_attempts_uri: str | None = None
+    design_flaws_uri: str | None = None
 
 
 class VerificationSummary(BaseModel):
@@ -310,3 +323,10 @@ class RunResult(BaseModel):
     traceback_truncated: str | None = Field(default=None, max_length=4096)
     verification: VerificationSummary | None = None
     resumed_from_iteration: int | None = None
+    linked_prior_runs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "§L8 — run_ids whose digest informed this run's planner, "
+            "most-recent first; empty on cold-start or opt-out."
+        ),
+    )

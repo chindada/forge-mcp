@@ -26,6 +26,7 @@ class RunConfig:
     keep_runs: int = 10
     harness_roots: tuple[Path, ...] = ()  # §R3.3
     harness_root_tokens: dict[str, Path] = field(default_factory=dict)  # §R3.3 token -> root
+    lineage_top_k: int = 4  # §L8.6; K=0 disables cross-run learning.
 
     @classmethod
     def from_env(cls) -> RunConfig:
@@ -62,6 +63,15 @@ class RunConfig:
                 parsed.append(root)
                 tokens[compute_harness_token(root)] = root
             roots = tuple(parsed)
+        raw_top_k = os.environ.get("FORGE_LINEAGE_TOP_K", "4")
+        try:
+            lineage_top_k = int(raw_top_k)
+        except ValueError as exc:
+            raise ValueError(
+                f"FORGE_LINEAGE_TOP_K must be an integer in [0, 10], got {raw_top_k!r}"
+            ) from exc
+        if not 0 <= lineage_top_k <= 10:
+            raise ValueError(f"FORGE_LINEAGE_TOP_K must be in [0, 10], got {lineage_top_k}")
         return cls(
             codex_bin=os.environ.get("FORGE_CODEX_BIN", "codex"),
             claude_config_dir=Path(claude_config_dir) if claude_config_dir else None,
@@ -69,4 +79,5 @@ class RunConfig:
             keep_runs=int(os.environ.get("FORGE_KEEP_RUNS", "10")),
             harness_roots=roots,
             harness_root_tokens=tokens,
+            lineage_top_k=lineage_top_k,
         )

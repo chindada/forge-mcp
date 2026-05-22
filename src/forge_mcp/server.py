@@ -53,7 +53,17 @@ server = Server("forge-mcp")
 server.experimental.enable_tasks()
 
 # §R3.3 — startup-bound resource discovery config for completed runs.
-_RESOURCE_CONFIG: RunConfig = RunConfig.from_env()
+try:
+    _RESOURCE_CONFIG: RunConfig = RunConfig.from_env()
+except ValueError as _exc:
+    import sys as _sys
+
+    # §L14 step 5 — stderr hint before re-raising opaque server-spawn failures.
+    print(
+        f"Invalid forge-mcp config: {_exc}. Run `forge doctor` for diagnostics.",
+        file=_sys.stderr,
+    )
+    raise
 _RESOURCE_LOGGER: logging.Logger = logging.getLogger("forge_mcp.resources")
 _RESOURCE_NOT_FOUND_CODE = -32002  # §R-Decision 8 — MCP-spec, not exported.
 _RUN_ID_DIR_RE = re.compile(r"^[0-9a-f]{8}$")

@@ -31,6 +31,19 @@ this brief only adds new behavior. The §18 schema-pin tests continue to derive
 from `RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` — no
 shift for this brief.
 
+A fifth companion normative brief, the **cross-run learning** doc
+(`docs/specs/forge-mcp-cross-run-learning.md`), adds planner cold-start
+digest of prior terminal runs (auto-detected by design-doc SHA-256
+fingerprint) in its own `§L*`, `L-Invariant N`, and `L-Decision N`
+namespaces (cite as e.g. `# §L2 fingerprint`, `# §L-Inv 1 cold-start
+fallback`). The base doc still wins on anything it specifies; the
+hardening doc still wins on anything it specifies; the continuity doc
+still wins on anything it specifies; the resource-surface doc still
+wins on anything it specifies; this brief only adds new behavior. The
+§18 schema-pin tests continue to derive from
+`RunForgeInput.model_json_schema()` /
+`RunResult.model_json_schema()` — no shift for this brief.
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is
@@ -146,6 +159,7 @@ Pre-release dep: `openai-codex` tracks `@main` (Decision 7, §19 — no PyPI rel
 | `FORGE_CODEX_BIN` | codex binary path | `"codex"` on `PATH` |
 | `CLAUDE_CONFIG_DIR` | Claude SDK config dir | inherit SDK default |
 | `FORGE_CLAUDE_CLI_PATH` | `claude` CLI override — preflight **and** runtime | unset; `claude` on `PATH` |
+| `FORGE_LINEAGE_TOP_K` | cross-run learning top-K (0 disables); validated `[0, 10]` | `4` |
 
 `FORGE_CLAUDE_CLI_PATH` is threaded into `ClaudeAgentOptions(cli_path=…)` via `RunContext.claude_cli_path` — a true runtime hatch (one deliberate step beyond legacy, which consumed it only in the doctor/preflight check).
 

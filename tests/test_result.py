@@ -74,3 +74,78 @@ def test_artifact_index_picks_up_git_violation_txt(tmp_path: Path) -> None:
     idx = _artifact_index(tmp_path, RunLedger())
     assert idx.iterations[0].git_violation_path is not None
     assert idx.iterations[0].git_violation_path.endswith("git-violation.txt")
+
+
+def test_build_result_populates_linked_prior_runs(tmp_path: Path) -> None:
+    """§L8.2 — RunResult.linked_prior_runs reflects ledger.linked_prior_runs.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    run_dir = tmp_path / "abcd1234"
+    (run_dir / "plan").mkdir(parents=True)
+    (run_dir / "plan" / "plan.md").write_text("plan")
+    sm = RunStateMachine(
+        run_dir / "state.json",
+        RunState(
+            state="completed",
+            run_id="abcd1234",
+            target_dir="/r",
+            iteration=1,
+            started_at=datetime.now(UTC),
+        ),
+    )
+    ledger = RunLedger()
+    ledger.linked_prior_runs = ["aaaa0001", "aaaa0002"]
+    result = build_result(
+        run_id="abcd1234",
+        run_dir=run_dir,
+        status="completed",
+        inputs=RunForgeInput(target_dir="/r", design_doc_content="x"),
+        sm=sm,
+        ledger=ledger,
+        started_at=datetime.now(UTC),
+    )
+    assert result.linked_prior_runs == ["aaaa0001", "aaaa0002"]
+
+
+def test_artifact_index_includes_prior_attempts_path_when_present(tmp_path: Path) -> None:
+    """§L8.3 — ArtifactIndex lineage paths are presence-gated.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    run_dir = tmp_path / "abcd1234"
+    (run_dir / "inputs").mkdir(parents=True)
+    (run_dir / "inputs" / "prior_attempts.md").write_text("# p")
+    (run_dir / "inputs" / "design.fingerprint").write_text("a" * 64)
+    (run_dir / "design_flaws.json").write_text('{"gaps":[]}')
+    ai = _artifact_index(run_dir, RunLedger())
+    assert ai.prior_attempts_path == str(run_dir / "inputs" / "prior_attempts.md")
+    assert ai.design_flaws_path == str(run_dir / "design_flaws.json")
+    assert ai.prior_attempts_uri is None
+
+
+def test_artifact_index_includes_uris_when_token_present(tmp_path: Path) -> None:
+    """§L8.3 — lineage URIs populate with harness_token and run_id.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    run_dir = tmp_path / "abcd1234"
+    (run_dir / "inputs").mkdir(parents=True)
+    (run_dir / "inputs" / "prior_attempts.md").write_text("# p")
+    (run_dir / "design_flaws.json").write_text('{"gaps":[]}')
+    ai = _artifact_index(run_dir, RunLedger(), harness_token="aBcDeFgHiJkL", run_id="abcd1234")
+    assert ai.prior_attempts_uri is not None
+    assert ai.prior_attempts_uri.startswith("forge://aBcDeFgHiJkL/abcd1234/")
+    assert ai.design_flaws_uri is not None

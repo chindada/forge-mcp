@@ -55,7 +55,12 @@ def doctor() -> None:
         exit 1 if any check fails.
     Example: forge doctor.
     """
-    config = RunConfig.from_env()
+    try:
+        config = RunConfig.from_env()
+    except ValueError as exc:
+        # §L14 step 5 — bad lineage/env config becomes a normal doctor failure.
+        typer.echo(f"[FAIL] env_config: {exc}")
+        sys.exit(1)
     checks: list[tuple[str, str, str]] = [
         doc.check_target_dir_writable(Path.cwd()),
         doc.check_harness_writable(Path.cwd() / ".harness"),

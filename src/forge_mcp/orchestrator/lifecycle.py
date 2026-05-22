@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..artifacts import atomic_write_text
+from ..artifacts import atomic_write_text, write_design_flaws
 from ..models import EvalGap, EvalResult
 from .caps import GAP_LIST_CAP, build_gap_overflow, split_warnings
 from .ledger import RunLedger
@@ -132,6 +132,16 @@ async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> N
     ledger.unresolved_gaps = collect_unresolved_gaps(deps.run_dir)
     ledger.decided_at = datetime.now(UTC)
     sm.transition("incomplete")
+
+    design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
+    try:
+        write_design_flaws(deps.run_dir, design_flaws_full)
+    except OSError as exc:
+        ledger.warnings.append(
+            "design_flaws.json write failed (lineage feed-forward disabled): "
+            f"{type(exc).__name__}: {exc}"
+        )
+        deps.logger.warning("design_flaws.json write failed", exc_info=True)
     apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
     await emit_terminal_status(deps.status, "incomplete")
 
@@ -160,6 +170,16 @@ async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc:
         ledger.unresolved_gaps = []
     ledger.decided_at = datetime.now(UTC)
     sm.transition("failed", reason=str(exc))
+
+    design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
+    try:
+        write_design_flaws(deps.run_dir, design_flaws_full)
+    except OSError as exc:
+        ledger.warnings.append(
+            "design_flaws.json write failed (lineage feed-forward disabled): "
+            f"{type(exc).__name__}: {exc}"
+        )
+        deps.logger.warning("design_flaws.json write failed", exc_info=True)
     apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
     await emit_terminal_status(deps.status, "failed")
 

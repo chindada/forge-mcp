@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from typer.testing import CliRunner
 
 from forge_mcp import cli
@@ -141,3 +142,43 @@ def test_version_prints_package_version() -> None:
     result = CliRunner().invoke(cli.app, ["version"])
     assert result.exit_code == 0
     assert expected in result.output
+
+
+def test_doctor_bad_lineage_top_k_emits_fail_line(monkeypatch, capsys) -> None:
+    """§L14 step 5 — bad FORGE_LINEAGE_TOP_K emits a FAIL env_config line.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    monkeypatch.setenv("FORGE_LINEAGE_TOP_K", "abc")
+    from forge_mcp.cli import doctor as doctor_cmd
+
+    with pytest.raises(SystemExit) as exc_info:
+        doctor_cmd()
+    combined = capsys.readouterr().out + capsys.readouterr().err
+    assert exc_info.value.code == 1
+    assert "FAIL" in combined and "env_config" in combined
+
+
+def test_server_import_bad_lineage_top_k_emits_stderr_diagnostic(monkeypatch, capsys) -> None:
+    """§L14 step 5 — server.py import with bad env writes stderr hint.
+
+    Design: cross-run learning and adjacent orchestration behavior is
+        load-bearing, so tests pin the user-visible contract.
+    Implementation: call focused production code or fixtures and assert the
+        observable artifact, model, prompt, or configuration result.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    import importlib
+    import sys
+
+    monkeypatch.setenv("FORGE_LINEAGE_TOP_K", "abc")
+    sys.modules.pop("forge_mcp.server", None)
+    with pytest.raises(ValueError):
+        importlib.import_module("forge_mcp.server")
+    captured = capsys.readouterr()
+    assert "Invalid forge-mcp config" in captured.err
+    assert "forge doctor" in captured.err
