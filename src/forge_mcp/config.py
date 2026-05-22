@@ -15,7 +15,7 @@ class RunConfig:
 
     Design: §6.5 centralizes environment overrides for Codex and Claude so
         preflight and runtime use the same values.
-    Implementation: `from_env` reads three variables and converts path-valued
+    Implementation: `from_env` reads the documented environment variables and converts path-valued
         settings to Path while leaving absent overrides as None.
     Example: cfg = RunConfig.from_env(); cfg.codex_bin == 'codex'.
     """

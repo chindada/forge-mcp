@@ -62,7 +62,7 @@ specifies; the hardening, continuity, resource-surface, and cross-run
 briefs each still win on anything in their namespaces; this brief only
 adds new behavior. The §18 schema-pin tests continue to derive from
 `RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` —
-§W3 adds one new optional field (`failure_kind: str | None`) which the
+§W3 adds one new optional field (`failure_kind: FailureKind | None`) which the
 pin extends to cover verbatim; §S does not touch the input/result
 shape.
 
@@ -182,6 +182,8 @@ Pre-release dep: `openai-codex` tracks `@main` (Decision 7, §19 — no PyPI rel
 | `CLAUDE_CONFIG_DIR` | Claude SDK config dir | inherit SDK default |
 | `FORGE_CLAUDE_CLI_PATH` | `claude` CLI override — preflight **and** runtime | unset; `claude` on `PATH` |
 | `FORGE_LINEAGE_TOP_K` | cross-run learning top-K (0 disables); validated `[0, 10]` | `4` |
+| `FORGE_HARNESS_ROOTS` | extra harness roots (comma-separated absolute paths) surfaced read-only by the resource layer; each must exist + be a readable dir or `from_env` raises (§R3.3) | unset; none |
+| `FORGE_KEEP_RUNS` | completed-run retention — newest N kept, older pruned at run start (never the live/resumed run) (§H9) | `10` |
 
 `FORGE_CLAUDE_CLI_PATH` is threaded into `ClaudeAgentOptions(cli_path=…)` via `RunContext.claude_cli_path` — a true runtime hatch (one deliberate step beyond legacy, which consumed it only in the doctor/preflight check).
 
