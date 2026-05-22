@@ -31,7 +31,7 @@ this brief only adds new behavior. The §18 schema-pin tests continue to derive
 from `RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` — no
 shift for this brief.
 
-A fifth companion normative brief, the **cross-run learning** doc
+A fourth companion normative brief, the **cross-run learning** doc
 (`docs/specs/forge-mcp-cross-run-learning.md`), adds planner cold-start
 digest of prior terminal runs (auto-detected by design-doc SHA-256
 fingerprint) in its own `§L*`, `L-Invariant N`, and `L-Decision N`
