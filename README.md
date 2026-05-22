@@ -121,6 +121,14 @@ The `run.log` file may contain sensitive prompt/output snippets and is written w
 ## Development
 
 ```sh
+make help                      # list all targets
+make setup                     # install project + dev extras (uv sync --all-extras)
+make fmt                       # apply safe ruff autofixes + format
+make lint                      # ruff check + format check + pyright + docstrings
+make test                      # fast tests (pytest -m "not slow"); matches CI
+make ci                        # full merge gate: lint + test (== scripts/ci.sh)
+
+# Raw uv equivalents (if make is unavailable):
 uv sync --all-extras           # install dev dependencies (ruff, pyright, pytest)
 uv run ruff check
 uv run pyright

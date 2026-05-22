@@ -66,6 +66,21 @@ adds new behavior. The §18 schema-pin tests continue to derive from
 pin extends to cover verbatim; §S does not touch the input/result
 shape.
 
+A sixth companion normative brief, the **build and tooling** doc
+(`docs/specs/forge-mcp-build-and-tooling.md`), adds a top-level
+`Makefile` as the single developer-facing entry point for the
+static-check + lifecycle target matrix, and shrinks `scripts/ci.sh`
+to an `exec make ci` wrapper, in its own `§M*`, `M-Invariant N`, and
+`M-Decision N` namespaces (cite as e.g. `# §M2.3 fmt order`,
+`# §M-Inv 3 ci mirrors scripts/ci.sh`). The base doc still wins on
+anything it specifies; the hardening, continuity, resource-surface,
+cross-run-learning, and host-protocol-and-planner-extensions briefs
+each still win on anything in their namespaces; this brief only adds
+new behavior. The §18 schema-pin tests continue to derive from
+`RunForgeInput.model_json_schema()` /
+`RunResult.model_json_schema()` — no shift for this brief (the
+Makefile touches no Pydantic schema).
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is
@@ -142,6 +157,7 @@ Dropping `_auto_approve_codex_requests` is safe: the Codex SDK's default approva
 ## Commands
 
 ```sh
+make help                          # list all make targets (build/test/lint lifecycle)
 uv sync                            # install (creates .venv, resolves uv.lock)
 uv run forge doctor                # environment preflight (claude/codex CLIs, skills, auth)
 uv run forge serve                 # start the stdio MCP server
@@ -149,6 +165,8 @@ uv run pytest -m "not slow"        # fast tests (what CI runs)
 uv run pytest -m slow              # the real-CLI e2e only (needs claude + codex)
 bash scripts/ci.sh                 # full CI gate (ruff + pyright + docstrings + pytest)
 ```
+
+`make help` lists the full build/test/lint lifecycle; the raw `uv run` commands above remain the underlying primitives and work for ad-hoc invocation or on a Make-less machine.
 
 Single test: `uv run pytest tests/test_<name>.py::<test>`.
 
