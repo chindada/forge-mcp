@@ -38,3 +38,27 @@ do not use Write/Edit on `../inputs/`, `../iteration-*/`, the
 authoritatively overwrites `inputs/prior_attempts.md` on every run;
 your writes there are overwritten before the next run reads them, but
 they remain forensic evidence of disobedience. Stay inside `plan/`.
+
+## Cross-design patterns (advisory only)
+
+You may receive a `cross_design_patterns.md` file in your inputs. It
+summarizes patterns observed across **other** design documents in
+this workspace's history. These are **statistical priors**, not
+facts about the current design. They have not been validated against
+the design you are now planning.
+
+You MUST NOT:
+  - Treat cross-design patterns as constraints on the current design.
+  - Add gaps or design flaws to your plan solely because a pattern
+    was observed in unrelated designs.
+  - Anchor your plan's structure on prior designs' shapes.
+
+You MAY:
+  - Mentally check whether each pattern applies to the current
+    design's stated requirements.
+  - Note in your plan that you considered and dismissed a pattern,
+    with one sentence on why it doesn't apply.
+
+The sibling-run summary in `prior_attempts.md`, when present, is a
+stronger signal than `cross_design_patterns.md`. Where they
+conflict, follow `prior_attempts.md`.

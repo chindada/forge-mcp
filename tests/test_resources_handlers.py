@@ -400,25 +400,84 @@ async def test_read_resource_corrupt_log_replaced(tmp_path, monkeypatch):
     assert contents[0].mime_type == "application/x-ndjson"
 
 
-def test_capabilities_resources_false_flags():
-    """§R9.4 resource capability flags are exactly false.
+def test_capabilities_resources_subscribe_and_list_changed_advertised():
+    """§S1 resource capability flags are advertised by CLI init options.
 
     Design: §R tests pin the resource-surface behavior required by the plan.
     Implementation: The test constructs focused fixtures and asserts direct outputs.
     Example: pytest runs this test in the non-slow suite.
     """
+    from forge_mcp.cli import build_init_options
+
+    caps = build_init_options().capabilities
+    assert caps.resources is not None
+    assert caps.resources.subscribe is True
+    assert caps.resources.listChanged is True
+
+
+def test_subscribe_capability_flag_true():
+    """§S1: resources.subscribe capability flag is advertised as True.
+
+    Design: §-Tests enumerates this single-flag pin so a regression that
+        drops the subscribe handler is caught by name; subsumed-by
+        test_capabilities_resources_subscribe_and_list_changed_advertised.
+    Implementation: assert build_init_options advertises subscribe=True, then
+        pin the get_capabilities() mechanism named by the design — the installed
+        SDK hardcodes subscribe=False, so build_init_options is the component
+        that upgrades it; assert both halves so the upgrade can't be dropped.
+    Example: build_init_options().capabilities.resources.subscribe is True.
+    """
     from mcp.server.lowlevel import NotificationOptions
 
+    from forge_mcp.cli import build_init_options
     from forge_mcp.server import server
 
-    caps = server.get_capabilities(NotificationOptions(), {})
+    # End-to-end advertised capability (what clients receive).
+    caps = build_init_options().capabilities
     assert caps.resources is not None
-    assert caps.resources.subscribe is False
-    assert caps.resources.listChanged is False
+    assert caps.resources.subscribe is True
+
+    # §S1: the installed SDK hardcodes subscribe=False on raw get_capabilities;
+    # build_init_options upgrades it. Pin both halves.
+    raw = server.get_capabilities(
+        notification_options=NotificationOptions(resources_changed=True),
+        experimental_capabilities={},
+    )
+    assert raw.resources is not None
+    assert raw.resources.subscribe is False
 
 
-def test_no_subscribe_handler_registered():
-    """§R-Decision 3 no resources/subscribe handler is registered.
+def test_subscribe_capability_listChanged_true():
+    """§S1: resources.listChanged capability flag is advertised as True.
+
+    Design: §-Tests enumerates this single-flag pin so a regression that
+        drops listChanged advertisement is caught by name; subsumed-by
+        test_capabilities_resources_subscribe_and_list_changed_advertised.
+    Implementation: assert build_init_options advertises listChanged=True and
+        also assert it through the design's named server.get_capabilities()
+        mechanism, which honors NotificationOptions(resources_changed=True).
+    Example: build_init_options().capabilities.resources.listChanged is True.
+    """
+    from mcp.server.lowlevel import NotificationOptions
+
+    from forge_mcp.cli import build_init_options
+    from forge_mcp.server import server
+
+    caps = build_init_options().capabilities
+    assert caps.resources is not None
+    assert caps.resources.listChanged is True
+
+    # §S1: assert through the design's named mechanism.
+    raw = server.get_capabilities(
+        notification_options=NotificationOptions(resources_changed=True),
+        experimental_capabilities={},
+    )
+    assert raw.resources is not None
+    assert raw.resources.listChanged is True
+
+
+def test_subscribe_handler_registered():
+    """§S3 resources/subscribe handler is registered.
 
     Design: §R tests pin the resource-surface behavior required by the plan.
     Implementation: The test constructs focused fixtures and asserts direct outputs.
@@ -428,7 +487,104 @@ def test_no_subscribe_handler_registered():
 
     from forge_mcp.server import server
 
-    assert types.SubscribeRequest not in server.request_handlers
+    assert types.SubscribeRequest in server.request_handlers
+
+
+async def test_subscribe_handler_rejects_unallowed_uri() -> None:
+    """§S4: subscribing to a non-allowlisted URI raises McpError(-32002).
+
+    Design: subscribe shares read_resource's decode+allowlist gate, so a URI
+        that resolves to no allowlisted artifact is rejected with the same
+        -32002 code and the same "resource not found: <uri>" message shape.
+    Implementation: call subscribe_resource_handler with a valid-shape forge URI
+        whose subpath (run.log) is intentionally not allowlisted; assert the
+        raised McpError code and message.
+    Example: subscribing forge://.../run.log raises -32002.
+    """
+    from forge_mcp.server import subscribe_resource_handler
+
+    uri = AnyUrl("forge://tokenToken12/abcd1234/run.log")
+    with pytest.raises(McpError) as exc_info:
+        await subscribe_resource_handler(uri)
+    assert exc_info.value.error.code == -32002
+    assert exc_info.value.error.message == f"resource not found: {uri}"
+
+
+async def test_subscribe_handler_accepts_allowed_uri_and_registers(monkeypatch) -> None:
+    """§S4/§S5: subscribing to an allowlisted URI registers the current session.
+
+    Design: a readable artifact URI must be subscribable; the handler inserts the
+        in-flight request session into the in-memory subscription registry.
+    Implementation: stub server.request_context with a fake carrying a recording
+        session, call the handler with an allowlisted state.json URI, and assert
+        the registry now lists that session as a subscriber of the exact URI.
+    Example: after subscribe, subscribed_sessions(uri) contains the session.
+    """
+    from types import SimpleNamespace
+
+    from forge_mcp import subscriptions
+    from forge_mcp.server import server, subscribe_resource_handler
+
+    class _RecordingSession:
+        """Identity-hashable fake session for the subscribe accept path.
+
+        Design: the registry keys sessions by identity; a bare object suffices.
+        Implementation: no behavior needed beyond being hashable by identity.
+        Example: session = _RecordingSession().
+        """
+
+    session = _RecordingSession()
+    fake_ctx = SimpleNamespace(session=session)
+    monkeypatch.setattr(type(server), "request_context", property(lambda _self: fake_ctx))
+
+    uri = AnyUrl("forge://tokenToken12/abcd1234/state.json")
+    fresh = subscriptions.SubscriptionRegistry()
+    monkeypatch.setattr(subscriptions, "_REGISTRY", fresh)
+
+    await subscribe_resource_handler(uri)
+
+    assert session in tuple(fresh.subscribed_sessions(str(uri)))
+
+
+async def test_unsubscribe_handler_is_idempotent(monkeypatch) -> None:
+    """§S4: unsubscribing a never-subscribed URI is a no-op, twice over.
+
+    Design: hosts may reissue unsubscribe during reconnect recovery, so the
+        handler must tolerate a URI that was never subscribed without raising
+        or adding a URI subscription; handler-level counterpart to the
+        registry-level test_subscribe_unsubscribe_and_drop_are_idempotent.
+    Implementation: stub server.request_context with a fake session, swap in a
+        fresh empty SubscriptionRegistry, call unsubscribe_resource_handler
+        twice on an unsubscribed URI, and assert no raise, no URI subscribers,
+        and one connection-level session record.
+    Example: two unsubscribe calls leave subscribed_sessions(uri) empty.
+    """
+    from types import SimpleNamespace
+
+    from forge_mcp import subscriptions
+    from forge_mcp.server import server, unsubscribe_resource_handler
+
+    class _RecordingSession:
+        """Identity-hashable fake session for the unsubscribe idempotency pin.
+
+        Design: the registry keys sessions by identity; a bare object suffices.
+        Implementation: no behavior needed beyond being hashable by identity.
+        Example: session = _RecordingSession().
+        """
+
+    session = _RecordingSession()
+    fake_ctx = SimpleNamespace(session=session)
+    monkeypatch.setattr(type(server), "request_context", property(lambda _self: fake_ctx))
+
+    fresh = subscriptions.SubscriptionRegistry()
+    monkeypatch.setattr(subscriptions, "_REGISTRY", fresh)
+
+    uri = AnyUrl("forge://tokenToken12/abcd1234/state.json")
+    await unsubscribe_resource_handler(uri)
+    await unsubscribe_resource_handler(uri)
+
+    assert list(fresh.subscribed_sessions(str(uri))) == []
+    assert list(fresh._sessions_view()) == [session]
 
 
 async def test_list_resources_poison_per_scope(tmp_path, monkeypatch, caplog):

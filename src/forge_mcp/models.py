@@ -11,6 +11,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from .errors import FailureKind
+
 
 class RunForgeInput(BaseModel):
     """Validated input accepted by the `run_forge` MCP tool.
@@ -328,5 +330,12 @@ class RunResult(BaseModel):
         description=(
             "§L8 — run_ids whose digest informed this run's planner, "
             "most-recent first; empty on cold-start or opt-out."
+        ),
+    )
+    failure_kind: FailureKind | None = Field(
+        default=None,
+        description=(
+            "§W3 — categorical kind for status in {failed, incomplete}; always "
+            "None for completed. Mirrors the stable bracketed error prefix."
         ),
     )

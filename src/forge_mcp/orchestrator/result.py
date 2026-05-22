@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ..errors import PREFIX_START, FailureKind, tag
 from ..models import (
     ArtifactIndex,
     IterationArtifacts,
@@ -14,6 +15,33 @@ from ..models import (
 )
 from .ledger import RunLedger
 from .statemachine import RunStateMachine
+
+
+def _failure_kind_for(status: str) -> FailureKind | None:
+    """Map a terminal RunResult status to its §W categorical kind.
+
+    Design: §W3 says completed has no failure kind, failed maps to
+        infra_failure, and incomplete maps to timeout for returned results.
+    Implementation: use a flat mapping and return None for unknown values so
+        the model validation still owns illegal status detection.
+    Example: _failure_kind_for("incomplete") returns "timeout".
+    """
+    mapping: dict[str, FailureKind] = {"failed": "infra_failure", "incomplete": "timeout"}
+    return mapping.get(status)
+
+
+def _tag_once(kind: FailureKind, body: str | None) -> str | None:
+    """Prefix a message body unless it is already tagged (§W3).
+
+    Design: §W-Decision 5 prepends the stable prefix while preserving the body;
+        retry paths must not accidentally double-prefix diagnostics.
+    Implementation: None passes through; strings beginning with the literal
+        prefix family pass through; all other strings route through errors.tag.
+    Example: _tag_once("timeout", "cap") starts with the timeout prefix.
+    """
+    if body is None or body.startswith(PREFIX_START):
+        return body
+    return tag(kind, body)
 
 
 def _iteration_dirs(run_dir: Path) -> list[Path]:
@@ -200,6 +228,9 @@ def build_result(
     }[status]
     if ledger.stop_reason:
         message += f" (stopped early: {ledger.stop_reason})"
+    failure_kind = _failure_kind_for(status)
+    if failure_kind is not None:
+        message = _tag_once(failure_kind, message) or message
     verification = None
     if ledger.last_verification is not None:
         v = ledger.last_verification
@@ -225,9 +256,12 @@ def build_result(
         message=message,
         failed_phase=ledger.failed_phase if failed else None,
         error_class=ledger.error_class if failed else None,
-        error_message=ledger.error_message if failed else None,
+        error_message=_tag_once(failure_kind, ledger.error_message)
+        if failed and failure_kind is not None
+        else None,
         traceback_truncated=ledger.traceback_truncated if failed else None,
         verification=verification,
         resumed_from_iteration=ledger.resumed_from_iteration,
         linked_prior_runs=list(ledger.linked_prior_runs),
+        failure_kind=failure_kind,
     )

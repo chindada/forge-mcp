@@ -27,12 +27,14 @@ from mcp.types import (
 )
 from pydantic import AnyUrl, ValidationError
 
+from . import subscriptions
 from .config import RunConfig
 from .drivers._claude import ClaudeRunnerImpl
 from .drivers._codex import CodexRunnerImpl
 from .drivers.evaluator import EvaluatorDriver
 from .drivers.generator import GeneratorDriver
 from .drivers.planner import PlannerDriver
+from .errors import tag
 from .models import RunForgeInput, RunResult
 from .orchestrator import Orchestrator
 from .preflight import prepare_run
@@ -81,6 +83,24 @@ def _resource_not_found(uri: AnyUrl) -> McpError:
     return McpError(
         ErrorData(code=_RESOURCE_NOT_FOUND_CODE, message=f"resource not found: {uri}", data=None)
     )
+
+
+def _note_current_session_connected() -> None:
+    """Record the in-flight request's session as connection-level present (§S6).
+
+    Design: S-Decision 10 makes list_changed connection-level; a session must be
+        tracked the moment it issues any request so register/deregister
+        broadcasts reach it even if it never subscribes to a URI.
+    Implementation: read server.request_context.session under a LookupError guard
+        (no active request context outside a live call) and note it on the
+        module-level subscription registry.
+    Example: _note_current_session_connected() at the top of each handler.
+    """
+    try:
+        session = server.request_context.session
+    except LookupError:
+        return
+    subscriptions._REGISTRY.note_connected(session)
 
 
 class _Drivers:
@@ -133,6 +153,7 @@ async def list_resources_handler(request: types.ListResourcesRequest) -> ListRes
         a fixed page size of fifty using a forgiving numeric cursor.
     Example: result = await list_resources_handler(ListResourcesRequest(...)).
     """
+    _note_current_session_connected()
     cursor = request.params.cursor if request.params is not None else None
     scopes_by_key: dict[tuple[str, str], _ResourceScope] = {
         (scope.harness_token, scope.run_id): scope for scope in list_active_runs()
@@ -190,7 +211,41 @@ async def read_resource_handler(uri: AnyUrl) -> list[ReadResourceContents]:
         use replacement decoding. No SDK/driver/orchestrator callback occurs.
     Example: await read_resource_handler(AnyUrl('forge://token/run/state.json')).
     """
+    _note_current_session_connected()
     return _read_resource_contents_sync(uri)
+
+
+@server.subscribe_resource()
+async def subscribe_resource_handler(uri: AnyUrl) -> None:
+    """Validate and register one resource subscription (§S3/§S4).
+
+    Design: subscribe uses the same decode and allowlist gates as read_resource
+        so readable URIs and subscribable URIs stay in parity.
+    Implementation: decode_uri, match_artifact, then insert the current request
+        session into the in-memory subscription registry.
+    Example: await subscribe_resource_handler(AnyUrl('forge://t/r/state.json')).
+    """
+    _note_current_session_connected()
+    try:
+        _harness_token, _run_id, subpath = decode_uri(str(uri))
+    except ValueError:
+        raise _resource_not_found(uri) from None
+    if match_artifact(subpath) is None:
+        raise _resource_not_found(uri)
+    subscriptions._REGISTRY.subscribe(server.request_context.session, str(uri))
+
+
+@server.unsubscribe_resource()
+async def unsubscribe_resource_handler(uri: AnyUrl) -> None:
+    """Idempotently remove one resource subscription (§S3).
+
+    Design: unsubscribe intentionally does not validate resource allowlisting so
+        hosts can safely clean up speculative or stale URI subscriptions.
+    Implementation: remove the exact URI string for the current session.
+    Example: await unsubscribe_resource_handler(AnyUrl('forge://t/r/state.json')).
+    """
+    _note_current_session_connected()
+    subscriptions._REGISTRY.unsubscribe(server.request_context.session, str(uri))
 
 
 def _read_resource_contents_sync(uri: AnyUrl) -> list[ReadResourceContents]:
@@ -293,10 +348,13 @@ async def run_forge_handler(arguments: dict[str, Any]) -> CallToolResult | Creat
     try:
         inputs = RunForgeInput(**arguments)
     except ValidationError as exc:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(exc))) from exc
+        message = tag("invalid_params", str(exc))
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=message)) from exc
     config = RunConfig.from_env()
     prepared = await prepare_run(inputs, config)
     ctx = server.request_context
+    # §S6 — track before register_active_run broadcasts.
+    subscriptions._REGISTRY.note_connected(ctx.session)
     # §R3.2 — compute once so task-mode and direct-call branches share identity.
     harness_token = compute_harness_token(prepared.harness_dir)
     if _client_requested_task_mode(ctx):
@@ -381,6 +439,7 @@ async def _orchestrator_entry(
     Example: result = await _orchestrator_entry(prepared, inputs, config, ctx,
         task=None, harness_token='aBcDeFgHiJkL').
     """
+    notifier = subscriptions.RegistryNotifier(subscriptions._REGISTRY)  # §S5.3
     return await Orchestrator(
         prepared,
         inputs,
@@ -390,6 +449,7 @@ async def _orchestrator_entry(
         task=task,
         task_id=_extract_task_id(task),
         harness_token=harness_token,
+        notifier=notifier,
     ).run()
 
 

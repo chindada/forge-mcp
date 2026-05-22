@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -22,6 +22,7 @@ from ..verifier import render as render_verification
 from ..verifier import run_verification
 from . import lifecycle
 from .convergence import NON_PROGRESS_WINDOW, detect_non_progress, fingerprint_gaps
+from .emitter import _Emitter, _NullNotifier
 from .handoff import validate_contract, validate_plan
 from .ledger import RunLedger
 from .retry import with_schema_retry, with_transient_retry
@@ -47,6 +48,7 @@ class PhaseDeps:
     target_dir: Path
     inputs: RunForgeInput
     config: RunConfig
+    emitter: _Emitter = field(default_factory=lambda: _Emitter(_NullNotifier(), None, "00000000"))
 
 
 def _ctx(deps: PhaseDeps, iteration_n: int | None = None) -> RunContext:
@@ -135,6 +137,7 @@ async def run_plan_phase(
             problems = validate_plan(plan_path.read_text()) if plan_path.exists() else problems
             if problems:
                 ledger.warnings.append(f"plan.md degenerate after re-author: {problems}")
+    await deps.emitter.emit_path("plan/plan.md")  # §S5.2
     ledger.completed_phases.append("plan")  # §7 / §9.1
     write_sessions_json(
         deps.run_dir / "plan" / "sessions.json",
@@ -149,6 +152,7 @@ async def run_plan_phase(
             }
         ],
     )
+    await deps.emitter.emit_path("plan/sessions.json")  # §S5.2
     sm.transition("planned")
     lifecycle.poll_task_cancellation(task)
 
@@ -311,6 +315,7 @@ async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iterati
     plan_text = (deps.run_dir / "plan" / "plan.md").read_text()
     if start_iteration == 1:
         atomic_write_text(contract, plan_text)
+        await deps.emitter.emit_iteration(start_iteration, "contract.md")  # §S5.2
         return
     # §H2.2 reuse durable contract: prepare_resume archived the in-flight
     # iteration to iteration-<start>.interrupted-<ts>/; recover the prior run's
@@ -329,6 +334,7 @@ async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iterati
         # through to the re-author path below.
         if archived_text is not None and not validate_contract(archived_text):
             atomic_write_text(contract, archived_text)
+            await deps.emitter.emit_iteration(start_iteration, "contract.md")
             ledger.warnings.append(
                 f"Resume reused durable contract for iteration-{start_iteration} from archive"
             )
@@ -339,6 +345,7 @@ async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iterati
     except Exception:
         # §H2.5: prior eval missing/corrupt — degrade to plan.md so resume proceeds.
         atomic_write_text(contract, plan_text)
+        await deps.emitter.emit_iteration(start_iteration, "contract.md")
         ledger.warnings.append(
             f"Resume could not reconstruct eval for iteration-{start_iteration}; "
             "seeded contract from plan.md"
@@ -352,6 +359,7 @@ async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iterati
         pivot=False,
     )
     if not _supports_hardened_remediation(deps):
+        await deps.emitter.emit_iteration(start_iteration, "contract.md")
         return
     problems = (
         validate_contract(contract.read_text()) if contract.exists() else ["contract.md missing"]
@@ -371,10 +379,13 @@ async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iterati
         )
     if problems:
         atomic_write_text(contract, plan_text)
+        await deps.emitter.emit_iteration(start_iteration, "contract.md")
         ledger.warnings.append(
             f"Resume re-author for iteration-{start_iteration} stayed degenerate "
             f"({problems}); seeded contract from plan.md"
         )
+    else:
+        await deps.emitter.emit_iteration(start_iteration, "contract.md")
 
 
 def _make_eval_call(deps: PhaseDeps, iteration_n: int, changed: list[str] | None) -> Any:
@@ -475,6 +486,9 @@ async def run_iteration_loop(
                 "completed_at": _utcnow_iso(),
             }
         )
+        # §S5.2 — generator phase fsync lands iteration-N/summary.md; emit so
+        # forge://<t>/<r>/iteration-N/summary.md subscribers get resources/updated.
+        await deps.emitter.emit_iteration(iteration_n, "summary.md")
         lifecycle.poll_task_cancellation(task)
         if deps.inputs.verify_command:
             sm.transition("iter_verifying", iteration=iteration_n)
@@ -491,6 +505,7 @@ async def run_iteration_loop(
                 timeout_seconds=deps.inputs.verify_timeout_seconds,
             )
             atomic_write_text(iteration_dir / "verify.txt", render_verification(outcome))
+            await deps.emitter.emit_iteration(iteration_n, "verify.txt")  # §S5.2
             ledger.last_verification = outcome
             phase_sessions.append(
                 {
@@ -513,6 +528,10 @@ async def run_iteration_loop(
             ),
             is_transient=is_transient_claude,
         )
+        # §S5.2 — evaluator phase fsync lands both eval.md and eval.json; each is
+        # independently subscribable, so emit both so neither subscriber set is starved.
+        await deps.emitter.emit_iteration(iteration_n, "eval.md")
+        await deps.emitter.emit_iteration(iteration_n, "eval.json")
         phase_sessions.append(
             {
                 "phase": "iter_evaluating",
@@ -536,6 +555,7 @@ async def run_iteration_loop(
                 ),
                 is_transient=is_transient_claude,
             )
+            await deps.emitter.emit_iteration(iteration_n, "triage.json")  # §S5.2
             triage_ran = True
             phase_sessions.append(
                 {
@@ -565,6 +585,7 @@ async def run_iteration_loop(
         if git_diff:
             violation_path = iteration_dir / "git-violation.txt"  # §13 artifact tree
             atomic_write_text(violation_path, git_diff)
+            await deps.emitter.emit_iteration(iteration_n, "git-violation.txt")  # §S5.2
             eval_for_loop.gaps.append(
                 EvalGap(
                     title="Rule 11 git mutation detected",
@@ -597,6 +618,7 @@ async def run_iteration_loop(
         write_sessions_json(
             iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
         )
+        await deps.emitter.emit_iteration(iteration_n, "sessions.json")  # §S5.2
         sm.transition("iter_done", iteration=iteration_n, last_completed_iteration=iteration_n)
         lifecycle.poll_task_cancellation(task)
         ledger.completed_phases.append(f"iter-{iteration_n}")  # §7 / §9.2 step 6
@@ -695,6 +717,7 @@ async def run_iteration_loop(
         write_sessions_json(
             iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
         )
+        await deps.emitter.emit_iteration(iteration_n, "sessions.json")  # §S5.2
         lifecycle.poll_task_cancellation(task)
     return ("incomplete", deps.inputs.max_iterations)
 

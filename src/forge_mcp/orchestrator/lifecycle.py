@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
@@ -96,6 +97,27 @@ async def emit_terminal_status(status: Any, terminal_status: str) -> None:
     )
 
 
+async def _emit_if_present(deps: Any, method: str, *args: Any) -> None:
+    """Best-effort artifact emission for lifecycle handlers (§S5.4).
+
+    Design: notifications are observability-only and must not perturb timeout
+        or failure paths, including focused tests that use old dependency fakes.
+    Implementation: look up deps.emitter.<method>, call it if present, await
+        only awaitable results, and swallow emission failures.
+    Example: await _emit_if_present(deps, 'emit_state').
+    """
+    emitter = getattr(deps, "emitter", None)
+    target = getattr(emitter, method, None)
+    if not callable(target):
+        return
+    try:
+        result = target(*args)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001  # §S-Decision 6 fail-soft
+        return
+
+
 async def handle_cancellation(sm: RunStateMachine, ledger: RunLedger, deps: Any, lock: Any) -> None:
     """Apply the exact §8.5 client-cancellation terminal ordering, then re-raise.
 
@@ -128,14 +150,17 @@ async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> N
     Example: await handle_timeout(sm, ledger, deps).
     """
     sm.transition("finalizing")
+    await _emit_if_present(deps, "emit_state")
     await close_drivers(deps)
     ledger.unresolved_gaps = collect_unresolved_gaps(deps.run_dir)
     ledger.decided_at = datetime.now(UTC)
     sm.transition("incomplete")
+    await _emit_if_present(deps, "emit_state")
 
     design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
     try:
         write_design_flaws(deps.run_dir, design_flaws_full)
+        await _emit_if_present(deps, "emit_path", "design_flaws.json")
     except OSError as exc:
         ledger.warnings.append(
             "design_flaws.json write failed (lineage feed-forward disabled): "
@@ -143,6 +168,10 @@ async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> N
         )
         deps.logger.warning("design_flaws.json write failed", exc_info=True)
     apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
+    if ledger.unresolved_overflow_path:
+        await _emit_if_present(deps, "emit_path", "unresolved-gaps-overflow.md")
+    if ledger.design_flaw_overflow_path:
+        await _emit_if_present(deps, "emit_path", "design-flaw-gaps-overflow.md")
     await emit_terminal_status(deps.status, "incomplete")
 
 
@@ -170,10 +199,12 @@ async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc:
         ledger.unresolved_gaps = []
     ledger.decided_at = datetime.now(UTC)
     sm.transition("failed", reason=str(exc))
+    await _emit_if_present(deps, "emit_state")
 
     design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
     try:
         write_design_flaws(deps.run_dir, design_flaws_full)
+        await _emit_if_present(deps, "emit_path", "design_flaws.json")
     except OSError as exc:
         ledger.warnings.append(
             "design_flaws.json write failed (lineage feed-forward disabled): "
@@ -181,6 +212,10 @@ async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc:
         )
         deps.logger.warning("design_flaws.json write failed", exc_info=True)
     apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
+    if ledger.unresolved_overflow_path:
+        await _emit_if_present(deps, "emit_path", "unresolved-gaps-overflow.md")
+    if ledger.design_flaw_overflow_path:
+        await _emit_if_present(deps, "emit_path", "design-flaw-gaps-overflow.md")
     await emit_terminal_status(deps.status, "failed")
 
 

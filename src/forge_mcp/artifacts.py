@@ -27,6 +27,10 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(content)
+            # §S-Inv 4 — updated-resource notifications fire only after a
+            # durable temp-file write followed by os.replace.
+            handle.flush()
+            os.fsync(handle.fileno())
         if os.name == "posix":
             os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)

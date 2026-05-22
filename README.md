@@ -178,3 +178,16 @@ design docs for any cross-tenant bleed. Operators with sensitive
 workloads should set `FORGE_LINEAGE_TOP_K=0`. See
 `docs/specs/forge-mcp-cross-run-learning.md` §L16 for the full risk
 catalog.
+
+### Resource subscriptions
+
+forge-mcp advertises MCP resource `subscribe: true` and `listChanged: true`.
+Hosts may subscribe to allowlisted `forge://<token>/<run-id>/<artifact>` URIs and
+will receive `notifications/resources/updated` after durable artifact writes.
+Subscriptions are in-memory and session-scoped: after reconnecting, hosts should
+re-list resources, re-read the artifacts they care about, and re-subscribe.
+
+`inputs/design.md` and `inputs/design.fingerprint` are readable and subscribable
+for allowlist parity, but they are written before a host can subscribe and do not
+produce later `resources/updated` notifications. Run list changes are announced
+with `listChanged` when active runs become discoverable or are pruned.

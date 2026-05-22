@@ -44,6 +44,7 @@ _ALLOWED_ARTIFACTS: tuple[_ArtifactPattern, ...] = (
     _ArtifactPattern("inputs/design.fingerprint", None, "text/plain"),  # §L9.2
     _ArtifactPattern("inputs/prior_attempts.md", None, "text/markdown"),
     _ArtifactPattern("inputs/prior_attempts-overflow.md", None, "text/markdown"),
+    _ArtifactPattern("inputs/cross_design_patterns.md", None, "text/markdown"),  # §X4.1
     _ArtifactPattern("plan/plan.md", None, "text/markdown"),
     _ArtifactPattern("plan/sessions.json", None, "application/json"),
     _ArtifactPattern(None, re.compile(r"^iteration-([1-9]\d*)/contract\.md$"), "text/markdown"),
@@ -167,6 +168,42 @@ class _ResourceScope:
 _ACTIVE_RUNS: dict[tuple[str, str], _ResourceScope] = {}
 
 
+async def _broadcast_list_changed() -> None:
+    """Broadcast resources/list_changed to every known session (§S6).
+
+    Design: listChanged is connection-level, not URI-specific; send failures
+        are observability-only and must not affect resource registry mutation.
+    Implementation: lazily import subscriptions to avoid a module cycle, then
+        call send_resource_list_changed on each session under exception guard.
+    Example: await _broadcast_list_changed().
+    """
+    from . import subscriptions
+
+    for session in subscriptions._REGISTRY._sessions_view():
+        try:
+            await session.send_resource_list_changed()
+        except Exception:  # noqa: BLE001  # §S-Decision 6 fail-soft
+            continue
+
+
+def _fire_list_changed() -> None:
+    """Schedule a best-effort listChanged broadcast (§S6).
+
+    Design: register/deregister are sync helpers; when no event loop is running
+        there is no connected async host to notify, so the side channel returns.
+    Implementation: get the running loop and create a background task; swallow
+        RuntimeError from loop absence only.
+    Example: _fire_list_changed() after active-run registry mutation.
+    """
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_broadcast_list_changed())
+
+
 def register_active_run(scope: _ResourceScope) -> None:
     """Add an in-flight run to the discovery registry (§R3.1).
 
@@ -182,6 +219,7 @@ def register_active_run(scope: _ResourceScope) -> None:
     key = (scope.harness_token, scope.run_id)
     assert key not in _ACTIVE_RUNS, f"double-register: {key!r}"
     _ACTIVE_RUNS[key] = scope
+    _fire_list_changed()  # §S6 — run became discoverable.
 
 
 def deregister_active_run(harness_token: str, run_id: str) -> None:
@@ -193,7 +231,8 @@ def deregister_active_run(harness_token: str, run_id: str) -> None:
     Implementation: dict.pop with default None.
     Example: deregister_active_run("aBcDeFgHiJkL", "12345678").
     """
-    _ACTIVE_RUNS.pop((harness_token, run_id), None)
+    if _ACTIVE_RUNS.pop((harness_token, run_id), None) is not None:
+        _fire_list_changed()  # §S6 — prune/deregister changed list_resources.
 
 
 def list_active_runs() -> list[_ResourceScope]:
@@ -282,6 +321,7 @@ def expand_scope_to_resources(scope: _ResourceScope) -> list[tuple[str, str, str
             "design.fingerprint",
             "prior_attempts.md",
             "prior_attempts-overflow.md",
+            "cross_design_patterns.md",
         ):
             _append_if_file(out, scope, inputs_dir / name, f"inputs/{name}")
 

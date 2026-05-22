@@ -478,6 +478,7 @@ def test_resources_module_imports_stdlib_only():
         "dataclasses",
         "typing",
         "__future__",
+        "asyncio",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -485,6 +486,10 @@ def test_resources_module_imports_stdlib_only():
                 top = alias.name.split(".", 1)[0]
                 assert top in allowed_top_levels, f"forbidden import: {alias.name}"
         elif isinstance(node, ast.ImportFrom):
+            if node.level == 1 and node.module is None:
+                names = {alias.name for alias in node.names}
+                assert names == {"subscriptions"}
+                continue
             top = (node.module or "").split(".", 1)[0]
             assert top in allowed_top_levels, f"forbidden from-import: {node.module}"
 

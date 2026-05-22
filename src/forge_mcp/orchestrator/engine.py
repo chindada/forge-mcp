@@ -27,8 +27,11 @@ from ..models import EvalResult, RunForgeInput, RunResult
 from ..preflight import PreparedRun
 from ..state import RunState
 from ..status import Status
+from ..subscriptions import ResourceNotifier
 from . import lineage
 from .convergence import fingerprint_gaps
+from .cross_design import render_cross_design_digest
+from .emitter import _Emitter, _NullNotifier
 from .ledger import RunLedger
 from .lifecycle import (
     apply_caps_and_overflow,
@@ -162,6 +165,7 @@ class Orchestrator:
         task: ServerTaskContext | None = None,
         task_id: str | None = None,
         harness_token: str | None = None,
+        notifier: ResourceNotifier | None = None,
     ) -> None:
         """Store constructor dependencies for run().
 
@@ -183,6 +187,7 @@ class Orchestrator:
         self._task = task
         self._task_id = task_id
         self._harness_token = harness_token
+        self._notifier = notifier or _NullNotifier()
 
     async def run(self) -> RunResult:
         """Execute the run and return a terminal RunResult.
@@ -215,6 +220,7 @@ class Orchestrator:
             ),
         )
         status = Status(self._prepared.run_id, self._ctx, run_dir / "status.log", task=self._task)
+        emitter = _Emitter(self._notifier, self._harness_token, self._prepared.run_id)
         status.set_max_iterations(self._inputs.max_iterations)
         logger = logging.getLogger(f"forge_mcp.run.{self._prepared.run_id}")
         logger.propagate = False
@@ -231,6 +237,7 @@ class Orchestrator:
             target_dir=self._prepared.harness_dir.parent,
             inputs=self._inputs,
             config=self._config,
+            emitter=emitter,
         )
         previous_umask = os.umask(0o077)  # §8.1 — captured just before the try
         # §R3.2 — scope is built before the try so finally can see it; registry
@@ -247,6 +254,7 @@ class Orchestrator:
         try:
             if scope is not None:
                 register_active_run(scope)  # §R3.2 — inside try
+            await emitter.emit_state()  # §S5.2 initial state.json already fsync'd.
             try:
                 prune_old_runs(
                     self._prepared.harness_dir,
@@ -261,6 +269,7 @@ class Orchestrator:
                 inputs_dir = run_dir / "inputs"
                 if resume_point is None:
                     sm.transition("canonicalizing")  # §8.1
+                    await emitter.emit_state()
                     canonicalize_design(self._inputs, run_dir, ledger)
 
                 fp: str | None = None
@@ -298,9 +307,11 @@ class Orchestrator:
                         if summaries:
                             digest = lineage.render_prior_attempts(summaries)
                             overflow_path = write_prior_attempts(inputs_dir, digest)
+                            await emitter.emit_path("inputs/prior_attempts.md")
                             ledger.linked_prior_runs = [summary.run_id for summary in summaries]
                             ledger.lineage_overflow_path = overflow_path
                             if overflow_path is not None:
+                                await emitter.emit_path("inputs/prior_attempts-overflow.md")
                                 ledger.warnings.append(
                                     "lineage digest exceeded 32768 bytes; "
                                     f"overflow at {overflow_path.name}"
@@ -316,14 +327,23 @@ class Orchestrator:
                         )
                         logger.warning("lineage discovery failed", exc_info=True)
 
+                # §X7 — the cross-design aggregator re-runs from scratch on BOTH
+                # cold-start and a §H2 resume; the digest must reflect harness
+                # state at planner-cold-start time, not at original-run-start time.
+                digest = render_cross_design_digest(self._prepared.harness_dir, logger)
+                atomic_write_text(inputs_dir / "cross_design_patterns.md", digest)
+                await emitter.emit_path("inputs/cross_design_patterns.md")  # §S5.2 / §X7
+
                 if resume_point is None:
                     git_state = capture_state(deps.target_dir)
                     if git_state is not None:
                         atomic_write_text(run_dir / "inputs" / "git-state.txt", git_state)
+                        await emitter.emit_path("inputs/git-state.txt")
                     uncommitted = capture_uncommitted(deps.target_dir)
                     if uncommitted:
                         path = run_dir / "inputs" / "git-uncommitted.txt"
                         atomic_write_text(path, uncommitted)
+                        await emitter.emit_path("inputs/git-uncommitted.txt")
                         ledger.git_uncommitted_path = str(path)
                     await warn_if_missing_target_agents_md(deps.target_dir, ledger, status)  # §8.1
                     if _accepts_task_kw(run_phases):
@@ -361,14 +381,17 @@ class Orchestrator:
                     # via the same helper handle_timeout uses.
                     ledger.unresolved_gaps = collect_unresolved_gaps(run_dir)
                 sm.transition("finalizing")
+                await emitter.emit_state()
                 ledger.decided_at = datetime.now(UTC)
                 if terminal_status == "incomplete" and ledger.stop_reason:
                     sm.transition("incomplete", reason=ledger.stop_reason)
                 else:
                     sm.transition(terminal_status)  # type: ignore[arg-type]
+                await emitter.emit_state()
                 design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
                 try:
                     write_design_flaws(run_dir, design_flaws_full)
+                    await emitter.emit_path("design_flaws.json")
                 except OSError as exc:
                     ledger.warnings.append(
                         "design_flaws.json write failed (lineage feed-forward disabled): "
@@ -389,6 +412,10 @@ class Orchestrator:
             if terminal_status in ("completed", "incomplete"):
                 # §8.1: caps run on every result-producing inline outcome.
                 apply_caps_and_overflow(ledger, run_dir, logger)
+                if ledger.unresolved_overflow_path:
+                    await emitter.emit_path("unresolved-gaps-overflow.md")
+                if ledger.design_flaw_overflow_path:
+                    await emitter.emit_path("design-flaw-gaps-overflow.md")
             result = build_result(
                 run_id=self._prepared.run_id,
                 run_dir=run_dir,

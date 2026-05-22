@@ -58,6 +58,41 @@ def test_result_numeric_iteration_sort_and_failed_fields(tmp_path: Path) -> None
     assert "run.log" not in result.model_dump_json()
 
 
+def test_completed_result_has_null_failure_kind(tmp_path: Path) -> None:
+    """§W3: a completed RunResult carries failure_kind is None.
+
+    Design: §W3 says completed has no failure kind; only failed/incomplete map to
+        a §W categorical kind, so a successful run must report None.
+    Implementation: build a status=completed RunResult via build_result and
+        assert failure_kind is None and the message carries no [FORGE_ERR_ prefix.
+    Example: a completed run result has no failure taxonomy tag.
+    """
+    run_dir = tmp_path / "abcd1234"
+    (run_dir / "plan").mkdir(parents=True)
+    (run_dir / "plan" / "plan.md").write_text("plan")
+    sm = RunStateMachine(
+        run_dir / "state.json",
+        RunState(
+            state="completed",
+            run_id="abcd1234",
+            target_dir="/r",
+            iteration=1,
+            started_at=datetime.now(UTC),
+        ),
+    )
+    result = build_result(
+        run_id="abcd1234",
+        run_dir=run_dir,
+        status="completed",
+        inputs=RunForgeInput(target_dir="/r", design_doc_content="x"),
+        sm=sm,
+        ledger=RunLedger(),
+        started_at=datetime.now(UTC),
+    )
+    assert result.status == "completed"
+    assert result.failure_kind is None
+
+
 def test_artifact_index_picks_up_git_violation_txt(tmp_path: Path) -> None:
     """Pin §13 forbidden git mutation artifact extension.
 

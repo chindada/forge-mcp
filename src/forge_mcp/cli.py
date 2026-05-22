@@ -7,13 +7,71 @@ import sys
 from pathlib import Path
 
 import typer
+from mcp.server.lowlevel import NotificationOptions
+from mcp.server.models import InitializationOptions
 
 from . import doctor as doc
+from . import subscriptions
 from .config import RunConfig
 from .drivers._claude import ClaudeRunnerImpl
 from .skills import SkillMissingError, probe_required_skills
 
 app = typer.Typer(no_args_is_help=True)
+
+
+def _server_version() -> str:
+    """Return the installed package version for MCP initialization (§S1).
+
+    Design: capability construction needs the same version source as the CLI
+        version command without importing package metadata at module import time.
+    Implementation: read importlib.metadata.version and fall back to unknown
+        when running directly from a source tree.
+    Example: _server_version() returns '0.1.0' or 'unknown'.
+    """
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("forge-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def build_init_options() -> InitializationOptions:
+    """Build initialization options with honest §S resource capabilities.
+
+    Design: §S1 requires subscribe and listChanged to be advertised true even
+        while the installed MCP SDK hardcodes subscribe=False.
+    Implementation: get server capabilities with resources_changed=True, patch
+        the resources submodel to subscribe=True, then construct options.
+    Example: await server.run(read, write, build_init_options()).
+    """
+    from .server import server
+
+    caps = server.get_capabilities(
+        notification_options=NotificationOptions(resources_changed=True),
+        experimental_capabilities={},
+    )
+    if caps.resources is not None:
+        caps = caps.model_copy(
+            update={"resources": caps.resources.model_copy(update={"subscribe": True})}
+        )
+    return InitializationOptions(
+        server_name="forge-mcp",
+        server_version=_server_version(),
+        capabilities=caps,
+    )
+
+
+def _drain_subscription_registry() -> None:
+    """Drop all subscriptions during server lifespan teardown (§S7).
+
+    Design: stdio sessions are ephemeral, so disconnect must clear the process
+        registry and prevent zombie subscriptions from receiving later updates.
+    Implementation: iterate a defensive snapshot and call drop_session.
+    Example: _drain_subscription_registry() empties subscriptions._REGISTRY.
+    """
+    for session in list(subscriptions._REGISTRY._sessions_view()):
+        subscriptions._REGISTRY.drop_session(session)
 
 
 @app.command()
@@ -33,11 +91,15 @@ def serve() -> None:
         """Run the low-level Server on stdio (§C1.4).
 
         Design: keep Typer's sync command while server.run is async.
-        Implementation: open stdio streams and pass initialization options.
+        Implementation: open stdio streams, pass §S-aware initialization
+            options, and drain subscriptions on disconnect.
         Example: asyncio.run(_serve_async()).
         """
         async with stdio_server() as (read, write):
-            await server.run(read, write, server.create_initialization_options())
+            try:
+                await server.run(read, write, build_init_options())
+            finally:
+                _drain_subscription_registry()
 
     asyncio.run(_serve_async())
 

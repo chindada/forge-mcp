@@ -19,6 +19,7 @@ from .doctor import (
     check_target_dir_writable,
 )
 from .drivers._claude import ClaudeRunnerImpl
+from .errors import FailureKind, tag
 from .lockfile import LockBusy, TargetLock
 from .models import RunForgeInput
 from .orchestrator.resume import ResumePoint, find_resumable_run
@@ -58,15 +59,15 @@ def _canonicalize_target_dir(path: str) -> Path:
     return Path(os.path.abspath(path))
 
 
-def _raise(code: int, message: str) -> None:
+def _raise(code: int, message: str, *, kind: FailureKind) -> None:
     """Raise an McpError with the given JSON-RPC intent code.
 
     Design: §6.3 uses numeric codes internally even though FastMCP turns them
         into `isError=true` text results on the wire.
     Implementation: construct ErrorData consistently for all preflight defects.
-    Example: _raise(-32602, 'bad target') raises McpError.
+    Example: _raise(-32602, 'bad target', kind='invalid_params') raises.
     """
-    raise McpError(ErrorData(code=code, message=message))
+    raise McpError(ErrorData(code=code, message=tag(kind, message)))
 
 
 def _fail_if_not_ok(check: tuple[str, CheckStatus, str], *, code: int) -> None:
@@ -79,7 +80,10 @@ def _fail_if_not_ok(check: tuple[str, CheckStatus, str], *, code: int) -> None:
     """
     label, status, detail = check
     if status == "FAIL":
-        _raise(code, f"{label}: {detail}")
+        kind: FailureKind = "invalid_params" if code == INVALID_PARAMS else "infra_failure"
+        if label == "claude_auth":
+            kind = "auth"
+        _raise(code, f"{label}: {detail}", kind=kind)
 
 
 def _load_design_doc(inputs: RunForgeInput) -> str:
@@ -94,12 +98,12 @@ def _load_design_doc(inputs: RunForgeInput) -> str:
     if inputs.design_doc_path is not None:
         path = Path(inputs.design_doc_path)
         if not path.exists() or not path.is_file():
-            _raise(INVALID_PARAMS, f"design_doc_path missing: {path}")
+            _raise(INVALID_PARAMS, f"design_doc_path missing: {path}", kind="invalid_params")
         text = path.read_text()
     else:
         text = inputs.design_doc_content or ""
     if not text.strip():
-        _raise(INVALID_PARAMS, "design document is empty")
+        _raise(INVALID_PARAMS, "design document is empty", kind="invalid_params")
     return text
 
 
@@ -146,11 +150,11 @@ async def prepare_run(inputs: RunForgeInput, config: RunConfig) -> PreparedRun:
     if inputs.resume:
         resume_point = find_resumable_run(harness_dir)
         if resume_point is None:
-            _raise(SERVER_ERROR, "no resumable run for target")
+            _raise(SERVER_ERROR, "no resumable run for target", kind="infra_failure")
     try:
         lock.acquire(adopt_run_id=resume_point.run_id if resume_point else None)
     except LockBusy as exc:
-        _raise(SERVER_ERROR, str(exc))
+        _raise(SERVER_ERROR, str(exc), kind="lock_held")
     try:
         _fail_if_not_ok(check_claude_cli(config), code=SERVER_ERROR)
         _fail_if_not_ok(await check_codex(config), code=SERVER_ERROR)

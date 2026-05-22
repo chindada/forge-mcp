@@ -306,6 +306,70 @@ async def test_engine_resume_skips_planning_and_starts_at_anchor(tmp_path, monke
     assert captured["start_iteration"] == 5
 
 
+async def test_engine_resume_regenerates_cross_design_digest(tmp_path, monkeypatch) -> None:
+    """§X7: a §H2 resume regenerates inputs/cross_design_patterns.md from scratch.
+
+    Design: the cross-design digest must reflect harness state at planner
+        cold-start time, so a resumed run re-runs the aggregator and rewrites the
+        file rather than reusing the original run's digest.
+    Implementation: build a PreparedRun carrying a ResumePoint, stub the
+        aggregator render to a sentinel string, drive the engine resume path with
+        fake phase functions, and assert the file was written with the sentinel.
+    Example: after a resume run, cross_design_patterns.md contains the new digest.
+    """
+    from forge_mcp.orchestrator.resume import ResumePoint
+
+    base = _prepared(tmp_path)
+    run_dir = base.harness_dir / base.run_id
+    (run_dir / "inputs").mkdir(parents=True, exist_ok=True)
+    (run_dir / "inputs" / "cross_design_patterns.md").write_text("STALE DIGEST")
+    point = ResumePoint(
+        run_id=base.run_id,
+        run_dir=run_dir,
+        last_completed_iteration=4,
+        start_iteration=5,
+    )
+    prepared = PreparedRun(
+        harness_dir=base.harness_dir,
+        lock=base.lock,
+        run_id=base.run_id,
+        config=base.config,
+        resume_point=point,
+    )
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Fail loudly if planning runs on the resume path.
+
+        Design: resume must bypass run_phases.
+        Implementation: raise so the test fails if planning is reached.
+        Example: never invoked on a resume run.
+        """
+        raise AssertionError("run_phases must not run on resume")
+
+    async def fake_run_iteration_loop(deps, sm, ledger, base_git, *, start_iteration=1):
+        """Return a completed terminal status for the resume loop.
+
+        Design: stand in for the real iteration loop on resume.
+        Implementation: record nothing and return a completed result tuple.
+        Example: await fake_run_iteration_loop(..., start_iteration=5).
+        """
+        ledger.completed_phases.append("iter-5")
+        return ("completed", 5)
+
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "run_iteration_loop", fake_run_iteration_loop)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    monkeypatch.setattr(
+        engine_mod, "render_cross_design_digest", lambda _harness_dir, _logger: "FRESH DIGEST"
+    )
+
+    await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+
+    digest = (run_dir / "inputs" / "cross_design_patterns.md").read_text()
+    assert digest == "FRESH DIGEST"
+
+
 async def test_engine_cancellation_propagates_and_skips_result(tmp_path: Path, monkeypatch) -> None:
     """Pin §8.5 cancellation propagation through engine.run.
 

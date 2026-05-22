@@ -6,6 +6,40 @@ MCP SDK. This module only houses errors that cross internal seams.
 
 from __future__ import annotations
 
+from typing import Final, Literal
+
+# §W1 — closed six-kind taxonomy. Adding another kind requires a brief update.
+FailureKind = Literal[
+    "invalid_params",
+    "infra_failure",
+    "auth",
+    "lock_held",
+    "timeout",
+    "cancelled",
+]
+
+_PREFIX: Final[dict[FailureKind, str]] = {
+    "invalid_params": "[FORGE_ERR_INVALID_PARAMS]",
+    "infra_failure": "[FORGE_ERR_INFRA_FAILURE]",
+    "auth": "[FORGE_ERR_AUTH]",
+    "lock_held": "[FORGE_ERR_LOCK_HELD]",
+    "timeout": "[FORGE_ERR_TIMEOUT]",
+    "cancelled": "[FORGE_ERR_CANCELLED]",
+}
+PREFIX_START: Final[str] = "[" + "FORGE_ERR_"
+
+
+def tag(kind: FailureKind, body: str) -> str:
+    """Construct the verbatim wire message text for an error category.
+
+    Design: §W2 makes the bracketed prefix stable host-visible API, and this
+        helper is the only construction site to prevent drift across modules.
+    Implementation: prepend the stored literal prefix, one ASCII space, and the
+        unchanged message body supplied by the caller.
+    Example: tag("timeout", "runtime cap exceeded").
+    """
+    return f"{_PREFIX[kind]} {body}"
+
 
 class OutputSchemaError(Exception):
     """Raised when a driver fails to parse the model's structured output.
