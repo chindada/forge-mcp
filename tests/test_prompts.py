@@ -34,28 +34,33 @@ def test_all_five_prompts_ship() -> None:
         assert _read(name).strip(), name
 
 
-def test_no_prompt_mentions_removed_removed_tool_surfaces() -> None:
-    """Pin a forge-mcp behavior.
+def test_no_prompt_mentions_playwright_or_browser_tools() -> None:
+    """Pin the real §15 Playwright-excision guard (P-Inv 2).
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
+    Design: P-Inv 2 — no shipped prompt may contain the case-insensitive
+        substring "playwright" or a "browser_"-prefixed tool identifier;
+        the old placeholder tokens left this invariant unguarded.
+    Implementation: lower-case each packaged prompt body and assert neither
+        forbidden substring is present.
     Example: pytest runs this test in the non-slow suite.
     """
-    forbidden = ("removed_removed_tool_surface", "removed_tool_")
+    forbidden = ("playwright", "browser_")
     for name in PROMPTS:
         text = _read(name).lower()
         for token in forbidden:
             assert token not in text, name
 
 
-def test_removed_eval_probe_md_does_not_ship() -> None:
-    """Pin a forge-mcp behavior.
+def test_evaluator_probe_md_does_not_ship() -> None:
+    """Pin that the real legacy file evaluator_probe.md is not shipped (P-Inv 2).
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
+    Design: P-Inv 2 — the genuine legacy Playwright probe prompt was named
+        evaluator_probe.md; the old test checked a nonexistent placeholder
+        filename and so never guarded the real surface.
+    Implementation: assert the package data file evaluator_probe.md is absent.
     Example: pytest runs this test in the non-slow suite.
     """
-    assert not (files("forge_mcp.prompts") / "removed_eval_probe.md").is_file()
+    assert not (files("forge_mcp.prompts") / "evaluator_probe.md").is_file()
 
 
 def test_generator_forbids_git_mutations() -> None:
@@ -79,30 +84,62 @@ def test_generator_forbids_git_mutations() -> None:
         assert mutation in text
 
 
-def test_plan_and_remediation_forbid_absolute_paths_and_default_save_location() -> None:
-    """Pin a forge-mcp behavior.
+def test_planner_forbids_absolute_path_and_default_save_location() -> None:
+    """Pin the planner save-location override (P2.1).
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
+    Design: the planner invokes superpowers:writing-plans, so it must keep
+        the override forbidding an absolute path and the skill default
+        docs/superpowers/plans save location.
+    Implementation: read planner_system.md and assert both fragments.
     Example: pytest runs this test in the non-slow suite.
     """
-    for name in ("planner_system.md", "evaluator_remediation.md"):
-        text = _read(name)
-        assert "absolute path" in text.lower()
-        assert "docs/superpowers/plans" in text
+    text = _read("planner_system.md")
+    assert "absolute path" in text.lower()
+    assert "docs/superpowers/plans" in text
 
 
-def test_plan_and_remediation_scrub_commit_steps() -> None:
-    """Pin a forge-mcp behavior.
+def test_remediation_uses_relative_contract_path() -> None:
+    """Pin the remediation relative-path rule, sans skill framing (P-Decision 3).
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
+    Design: P-Decision 3 — remediation authors contract.md directly and never
+        invokes the writing-plans skill, so it forbids an absolute path but
+        must NOT carry the docs/superpowers/plans skill-default reference.
+    Implementation: read evaluator_remediation.md, assert "absolute path" is
+        present and "docs/superpowers/plans" is absent.
     Example: pytest runs this test in the non-slow suite.
     """
-    for name in ("planner_system.md", "evaluator_remediation.md"):
-        text = _read(name).lower()
-        assert "scrub" in text or "remove" in text
-        assert "step 5: commit" in text or "git commit" in text
+    text = _read("evaluator_remediation.md")
+    assert "absolute path" in text.lower()
+    assert "docs/superpowers/plans" not in text
+
+
+def test_planner_scrubs_commit_steps() -> None:
+    """Pin the planner commit-scrub instruction (P2.1).
+
+    Design: the planner must tell writing-plans output to scrub/remove the
+        skill's commit section because Rule 11 forbids git mutations.
+    Implementation: read planner_system.md (lower-cased) and assert a
+        scrub/remove verb plus a commit-step reference are both present.
+    Example: pytest runs this test in the non-slow suite.
+    """
+    text = _read("planner_system.md").lower()
+    assert "scrub" in text or "remove" in text
+    assert "step 5: commit" in text or "git commit" in text
+
+
+def test_remediation_forbids_git_in_contract() -> None:
+    """Pin the remediation contract-level no-git rule (P-Inv 3).
+
+    Design: P-Inv 3 — the remediation prompt must forbid the contract from
+        instructing the generator to mutate git, replacing the dropped
+        skill-override commit-scrub framing.
+    Implementation: read evaluator_remediation.md and assert it contains
+        "git commit" and the phrase "must never instruct".
+    Example: pytest runs this test in the non-slow suite.
+    """
+    text = _read("evaluator_remediation.md")
+    assert "git commit" in text
+    assert "must never instruct" in text
 
 
 def test_planner_prompt_states_general_mcp_tool_id_rule() -> None:
@@ -209,4 +246,73 @@ def test_evaluator_remediation_md_has_cross_run_directive() -> None:
     fragment = (
         "must propose a DIFFERENT implementation strategy than any documented-failed approach"
     )
+    assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_generator_has_budget_clause() -> None:
+    """Pin the generator anti-premature-wrap budget clause (P-Inv 0).
+
+    Design: P-Inv 0 — the generator drives a long-horizon turn and MUST carry
+        an explicit budget / anti-premature-wrap clause; "Completeness beats
+        brevity." is its load-bearing fragment.
+    Implementation: canonicalize whitespace and assert the fragment is present.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("generator_system.md").read_text()
+    fragment = "Completeness beats brevity."
+    assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_generator_has_honesty_clause() -> None:
+    """Pin the generator honest-non-convergence clause (P-Inv 0).
+
+    Design: P-Inv 0 — the generator MUST carry an honest-non-convergence clause
+        (implement what you can; record the blocker; never fabricate done).
+    Implementation: canonicalize whitespace and assert the fragment is present.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("generator_system.md").read_text()
+    fragment = "honest non-convergence is a designed outcome"
+    assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_evaluator_has_good_gap_example() -> None:
+    """Pin the evaluator good-gap actionability example (P3 principle 4).
+
+    Design: §P3 principle 4 — a concrete worked example raises gap quality; the
+        evaluator carries the "A good gap is specific" lead-in.
+    Implementation: canonicalize whitespace and assert the fragment is present.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("evaluator_system.md").read_text()
+    fragment = "A good gap is specific"
+    assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_triage_has_accept_vs_demote_example() -> None:
+    """Pin the triage accept-vs-demote worked example (P3 principle 4).
+
+    Design: §P3 principle 4 — the triage prompt carries an example contrasting
+        an acceptable verbatim citation with a title-collision demotion.
+    Implementation: canonicalize whitespace and assert the fragment is present.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("evaluator_triage.md").read_text()
+    fragment = "For example: a gap citing the exact sentence"
     assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)

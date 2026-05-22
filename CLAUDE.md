@@ -81,6 +81,20 @@ new behavior. The §18 schema-pin tests continue to derive from
 `RunResult.model_json_schema()` — no shift for this brief (the
 Makefile touches no Pydantic schema).
 
+A seventh companion normative brief, the **prompt engineering** doc
+(`forge-mcp-prompt-engineering.md`), revises the five packaged driver
+prompts in `src/forge_mcp/prompts/` for fidelity and prompt-engineering
+best practice in its own `§P*`, `P-Invariant N`, and `P-Decision N`
+namespaces (cite as e.g. `# §P2.2 generator budget clause`, `# §P-Inv 2
+real §15 guard`). The base doc still wins on anything it specifies; the
+hardening, continuity, resource-surface, cross-run-learning,
+host-protocol-and-planner-extensions, and build-and-tooling briefs each
+still win on anything in their namespaces; this brief only adds new
+behavior. The §18 schema-pin tests continue to derive from
+`RunForgeInput.model_json_schema()` /
+`RunResult.model_json_schema()` — **no shift for this brief** (the
+prompts touch no Pydantic schema).
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is
