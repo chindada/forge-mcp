@@ -44,6 +44,28 @@ wins on anything it specifies; this brief only adds new behavior. The
 `RunForgeInput.model_json_schema()` /
 `RunResult.model_json_schema()` — no shift for this brief.
 
+A fifth companion normative brief, the **host-protocol and planner
+extensions** doc
+(`docs/specs/forge-mcp-host-protocol-and-planner-extensions.md`), bundles
+three independent extensions in their own three sub-namespaces:
+`§S*` / `S-Invariant N` / `S-Decision N` for resource subscriptions
+(`subscribe_resource` + `notifications/resources/updated` +
+`listChanged`); `§W*` / `W-Invariant N` / `W-Decision N` for
+wire-visible error discrimination (stable `[FORGE_ERR_<KIND>]` message
+prefixes plus a structured `RunResult.failure_kind` field); and `§X*` /
+`X-Invariant N` / `X-Decision N` for cross-design-doc learning (gated
+aggregation of `design_flaws.json` across the full harness, surfaced to
+the planner as weak statistical priors). Cite as e.g. `# §S5.2
+emission-after-durable-write`, `# §W2 prefix taxonomy`, `# §X1
+cross-design aggregator`. The base doc still wins on anything it
+specifies; the hardening, continuity, resource-surface, and cross-run
+briefs each still win on anything in their namespaces; this brief only
+adds new behavior. The §18 schema-pin tests continue to derive from
+`RunForgeInput.model_json_schema()` / `RunResult.model_json_schema()` —
+§W3 adds one new optional field (`failure_kind: str | None`) which the
+pin extends to cover verbatim; §S does not touch the input/result
+shape.
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is

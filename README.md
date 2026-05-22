@@ -32,14 +32,14 @@ The doctor command runs seven checks: `target_dir` writable, `.harness` writable
 claude mcp add forge-mcp -- uv run --directory $PWD forge serve
 ```
 
+Place the server name before any `-e` environment flags to avoid parsing errors.
+
 ```sh
 claude mcp add --scope user forge-mcp \
   -e CLAUDE_CONFIG_DIR=$HOME/.claude \
   -e FORGE_CODEX_BIN=$(which codex) \
   -- uv run --directory $PWD forge serve
 ```
-
-Place the server name before any `-e` environment flags to avoid parsing errors.
 
 **5. Run the example:**
 
@@ -162,7 +162,7 @@ work. The digest is rendered to `inputs/prior_attempts.md` and read by
 the planner through the same `add_dirs=[inputs/]` surface as `design.md`.
 
 **Anti-anchoring is load-bearing.** The planner prompt directs the model
-to propose a *different* implementation strategy when prior gaps recur,
+to propose a _different_ implementation strategy when prior gaps recur,
 not to refine a multiply-failed approach.
 
 **Controls:**
