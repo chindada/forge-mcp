@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 from importlib.resources import files
+from typing import TypeVar
+
+from pydantic import BaseModel, ValidationError
 
 from ..artifacts import atomic_write_json, atomic_write_text, render_eval_md
 from ..errors import OutputSchemaError
@@ -20,6 +23,8 @@ from ._claude import (
     maybe_append_retry_suffix,
     truncate_for_warning,
 )
+
+BaseModelT = TypeVar("BaseModelT", bound=BaseModel)
 
 PIVOT_DIRECTIVE = (
     "Prior iterations repeatedly produced the same gaps. Do NOT refine the "
@@ -97,7 +102,7 @@ class EvaluatorDriver:
             ),
             system=system,
         )
-        er = EvalResult.model_validate(_run_and_parse_json(result.structured, result.text))
+        er = _parse_and_validate(EvalResult, result.structured, result.text)
         atomic_write_json(iteration_dir / "eval.json", er.model_dump(mode="json"))
         atomic_write_text(
             iteration_dir / "eval.md", render_eval_md(er, iteration_n=ctx.iteration_n)
@@ -137,7 +142,7 @@ class EvaluatorDriver:
             ),
             system=system,
         )
-        triage = TriageResult.model_validate(_run_and_parse_json(result.structured, result.text))
+        triage = _parse_and_validate(TriageResult, result.structured, result.text)
         atomic_write_json(iteration_dir / "triage.json", triage.model_dump(mode="json"))
         return triage
 
@@ -186,21 +191,28 @@ class EvaluatorDriver:
         return truncate_for_warning("recovered remediation Write tool content for contract.md")
 
 
-def _run_and_parse_json(structured: dict | None, raw_text: str) -> dict:
-    """Single parse attempt; raise OutputSchemaError on any failure.
+def _parse_and_validate(
+    model: type[BaseModelT], structured: dict | None, raw_text: str
+) -> BaseModelT:
+    """Parse and validate one structured driver response (§A).
 
     Design: §10.3 makes the driver attempt exactly one parse while the
-        orchestrator owns retry through with_schema_retry.
-    Implementation: prefer structured dict, otherwise json.loads raw text and
-        wrap JSON failures in OutputSchemaError.
-    Example: payload = _run_and_parse_json({'ok': True}, '').
+        orchestrator owns retry through with_schema_retry; §A extends that
+        boundary to Pydantic schema deviations, not just JSON syntax failures.
+    Implementation: prefer structured dict, otherwise json.loads raw text,
+        require a top-level object, then model_validate with wrapped errors.
+    Example: result = _parse_and_validate(EvalResult, {'no_gaps': True}, '').
     """
     if structured is not None:
-        return structured
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise OutputSchemaError(raw=raw_text, reason=str(exc)) from exc
+        parsed = structured
+    else:
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise OutputSchemaError(raw=raw_text, reason=str(exc)) from exc
     if not isinstance(parsed, dict):
         raise OutputSchemaError(raw=raw_text, reason="top-level JSON value is not an object")
-    return parsed
+    try:
+        return model.model_validate(parsed)
+    except ValidationError as exc:
+        raise OutputSchemaError(raw=raw_text, reason=str(exc)) from exc

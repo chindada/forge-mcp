@@ -192,6 +192,7 @@ class TestMatchArtifact:
             ("iteration-2/eval.md", "text/markdown"),
             ("iteration-3/triage.json", "application/json"),
             ("iteration-3/sessions.json", "application/json"),
+            ("iteration-3/gap_fingerprint.json", "application/json"),
             ("iteration-4/git-violation.txt", "text/plain"),
             ("iteration-4/verify.txt", "text/plain"),
             ("state.json", "application/json"),
@@ -395,6 +396,7 @@ class TestExpandScope:
         (run_dir / "plan" / "plan.md").write_text("# plan")
         (run_dir / "iteration-1" / "contract.md").write_text("# c")
         (run_dir / "iteration-2" / "eval.md").write_text("# e")
+        (run_dir / "iteration-2" / "gap_fingerprint.json").write_text("[]")
         scope = _ResourceScope("12345678", harness, "tokenAtokenA")
         rows = expand_scope_to_resources(scope)
         subpaths = sorted(sp for _, _, _, sp in rows)
@@ -402,6 +404,7 @@ class TestExpandScope:
             "inputs/design.md",
             "iteration-1/contract.md",
             "iteration-2/eval.md",
+            "iteration-2/gap_fingerprint.json",
             "plan/plan.md",
             "state.json",
             "status.log",

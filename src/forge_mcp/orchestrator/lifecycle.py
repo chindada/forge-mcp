@@ -193,7 +193,7 @@ async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> N
     sm.transition("finalizing")
     await _emit_if_present(deps, "emit_state")
     await close_drivers(deps)
-    ledger.unresolved_gaps = collect_unresolved_gaps(deps.run_dir)
+    ledger.unresolved_gaps = collect_unresolved_gaps_safe(deps.run_dir, deps.logger, ledger)
     ledger.decided_at = datetime.now(UTC)
     await _finalize_terminal(sm, ledger, deps, status="incomplete")
 
@@ -217,11 +217,7 @@ async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc:
     ledger.error_class = exc.__class__.__name__
     ledger.error_message = str(exc)
     ledger.traceback_truncated = "".join(traceback.format_exception(exc))[:4096]
-    try:
-        ledger.unresolved_gaps = collect_unresolved_gaps(deps.run_dir)
-    except Exception:
-        # §8.5: malformed eval.json must not mask the original exception.
-        ledger.unresolved_gaps = []
+    ledger.unresolved_gaps = collect_unresolved_gaps_safe(deps.run_dir, deps.logger, ledger)
     ledger.decided_at = datetime.now(UTC)
     await _finalize_terminal(sm, ledger, deps, status="failed", reason=str(exc))
 
@@ -250,6 +246,28 @@ def collect_unresolved_gaps(run_dir: Path) -> list[EvalGap]:
     return []
 
 
+def collect_unresolved_gaps_safe(
+    run_dir: Path, logger: Any, ledger: RunLedger | None = None
+) -> list[EvalGap]:
+    """Collect unresolved gaps without letting artifact corruption escape (§B).
+
+    Design: terminal failure/timeout paths must preserve their original outcome
+        even when the latest eval.json is malformed or unreadable.
+    Implementation: delegate to the strict collector, warn with exc_info on any
+        exception, and return an empty list as the conservative fallback.
+    Example: gaps = collect_unresolved_gaps_safe(Path('.harness/abcd1234'), logger).
+    """
+    try:
+        return collect_unresolved_gaps(run_dir)
+    except Exception as exc:  # noqa: BLE001
+        message = f"unresolved gap collection failed: {type(exc).__name__}: {exc}"
+        if ledger is not None:
+            ledger.warnings.append(message)
+        if logger is not None:
+            logger.warning("unresolved gap collection failed", exc_info=True)
+        return []
+
+
 def apply_caps_and_overflow(ledger: RunLedger, run_dir: Path, logger: Any) -> None:
     """Apply RunResult caps and write overflow artifacts when needed.
 
@@ -265,8 +283,15 @@ def apply_caps_and_overflow(ledger: RunLedger, run_dir: Path, logger: Any) -> No
     )
     if unresolved_overflow is not None:
         path = run_dir / "unresolved-gaps-overflow.md"
-        atomic_write_text(path, unresolved_overflow)
-        ledger.unresolved_overflow_path = str(path)
+        try:
+            atomic_write_text(path, unresolved_overflow)
+            ledger.unresolved_overflow_path = str(path)
+        except OSError as exc:
+            ledger.warnings.append(
+                f"unresolved-gaps-overflow.md write failed: {type(exc).__name__}: {exc}"
+            )
+            if logger is not None:
+                logger.warning("unresolved-gaps-overflow.md write failed", exc_info=True)
         ledger.unresolved_gaps = ledger.unresolved_gaps[:GAP_LIST_CAP]
     design_total = len(ledger.design_flaw_gaps)
     design_overflow = build_gap_overflow(
@@ -274,8 +299,15 @@ def apply_caps_and_overflow(ledger: RunLedger, run_dir: Path, logger: Any) -> No
     )
     if design_overflow is not None:
         path = run_dir / "design-flaw-gaps-overflow.md"
-        atomic_write_text(path, design_overflow)
-        ledger.design_flaw_overflow_path = str(path)
+        try:
+            atomic_write_text(path, design_overflow)
+            ledger.design_flaw_overflow_path = str(path)
+        except OSError as exc:
+            ledger.warnings.append(
+                f"design-flaw-gaps-overflow.md write failed: {type(exc).__name__}: {exc}"
+            )
+            if logger is not None:
+                logger.warning("design-flaw-gaps-overflow.md write failed", exc_info=True)
         ledger.design_flaw_gaps = ledger.design_flaw_gaps[:GAP_LIST_CAP]
     kept, dropped = split_warnings(ledger.warnings)
     if dropped:

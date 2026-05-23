@@ -415,6 +415,185 @@ async def test_handle_failure_swallows_eval_json_errors(tmp_path: Path) -> None:
     assert ledger.unresolved_gaps == []
 
 
+async def test_handle_timeout_corrupt_eval_returns_incomplete_with_warning(tmp_path: Path) -> None:
+    """§B — timeout gap collection is defensive against corrupt eval.json.
+
+    Design: runtime-cap terminalization must return incomplete, not mask with parse errors.
+    Implementation: write invalid eval.json, call handle_timeout, and inspect ledger warning.
+    Example: ledger.unresolved_gaps is empty after corrupt latest eval.json.
+    """
+    iter_dir = tmp_path / "iteration-1"
+    iter_dir.mkdir()
+    (iter_dir / "eval.json").write_text("not json {{{")
+    sm = _sm(tmp_path)
+    ledger = RunLedger()
+    deps = _deps(tmp_path)
+
+    await handle_timeout(sm, ledger, deps)
+
+    assert sm.current.state == "incomplete"
+    assert ledger.unresolved_gaps == []
+    assert any("unresolved gap collection failed" in warning for warning in ledger.warnings)
+
+
+async def test_handle_failure_corrupt_eval_warns_without_masking_original(tmp_path: Path) -> None:
+    """§B — failure gap collection warns while preserving original metadata.
+
+    Design: malformed eval artifacts must not replace the exception that failed the run.
+    Implementation: corrupt eval.json, fail with ValueError, and inspect recorded metadata.
+    Example: error_class remains ValueError after collection failure.
+    """
+    iter_dir = tmp_path / "iteration-1"
+    iter_dir.mkdir()
+    (iter_dir / "eval.json").write_text("not json {{{")
+    sm = _sm(tmp_path)
+    sm.transition("iter_evaluating", iteration=1)
+    ledger = RunLedger()
+
+    await handle_failure(sm, ledger, _deps(tmp_path), ValueError("original"))
+
+    assert ledger.error_class == "ValueError"
+    assert ledger.error_message == "original"
+    assert ledger.unresolved_gaps == []
+    assert any("unresolved gap collection failed" in warning for warning in ledger.warnings)
+
+
+def test_apply_caps_unresolved_overflow_write_failure_still_caps(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """§G — unresolved overflow writes are best-effort and caps still apply.
+
+    Design: terminal RunResult construction must not become McpError on overflow I/O.
+    Implementation: make atomic_write_text raise and assert cap slice plus warning.
+    Example: unresolved_overflow_path remains None after OSError.
+    """
+    from forge_mcp.models import EvalGap
+    from forge_mcp.orchestrator.caps import GAP_LIST_CAP
+
+    gaps = [
+        EvalGap(
+            title=f"g{i}",
+            severity="low",
+            design_doc_section="§x",
+            current_state="c",
+            expected_state="e",
+            suggested_fix="f",
+        )
+        for i in range(GAP_LIST_CAP + 1)
+    ]
+    ledger = RunLedger(unresolved_gaps=gaps)
+
+    def fail_write(path, text):
+        """Raise OSError for overflow writes.
+
+        Design: isolates apply_caps_and_overflow error handling.
+        Implementation: always raise the filesystem-shaped exception.
+        Example: fail_write(Path('x'), 'body') raises OSError.
+        """
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lifecycle_mod, "atomic_write_text", fail_write)
+    lifecycle_mod.apply_caps_and_overflow(ledger, tmp_path, MagicMock())
+
+    assert ledger.unresolved_overflow_path is None
+    assert len(ledger.unresolved_gaps) == GAP_LIST_CAP
+    assert ledger.warnings[0].startswith("unresolved-gaps-overflow.md write failed")
+
+
+def test_apply_caps_design_overflow_write_failure_still_caps(monkeypatch, tmp_path: Path) -> None:
+    """§G — design-flaw overflow writes are best-effort and caps still apply.
+
+    Design: design-flaw side overflow must mirror unresolved overflow behavior.
+    Implementation: make atomic_write_text raise and assert cap slice plus warning.
+    Example: design_flaw_overflow_path remains None after OSError.
+    """
+    from forge_mcp.models import DesignFlawGap, EvalGap
+    from forge_mcp.orchestrator.caps import GAP_LIST_CAP
+
+    gaps = [
+        EvalGap(
+            title=f"d{i}",
+            severity="low",
+            design_doc_section="§x",
+            current_state="c",
+            expected_state="e",
+            suggested_fix="f",
+        )
+        for i in range(GAP_LIST_CAP + 1)
+    ]
+    design_flaws = [
+        DesignFlawGap(
+            gap=gap,
+            iteration_n=1,
+            fault_kind="other",
+            cited_sections=["design section with enough text"],
+            explanation="design issue",
+        )
+        for gap in gaps
+    ]
+    ledger = RunLedger(design_flaw_gaps=design_flaws)
+
+    def fail_write(path, text):
+        """Raise OSError for overflow writes.
+
+        Design: isolates apply_caps_and_overflow error handling.
+        Implementation: always raise the filesystem-shaped exception.
+        Example: fail_write(Path('x'), 'body') raises OSError.
+        """
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lifecycle_mod, "atomic_write_text", fail_write)
+    lifecycle_mod.apply_caps_and_overflow(ledger, tmp_path, MagicMock())
+
+    assert ledger.design_flaw_overflow_path is None
+    assert len(ledger.design_flaw_gaps) == GAP_LIST_CAP
+    assert ledger.warnings[0].startswith("design-flaw-gaps-overflow.md write failed")
+
+
+async def test_finalize_terminal_ignores_overflow_write_oserror(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """§G — terminal finalization still returns after overflow write failure.
+
+    Design: overflow artifact I/O is forensic and must not raise McpError-shaped failures.
+    Implementation: patch atomic_write_text to fail and await shared terminal finalization.
+    Example: state reaches incomplete and no exception escapes.
+    """
+    from forge_mcp.models import EvalGap
+    from forge_mcp.orchestrator.caps import GAP_LIST_CAP
+
+    ledger = RunLedger(
+        unresolved_gaps=[
+            EvalGap(
+                title=f"g{i}",
+                severity="low",
+                design_doc_section="§x",
+                current_state="c",
+                expected_state="e",
+                suggested_fix="f",
+            )
+            for i in range(GAP_LIST_CAP + 1)
+        ]
+    )
+
+    def fail_write(path, text):
+        """Raise OSError for overflow writes.
+
+        Design: finalization should treat overflow write failures as warnings.
+        Implementation: always raise the filesystem-shaped exception.
+        Example: fail_write(Path('x'), 'body') raises OSError.
+        """
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lifecycle_mod, "atomic_write_text", fail_write)
+    sm = _sm(tmp_path)
+    await lifecycle_mod._finalize_terminal(sm, ledger, _deps(tmp_path), status="incomplete")
+
+    assert sm.current.state == "incomplete"
+    assert ledger.unresolved_overflow_path is None
+    assert len(ledger.unresolved_gaps) == GAP_LIST_CAP
+
+
 async def test_emit_terminal_status_emits_one_phase_update() -> None:
     """Pin §8.1 terminal status event shape.
 

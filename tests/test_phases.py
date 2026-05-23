@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fakes import FakeEvaluator, FakeGenerator, FakePlanner
 
 from forge_mcp.config import RunConfig
+from forge_mcp.errors import PlannerNoOutputError
 from forge_mcp.models import EvalGap, EvalResult, GapTriage, RunForgeInput, TriageResult
+from forge_mcp.orchestrator.convergence import fingerprint_gaps
 from forge_mcp.orchestrator.ledger import RunLedger
 from forge_mcp.orchestrator.phases import (
     PhaseDeps,
@@ -151,6 +155,26 @@ async def test_no_gaps_completes_iteration_one(tmp_path: Path) -> None:
     assert await run_phases(deps, sm, ledger, None) == ("completed", 1)
 
 
+async def test_iteration_writes_gap_fingerprint_sidecar_before_done(tmp_path: Path) -> None:
+    """§C — each completed iteration durably records gap fingerprints.
+
+    Design: resume parity uses a sidecar instead of lossy eval.json reconstruction.
+    Implementation: run one gapped iteration and assert sorted fingerprint JSON exists.
+    Example: gap_fingerprint.json equals sorted(fingerprint_gaps(eval.gaps)).
+    """
+    gap = _gap("sidecar gap")
+    evaluator = FakeEvaluator([EvalResult(no_gaps=False, gaps=[gap], summary="bad")])
+    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=1)
+    (deps.run_dir / "plan").mkdir(exist_ok=True)
+    (deps.run_dir / "plan" / "plan.md").write_text("# plan\n")
+
+    await run_iteration_loop(deps, sm, ledger, None)
+
+    sidecar = deps.run_dir / "iteration-1" / "gap_fingerprint.json"
+    assert json.loads(sidecar.read_text()) == sorted(fingerprint_gaps([gap]))
+    assert ledger.gap_fingerprints == [fingerprint_gaps([gap])]
+
+
 async def test_gap_then_no_gaps_completes_iteration_two(tmp_path: Path) -> None:
     """Pin a forge-mcp behavior.
 
@@ -185,7 +209,19 @@ async def test_planner_ctx_has_no_target_dir(tmp_path: Path) -> None:
     Example: ctx.target_dir is None and ctx.iteration_n is None.
     """
     planner = MagicMock()
-    planner.write_plan = AsyncMock(return_value=None)
+
+    async def write_plan(ctx):
+        """Write a valid plan while preserving ctx capture.
+
+        Design: this test targets RunContext shape, not no-output recovery.
+        Implementation: create plan.md exactly as a real planner would.
+        Example: await write_plan(ctx) leaves run/plan/plan.md present.
+        """
+        (ctx.run_dir / "plan").mkdir(parents=True, exist_ok=True)
+        (ctx.run_dir / "plan" / "plan.md").write_text("# plan\n")
+        return None
+
+    planner.write_plan = AsyncMock(side_effect=write_plan)
     drivers = MagicMock(planner=planner)
     status = MagicMock()
     status.update = AsyncMock()
@@ -215,6 +251,25 @@ async def test_planner_ctx_has_no_target_dir(tmp_path: Path) -> None:
     assert ctx.target_dir is None
     assert ctx.iteration_n is None
     assert ledger.completed_phases == ["plan"]
+
+
+async def test_run_plan_phase_raises_after_two_missing_plan_attempts(tmp_path: Path) -> None:
+    """§H — planner no-output becomes a typed terminal failure cause.
+
+    Design: a missing plan.md after Write-tool recovery is an infra failure, not McpError.
+    Implementation: fake planner never writes plan.md and assert two attempts occur.
+    Example: run_plan_phase raises PlannerNoOutputError after retry.
+    """
+    evaluator = FakeEvaluator([EvalResult(no_gaps=True, gaps=[], summary="ok")])
+    deps, sm, ledger = _deps(tmp_path, evaluator)
+    planner = MagicMock()
+    planner.write_plan = AsyncMock(return_value=None)
+    deps.drivers.planner = planner
+
+    with pytest.raises(PlannerNoOutputError, match="planner produced no plan.md"):
+        await run_plan_phase(deps, sm, ledger)
+
+    assert planner.write_plan.await_count == 2
 
 
 async def test_iteration_completed_phase_label_uses_iter_dash_n(tmp_path: Path) -> None:

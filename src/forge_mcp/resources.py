@@ -57,6 +57,9 @@ _ALLOWED_ARTIFACTS: tuple[_ArtifactPattern, ...] = (
     _ArtifactPattern(
         None, re.compile(r"^iteration-([1-9]\d*)/sessions\.json$"), "application/json"
     ),
+    _ArtifactPattern(
+        None, re.compile(r"^iteration-([1-9]\d*)/gap_fingerprint\.json$"), "application/json"
+    ),
     _ArtifactPattern(None, re.compile(r"^iteration-([1-9]\d*)/git-violation\.txt$"), "text/plain"),
     _ArtifactPattern(None, re.compile(r"^iteration-([1-9]\d*)/verify\.txt$"), "text/plain"),
     _ArtifactPattern("state.json", None, "application/json"),
@@ -352,6 +355,7 @@ def expand_scope_to_resources(scope: _ResourceScope) -> list[tuple[str, str, str
                 "eval.md",
                 "triage.json",
                 "sessions.json",
+                "gap_fingerprint.json",
                 "git-violation.txt",
                 "verify.txt",
             ):

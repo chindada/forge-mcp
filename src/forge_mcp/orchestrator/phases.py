@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from mcp.server.experimental.task_context import ServerTaskContext
 
-from ..artifacts import atomic_write_text, write_sessions_json
+from ..artifacts import atomic_write_json, atomic_write_text, write_sessions_json
 from ..config import RunConfig
 from ..drivers._claude import is_transient_error as is_transient_claude
 from ..drivers._codex import is_transient_error as is_transient_codex
+from ..errors import PlannerNoOutputError
 from ..gitguard import capture_state, changed_files, diff_state
 from ..models import EvalGap, EvalResult, RunForgeInput
 from ..runcontext import RunContext
@@ -125,18 +126,21 @@ async def run_plan_phase(
     if warning:
         ledger.warnings.append(warning)
     plan_path = deps.run_dir / "plan" / "plan.md"
-    if plan_path.exists():
+    problems = validate_plan(plan_path.read_text()) if plan_path.exists() else ["plan.md missing"]
+    if not plan_path.exists() or problems:
+        warning = await with_transient_retry(
+            lambda: deps.drivers.planner.write_plan(planner_ctx),
+            is_transient=is_transient_claude,
+        )
+        if warning:
+            ledger.warnings.append(warning)
+        if not plan_path.exists():
+            raise PlannerNoOutputError(
+                "planner produced no plan.md and Write tool_use recovery failed after two attempts"
+            )
         problems = validate_plan(plan_path.read_text())
         if problems:
-            warning = await with_transient_retry(
-                lambda: deps.drivers.planner.write_plan(planner_ctx),
-                is_transient=is_transient_claude,
-            )
-            if warning:
-                ledger.warnings.append(warning)
-            problems = validate_plan(plan_path.read_text()) if plan_path.exists() else problems
-            if problems:
-                ledger.warnings.append(f"plan.md degenerate after re-author: {problems}")
+            ledger.warnings.append(f"plan.md degenerate after re-author: {problems}")
     await deps.emitter.emit_path("plan/plan.md")  # §S5.2
     ledger.completed_phases.append("plan")  # §7 / §9.1
     write_sessions_json(
@@ -619,10 +623,13 @@ async def run_iteration_loop(
             iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
         )
         await deps.emitter.emit_iteration(iteration_n, "sessions.json")  # §S5.2
+        fingerprint = fingerprint_gaps(eval_for_loop.gaps)
+        atomic_write_json(iteration_dir / "gap_fingerprint.json", sorted(fingerprint))
+        await deps.emitter.emit_iteration(iteration_n, "gap_fingerprint.json")  # §S5.2
         sm.transition("iter_done", iteration=iteration_n, last_completed_iteration=iteration_n)
         lifecycle.poll_task_cancellation(task)
         ledger.completed_phases.append(f"iter-{iteration_n}")  # §7 / §9.2 step 6
-        ledger.gap_fingerprints.append(fingerprint_gaps(eval_for_loop.gaps))
+        ledger.gap_fingerprints.append(fingerprint)
         signal = detect_non_progress(ledger.gap_fingerprints, window=NON_PROGRESS_WINDOW)
         effective_no_gaps = (not eval_for_loop.gaps) and (er.no_gaps or triage_ran)
         verify_passed = deps.inputs.verify_command is None or bool(

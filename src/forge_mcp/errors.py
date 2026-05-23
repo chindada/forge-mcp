@@ -55,7 +55,7 @@ class OutputSchemaError(Exception):
     def __init__(self, *, raw: str, reason: str) -> None:
         """Store the raw payload and parse reason on the exception.
 
-        Design: callers (the `_run_and_parse_json` helper, §10.3) need both the
+        Design: callers (the `_parse_and_validate` helper, §10.3) need both the
             unparsed text and the parse-error message for the terminal-fail log
             when both schema-retry attempts fail.
         Implementation: forward `reason` to the base Exception message via
@@ -65,3 +65,14 @@ class OutputSchemaError(Exception):
         super().__init__(reason)
         self.raw = raw
         self.reason = reason
+
+
+class PlannerNoOutputError(RuntimeError):
+    """Raised when planner recovery still does not produce plan.md (§H).
+
+    Design: a missing planner handoff artifact is an in-run infrastructure
+        failure, so the orchestrator should return RunResult(status='failed').
+    Implementation: plain RuntimeError subclass used only for error_class
+        discrimination; failure_kind remains the closed infra_failure mapping.
+    Example: raise PlannerNoOutputError('planner produced no plan.md').
+    """

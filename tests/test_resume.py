@@ -14,7 +14,13 @@ from forge_mcp.state import RunState, StateLiteral, write_state
 
 
 def _write_run(
-    harness: Path, run_id: str, state: StateLiteral, *, last_completed: int, started: datetime
+    harness: Path,
+    run_id: str,
+    state: StateLiteral,
+    *,
+    last_completed: int,
+    started: datetime,
+    cancelled: bool = False,
 ) -> Path:
     """Write a minimal run dir with a state.json for resume tests.
 
@@ -34,6 +40,7 @@ def _write_run(
             iteration=last_completed,
             started_at=started,
             last_completed_iteration=last_completed,
+            cancelled=cancelled,
         ),
     )
     return run_dir
@@ -72,6 +79,47 @@ def test_find_returns_none_when_all_terminal(harness_dir: Path) -> None:
     _write_run(harness_dir, "aaaaaaaa", "completed", last_completed=5, started=now)
     _write_run(harness_dir, "bbbbbbbb", "incomplete", last_completed=2, started=now)
     assert find_resumable_run(harness_dir) is None
+
+
+def test_find_resumable_run_skips_cancelled_state(harness_dir: Path) -> None:
+    """§C-Inv 1 — cancelled runs are never offered for resume.
+
+    Design: client cancellation is terminal-forensic even while state is cancelling.
+    Implementation: write a non-terminal state with cancelled=True and assert skip.
+    Example: find_resumable_run returns None for cancelling/cancelled=True.
+    """
+    now = datetime.now(UTC)
+    _write_run(
+        harness_dir,
+        "aaaaaaaa",
+        "cancelling",
+        last_completed=2,
+        started=now,
+        cancelled=True,
+    )
+    assert find_resumable_run(harness_dir) is None
+
+
+def test_find_resumable_run_keeps_uncancelled_crash_recovery(harness_dir: Path) -> None:
+    """§H2 — cancelled guard does not block normal crash recovery.
+
+    Design: resume still recovers non-terminal anchored crashes when cancelled=False.
+    Implementation: write iter_generating with a durable anchor and assert it resumes.
+    Example: start_iteration is last_completed_iteration + 1.
+    """
+    now = datetime.now(UTC)
+    _write_run(
+        harness_dir,
+        "bbbbbbbb",
+        "iter_generating",
+        last_completed=2,
+        started=now,
+        cancelled=False,
+    )
+    point = find_resumable_run(harness_dir)
+    assert point is not None
+    assert point.run_id == "bbbbbbbb"
+    assert point.start_iteration == 3
 
 
 def test_find_resumable_run_skips_non_run_id_dir(tmp_path: Path) -> None:

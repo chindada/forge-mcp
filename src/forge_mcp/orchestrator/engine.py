@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 from datetime import UTC, datetime
@@ -34,7 +35,7 @@ from .emitter import _Emitter, _NullNotifier
 from .ledger import RunLedger
 from .lifecycle import (
     _finalize_terminal,
-    collect_unresolved_gaps,
+    collect_unresolved_gaps_safe,
     handle_cancellation,
     handle_failure,
     handle_timeout,
@@ -47,25 +48,44 @@ from .statemachine import RunStateMachine
 DESIGN_DOC_LARGE_BYTES = 1024 * 1024  # §8.1 — warn over 1 MB without truncating
 
 
-def _reconstruct_fingerprints(run_dir: Path, point: ResumePoint) -> list[frozenset[str]]:
+def _reconstruct_fingerprints(
+    run_dir: Path, point: ResumePoint, ledger: RunLedger
+) -> list[frozenset[str]]:
     """Rebuild oscillation history from durable eval.json files (§H2.5, §H3).
 
-    Design: non-progress detection must survive resume without live context, so
-        history is reconstructed from completed iteration artifacts.
-    Implementation: read eval.json for iterations 1..last_completed and append
-        fingerprint_gaps(gaps), skipping missing/corrupt artifacts.
-    Example: history = _reconstruct_fingerprints(run_dir, point).
+    Design: non-progress detection must survive resume without live context;
+        §C sidecars preserve exact live fingerprints while legacy eval.json is lossy.
+    Implementation: prefer gap_fingerprint.json per iteration, fall back to
+        eval.json reconstruction, and emit one warning when any fallback occurs.
+    Example: history = _reconstruct_fingerprints(run_dir, point, ledger).
     """
     history: list[frozenset[str]] = []
+    legacy_fallback = False
     for iteration_n in range(1, point.last_completed_iteration + 1):
-        eval_path = run_dir / f"iteration-{iteration_n}" / "eval.json"
+        iteration_dir = run_dir / f"iteration-{iteration_n}"
+        sidecar_path = iteration_dir / "gap_fingerprint.json"
+        if sidecar_path.exists():
+            try:
+                loaded = json.loads(sidecar_path.read_text())
+                if isinstance(loaded, list) and all(isinstance(item, str) for item in loaded):
+                    history.append(frozenset(loaded))
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        legacy_fallback = True
+        eval_path = iteration_dir / "eval.json"
         if not eval_path.exists():
             continue
         try:
             gaps = EvalResult.model_validate_json(eval_path.read_text()).gaps
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         history.append(fingerprint_gaps(gaps))
+    if legacy_fallback:
+        ledger.warnings.append(
+            "resume reconstructed approximate gap history from legacy eval.json; "
+            "gap_fingerprint.json sidecars were missing or unreadable"
+        )
     return history
 
 
@@ -345,9 +365,15 @@ class Orchestrator:
                 # §X7 — the cross-design aggregator re-runs from scratch on BOTH
                 # cold-start and a §H2 resume; the digest must reflect harness
                 # state at planner-cold-start time, not at original-run-start time.
-                digest = render_cross_design_digest(self._prepared.harness_dir, logger)
-                atomic_write_text(inputs_dir / "cross_design_patterns.md", digest)
-                await emitter.emit_path("inputs/cross_design_patterns.md")  # §S5.2 / §X7
+                try:
+                    digest = render_cross_design_digest(self._prepared.harness_dir, logger)
+                    atomic_write_text(inputs_dir / "cross_design_patterns.md", digest)
+                    await emitter.emit_path("inputs/cross_design_patterns.md")  # §S5.2 / §X7
+                except OSError as exc:
+                    ledger.warnings.append(
+                        f"cross_design_patterns.md write failed: {type(exc).__name__}: {exc}"
+                    )
+                    logger.warning("cross_design_patterns.md write failed", exc_info=True)
 
                 if resume_point is None:
                     git_state = capture_state(deps.target_dir)
@@ -370,7 +396,9 @@ class Orchestrator:
                     prepare_resume(run_dir, resume_point)
                     git_state_path = run_dir / "inputs" / "git-state.txt"
                     git_state = git_state_path.read_text() if git_state_path.exists() else None
-                    ledger.gap_fingerprints = _reconstruct_fingerprints(run_dir, resume_point)
+                    ledger.gap_fingerprints = _reconstruct_fingerprints(
+                        run_dir, resume_point, ledger
+                    )
                     if _accepts_task_kw(run_iteration_loop):
                         phase_task = run_iteration_loop(
                             deps,
@@ -394,7 +422,7 @@ class Orchestrator:
                 if terminal_status == "incomplete":
                     # §8.1 / §8.3 — iteration-cap branch reads latest eval.json
                     # via the same helper handle_timeout uses.
-                    ledger.unresolved_gaps = collect_unresolved_gaps(run_dir)
+                    ledger.unresolved_gaps = collect_unresolved_gaps_safe(run_dir, logger, ledger)
                 sm.transition("finalizing")
                 await emitter.emit_state()
                 ledger.decided_at = datetime.now(UTC)

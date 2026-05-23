@@ -48,7 +48,7 @@ def find_resumable_run(harness_dir: Path) -> ResumePoint | None:
             state = read_state(state_path)
         except Exception:
             continue
-        if state.state in _TERMINAL:
+        if state.state in _TERMINAL or state.cancelled:
             continue
         # §H2 / H-Inv 2 (durable resume anchor): resume re-enters ONLY from a
         # fsync-durable iter_done boundary. last_completed_iteration is set only

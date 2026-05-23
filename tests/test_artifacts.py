@@ -299,6 +299,45 @@ def test_write_prior_attempts_over_cap_splits(tmp_path):
     assert body.rstrip("\n").endswith(tail.rstrip("\n"))
 
 
+def test_write_prior_attempts_no_newline_utf8_split_has_no_replacement(tmp_path):
+    """§I — no-newline truncation lands on UTF-8 character boundaries.
+
+    Design: prior-attempt digest truncation must not corrupt multibyte text.
+    Implementation: split an over-cap 3-byte-only string and assert no U+FFFD.
+    Example: Japanese kana overflow round-trips without replacement characters.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    text = "あ" * 11_000
+    overflow = artifacts.write_prior_attempts(inputs_dir, text)
+    assert overflow is not None
+    combined = (inputs_dir / "prior_attempts.md").read_text() + overflow.read_text()
+    assert "\ufffd" not in combined
+
+
+def test_write_prior_attempts_newline_branch_still_aligns_to_newline(tmp_path):
+    """§I — newline-aligned truncation is unchanged.
+
+    Design: the UTF-8 fix applies only to the no-newline fallback branch.
+    Implementation: place a newline before the cap and assert the head cuts there.
+    Example: head content ends exactly at the last newline before the byte cap.
+    """
+    from forge_mcp import artifacts
+
+    inputs_dir = tmp_path / "inputs"
+    inputs_dir.mkdir()
+    prefix = "a" * 30_000 + "\n"
+    suffix = "b" * 4_000
+    overflow = artifacts.write_prior_attempts(inputs_dir, prefix + suffix)
+    assert overflow is not None
+    head = (inputs_dir / "prior_attempts.md").read_text()
+    assert head.startswith(prefix)
+    assert head.split("\n... truncated", 1)[0] == prefix.rstrip("\n")
+    assert overflow.read_text() == suffix
+
+
 def test_write_prior_attempts_posix_0600(tmp_path):
     """§L6.2 — head + overflow are 0600 on POSIX.
 

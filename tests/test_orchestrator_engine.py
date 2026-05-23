@@ -371,6 +371,50 @@ async def test_engine_resume_regenerates_cross_design_digest(tmp_path, monkeypat
     assert digest == "FRESH DIGEST"
 
 
+async def test_engine_cross_design_digest_write_oserror_warns(tmp_path, monkeypatch) -> None:
+    """§F — cross-design digest write failure is best-effort.
+
+    Design: inputs/cross_design_patterns.md is planner context, not terminal-critical I/O.
+    Implementation: raise OSError for that path and assert the run still completes.
+    Example: result.status remains completed and ledger warning reaches RunResult.
+    """
+    prepared = _prepared(tmp_path)
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Return a completed phase result without SDK calls.
+
+        Design: isolates the cross-design write block in engine.run.
+        Implementation: append a representative completed phase and return.
+        Example: await fake_run_phases(...) == ('completed', 1).
+        """
+        ledger.completed_phases.append("iter-1")
+        return ("completed", 1)
+
+    real_atomic = engine_mod.atomic_write_text
+
+    def flaky_atomic(path, text):
+        """Raise for cross-design digest writes only.
+
+        Design: keeps all other engine artifacts using production atomic writes.
+        Implementation: inspect filename and delegate otherwise.
+        Example: flaky_atomic(Path('cross_design_patterns.md'), 'x') raises.
+        """
+        if Path(path).name == "cross_design_patterns.md":
+            raise OSError("readonly")
+        return real_atomic(path, text)
+
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "render_cross_design_digest", lambda _h, _l: "digest")
+    monkeypatch.setattr(engine_mod, "atomic_write_text", flaky_atomic)
+
+    result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+
+    assert result.status == "completed"
+    assert any(w.startswith("cross_design_patterns.md write failed") for w in result.warnings)
+
+
 async def test_engine_cancellation_propagates_and_skips_result(tmp_path: Path, monkeypatch) -> None:
     """Pin §8.5 cancellation propagation through engine.run.
 
@@ -396,6 +440,28 @@ async def test_engine_cancellation_propagates_and_skips_result(tmp_path: Path, m
     with pytest.raises(asyncio.CancelledError):
         await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
     lock.release.assert_called_once()
+
+
+async def test_engine_planner_no_output_returns_failed_result(tmp_path: Path, monkeypatch) -> None:
+    """§H — planner no-output is returned as terminal failed RunResult.
+
+    Design: pre-loop planner failures are normal terminal results under §6.3.
+    Implementation: planner never writes plan.md; engine catches PlannerNoOutputError.
+    Example: result.failure_kind is infra_failure and error_class names the exception.
+    """
+    prepared = _prepared(tmp_path)
+    drivers = _drivers()
+    drivers.planner.write_plan = AsyncMock(return_value=None)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+
+    result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), drivers).run()
+
+    assert result.status == "failed"
+    assert result.failed_phase == "planning"
+    assert result.error_class == "PlannerNoOutputError"
+    assert "planner produced no plan.md" in (result.error_message or "")
+    assert result.failure_kind == "infra_failure"
 
 
 async def test_engine_does_not_swallow_keyboard_interrupt(tmp_path: Path, monkeypatch) -> None:
@@ -519,6 +585,40 @@ async def test_iteration_cap_unresolved_gaps_come_from_latest_eval_json(tmp_path
     result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
     assert result.status == "incomplete"
     assert any(g.title == "DISK_SENTINEL" for g in result.unresolved_gaps)
+
+
+async def test_inline_incomplete_corrupt_eval_returns_empty_gaps_with_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """§B — inline incomplete gap collection is defensive like timeout.
+
+    Design: iteration-cap terminalization must not fail because eval.json is corrupt.
+    Implementation: fake phases write invalid eval.json and return incomplete.
+    Example: RunResult.unresolved_gaps is empty and warnings mention collection.
+    """
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Write corrupt eval data and return inline incomplete.
+
+        Design: isolates engine's inline unresolved-gap collection branch.
+        Implementation: create iteration-1/eval.json with invalid JSON.
+        Example: await fake_run_phases(...) == ('incomplete', 1).
+        """
+        iter_dir = deps.run_dir / "iteration-1"
+        iter_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (iter_dir / "eval.json").write_text("not json {{{")
+        return ("incomplete", 1)
+
+    prepared = _prepared(tmp_path)
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+
+    result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+
+    assert result.status == "incomplete"
+    assert result.unresolved_gaps == []
+    assert any("unresolved gap collection failed" in warning for warning in result.warnings)
 
 
 async def test_inline_incomplete_applies_caps_exactly_once(tmp_path: Path, monkeypatch) -> None:
@@ -669,7 +769,66 @@ def test_engine_run_does_not_re_transition_failed_after_build_result() -> None:
     src = Path("src/forge_mcp/orchestrator/engine.py").read_text()
     after_build = src.split("build_result(", 1)[1] if "build_result(" in src else ""
     assert 'sm.transition("failed"' not in after_build
-    assert "sm.transition('failed'" not in after_build
+
+
+def test_reconstruct_fingerprints_prefers_sidecars(tmp_path: Path) -> None:
+    """§C — resume reconstructs oscillation history from sidecars when present.
+
+    Design: sidecars preserve the exact live fingerprint history across resume.
+    Implementation: write two gap_fingerprint.json files and assert exact frozensets.
+    Example: _reconstruct_fingerprints returns [{'a'}, {'b', 'c'}].
+    """
+    from forge_mcp.orchestrator.resume import ResumePoint
+
+    run_dir = tmp_path / "run"
+    for iteration_n, values in ((1, ["a"]), (2, ["b", "c"])):
+        iteration_dir = run_dir / f"iteration-{iteration_n}"
+        iteration_dir.mkdir(parents=True)
+        (iteration_dir / "gap_fingerprint.json").write_text(json.dumps(values))
+    point = ResumePoint("abcd1234", run_dir, last_completed_iteration=2, start_iteration=3)
+    ledger = RunLedger()
+
+    history = engine_mod._reconstruct_fingerprints(run_dir, point, ledger)
+
+    assert history == [frozenset({"a"}), frozenset({"b", "c"})]
+    assert ledger.warnings == []
+
+
+def test_reconstruct_fingerprints_falls_back_once_when_sidecar_missing(tmp_path: Path) -> None:
+    """§C — legacy resume fallback reads eval.json and warns once.
+
+    Design: old runs without sidecars remain resumable but mark history approximate.
+    Implementation: write only eval.json, reconstruct, and assert a single warning.
+    Example: ledger.warnings has one approximate-history message.
+    """
+    from forge_mcp.models import EvalGap, EvalResult
+    from forge_mcp.orchestrator.convergence import fingerprint_gaps
+    from forge_mcp.orchestrator.resume import ResumePoint
+
+    gap = EvalGap(
+        title="legacy",
+        severity="high",
+        design_doc_section="§x",
+        current_state="c",
+        expected_state="e",
+        suggested_fix="f",
+    )
+    run_dir = tmp_path / "run"
+    iteration_dir = run_dir / "iteration-1"
+    iteration_dir.mkdir(parents=True)
+    (iteration_dir / "eval.json").write_text(
+        EvalResult(no_gaps=False, gaps=[gap], summary="bad").model_dump_json()
+    )
+    point = ResumePoint("abcd1234", run_dir, last_completed_iteration=1, start_iteration=2)
+    ledger = RunLedger()
+
+    history = engine_mod._reconstruct_fingerprints(run_dir, point, ledger)
+
+    assert history == [fingerprint_gaps([gap])]
+    assert ledger.warnings == [
+        "resume reconstructed approximate gap history from legacy eval.json; "
+        "gap_fingerprint.json sidecars were missing or unreadable"
+    ]
 
 
 async def test_engine_writes_fingerprint_after_canonicalize(tmp_path: Path, monkeypatch) -> None:

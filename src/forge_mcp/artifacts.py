@@ -241,7 +241,9 @@ def write_prior_attempts(inputs_dir: Path, text: str) -> Path | None:
     cut = encoded.rfind(b"\n", 0, _PRIOR_ATTEMPTS_MAX_BYTES)
     if cut == -1:
         cut = _PRIOR_ATTEMPTS_MAX_BYTES
-        while cut > 0 and (encoded[cut - 1] & 0xC0) == 0x80:
+        # §I: walk back while the first byte of the right half is a UTF-8
+        # continuation byte, leaving both decoded halves on character boundaries.
+        while cut > 0 and (encoded[cut] & 0xC0) == 0x80:
             cut -= 1
     head_text = encoded[:cut].decode("utf-8", errors="replace")
     tail_text = encoded[cut:].lstrip(b"\n").decode("utf-8", errors="replace")

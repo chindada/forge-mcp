@@ -9,6 +9,25 @@ from pathlib import Path
 from .resources import compute_harness_token
 
 
+def _parse_bounded_int_env(name: str, *, default: int, low: int, high: int) -> int:
+    """Parse an integer environment variable with an inclusive range (§E).
+
+    Design: environment validation must be symmetric for every bounded integer
+        knob so bad operator input fails fast instead of drifting silently.
+    Implementation: read os.environ, int() with a wrapped ValueError, then
+        apply one inclusive range check with the same user-facing message.
+    Example: _parse_bounded_int_env('FORGE_KEEP_RUNS', default=10, low=0, high=1000).
+    """
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer in [{low}, {high}], got {raw!r}") from exc
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be an integer in [{low}, {high}], got {raw!r}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class RunConfig:
     """Configuration resolved once before preparing a run.
@@ -63,20 +82,13 @@ class RunConfig:
                 parsed.append(root)
                 tokens[compute_harness_token(root)] = root
             roots = tuple(parsed)
-        raw_top_k = os.environ.get("FORGE_LINEAGE_TOP_K", "4")
-        try:
-            lineage_top_k = int(raw_top_k)
-        except ValueError as exc:
-            raise ValueError(
-                f"FORGE_LINEAGE_TOP_K must be an integer in [0, 10], got {raw_top_k!r}"
-            ) from exc
-        if not 0 <= lineage_top_k <= 10:
-            raise ValueError(f"FORGE_LINEAGE_TOP_K must be in [0, 10], got {lineage_top_k}")
+        keep_runs = _parse_bounded_int_env("FORGE_KEEP_RUNS", default=10, low=0, high=1000)
+        lineage_top_k = _parse_bounded_int_env("FORGE_LINEAGE_TOP_K", default=4, low=0, high=10)
         return cls(
             codex_bin=os.environ.get("FORGE_CODEX_BIN", "codex"),
             claude_config_dir=Path(claude_config_dir) if claude_config_dir else None,
             claude_cli_path=Path(claude_cli_path) if claude_cli_path else None,
-            keep_runs=int(os.environ.get("FORGE_KEEP_RUNS", "10")),
+            keep_runs=keep_runs,
             harness_roots=roots,
             harness_root_tokens=tokens,
             lineage_top_k=lineage_top_k,
