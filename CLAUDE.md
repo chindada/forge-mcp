@@ -82,7 +82,7 @@ new behavior. The §18 schema-pin tests continue to derive from
 Makefile touches no Pydantic schema).
 
 A seventh companion normative brief, the **prompt engineering** doc
-(`forge-mcp-prompt-engineering.md`), revises the five packaged driver
+(`docs/specs/forge-mcp-prompt-engineering.md`), revises the five packaged driver
 prompts in `src/forge_mcp/prompts/` for fidelity and prompt-engineering
 best practice in its own `§P*`, `P-Invariant N`, and `P-Decision N`
 namespaces (cite as e.g. `# §P2.2 generator budget clause`, `# §P-Inv 2
@@ -94,6 +94,26 @@ behavior. The §18 schema-pin tests continue to derive from
 `RunForgeInput.model_json_schema()` /
 `RunResult.model_json_schema()` — **no shift for this brief** (the
 prompts touch no Pydantic schema).
+
+An eighth normative brief, the **SDK realignment & drift-proofing** doc
+(`docs/specs/forge-mcp-sdk-realignment.md`), differs in kind from the
+seven above: it is a **remediation brief**, not a pure addition. It
+realigns both SDK seams (`drivers/_claude.py`, `drivers/_codex.py`) and
+preflight to the installed `@main` SDKs (`claude-agent-sdk` 0.2.85,
+`openai-codex` 0.131.0a4 — reproducibility still via the committed
+`uv.lock`), revives two design-required-but-dead forensic features (the
+Codex and Claude `stderr`→`run.log` tees), and adds an SDK-contract
+drift-detection layer (`tests/test_sdk_contract.py`, fast + in PR CI) so
+the class of defect cannot recur. It cites by fix group —
+`A#`/`B#`/`C#`/`D#` (e.g. `# A2 init-data skill probe`, `# C10
+SDK-contract pin`), **not** a `§*` namespace. Unlike the companion
+briefs it does not merely add: it **supersedes** the design-doc §276
+skill probe, swapping JSON-schema model self-report for a deterministic
+read of the init `SystemMessage.data["skills"]`. So for the skill probe
+this brief wins; the base doc still wins on everything it specifies that
+this brief does not **explicitly** supersede. The §18 schema-pin tests
+are unaffected — its own non-goal forbids any `RunForgeInput` /
+`RunResult` change.
 
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
