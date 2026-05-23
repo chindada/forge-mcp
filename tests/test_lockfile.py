@@ -37,7 +37,7 @@ def test_acquire_mints_8hex_run_id_and_writes_payload(target_dir: Path) -> None:
         payload = json.loads((target_dir / ".harness" / "run.lock").read_text())
         assert payload["pid"] == os.getpid()
         assert payload["run_id"] == lock.run_id
-        assert payload["target_dir"] == str(target_dir / ".harness")
+        assert payload["target_dir"] == str(target_dir)
     finally:
         lock.release()
 

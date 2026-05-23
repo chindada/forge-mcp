@@ -80,6 +80,7 @@ class GeneratorDriver:
             ),
             approval_mode=never_approval_mode(),
             env=env,
+            run_log_path=ctx.run_dir / "run.log",  # §13/B7 tee Codex stderr to run.log.
         )
         await status_cb(kind="stream", agent="generator", message="turn started")
         async for event in session:

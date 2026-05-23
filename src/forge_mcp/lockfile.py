@@ -98,7 +98,7 @@ class TargetLock:
             "pid": os.getpid(),
             "run_id": self._run_id,
             "started_at": datetime.now(UTC).isoformat(),
-            "target_dir": str(self._path.parent),
+            "target_dir": str(self._path.parent.parent),  # §6.5 target_dir, not .harness.
             "create_time": create_time,
         }
         self._path.write_text(json.dumps(payload, indent=2) + "\n")

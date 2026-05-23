@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -117,20 +120,45 @@ async def _codex_smoke_turn(codex_bin: str) -> None:
 
 
 def check_claude_auth() -> tuple[str, CheckStatus, str]:
-    """Verify a Claude auth source is resolvable.
+    """Verify a Claude auth source is resolvable (A4).
 
-    Design: §6.4 step 8 fails fast when neither environment nor local
-        credentials can authenticate Claude.
-    Implementation: accept API/OAuth env vars or a non-empty credentials file
-        under CLAUDE_CONFIG_DIR or ~/.claude.
+    Design: §6.4 step 8 fails fast when no auth source can authenticate Claude;
+        A4 checks env vars, .credentials.json, then Darwin Keychain.
+    Implementation: never read secrets; probe only source existence and treat
+        Keychain errors/timeouts as not found.
     Example: check_claude_auth().
     """
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         return ("claude_auth", "OK", "env-var")
-    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    cred = config_dir / "credentials.json"
+    config_dir_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(config_dir_env) if config_dir_env else (Path.home() / ".claude")
+    cred = config_dir / ".credentials.json"
     if cred.exists() and cred.stat().st_size > 0:
         return ("claude_auth", "OK", str(cred))
+    if sys.platform == "darwin":
+        suffix = ""
+        if config_dir_env:
+            digest = hashlib.sha256(os.path.abspath(config_dir_env).encode()).hexdigest()[:8]
+            suffix = "-" + digest
+        service = f"Claude Code-credentials{suffix}"
+        try:
+            proc = subprocess.run(
+                [
+                    "security",
+                    "find-generic-password",
+                    "-a",
+                    os.environ.get("USER", ""),
+                    "-s",
+                    service,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                return ("claude_auth", "OK", f"keychain:{service}")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     return ("claude_auth", "FAIL", "no ANTHROPIC_API_KEY and no credentials.json")
 
 

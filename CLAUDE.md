@@ -177,6 +177,7 @@ uv run forge doctor                # environment preflight (claude/codex CLIs, s
 uv run forge serve                 # start the stdio MCP server
 uv run pytest -m "not slow"        # fast tests (what CI runs)
 uv run pytest -m slow              # the real-CLI e2e only (needs claude + codex)
+make e2e                           # real-CLI e2e (slow; needs claude + codex + auth)
 bash scripts/ci.sh                 # full CI gate (ruff + pyright + docstrings + pytest)
 ```
 

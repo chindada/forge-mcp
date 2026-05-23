@@ -67,3 +67,128 @@ async def test_disk_space_warn_if_low_silent_when_ok(tmp_path, monkeypatch) -> N
     await disk_space_warn_if_low(tmp_path, status, MagicMock(), ledger)
     status.update.assert_not_awaited()
     assert ledger.warnings == []
+
+
+def test_check_claude_auth_accepts_env_var(monkeypatch) -> None:
+    """Pin A4 — ANTHROPIC_API_KEY or OAuth token yields OK env-var.
+
+    Design: env credentials are the first accepted source.
+    Implementation: set the env var and assert an OK status.
+    Example: pytest tests/test_doctor.py -k env_var -v.
+    """
+    from forge_mcp.doctor import check_claude_auth
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    label, status, _ = check_claude_auth()
+    assert (label, status) == ("claude_auth", "OK")
+
+
+def test_check_claude_auth_accepts_dot_credentials_file(monkeypatch, tmp_path) -> None:
+    """Pin A4 — non-empty .credentials.json under config dir is OK.
+
+    Design: A4 uses the leading-dot credentials filename.
+    Implementation: write .credentials.json into CLAUDE_CONFIG_DIR and assert OK.
+    Example: pytest tests/test_doctor.py -k dot_credentials -v.
+    """
+    from forge_mcp.doctor import check_claude_auth
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / ".credentials.json").write_text('{"token": "x"}')
+    label, status, _ = check_claude_auth()
+    assert (label, status) == ("claude_auth", "OK")
+
+
+def test_check_claude_auth_keychain_default_service(monkeypatch) -> None:
+    """Pin A4 — Darwin Keychain hit with no suffix is OK.
+
+    Design: on Darwin, security find-generic-password returncode 0 counts as auth.
+    Implementation: force sys.platform, clear env, and stub subprocess.run.
+    Example: pytest tests/test_doctor.py -k keychain_default -v.
+    """
+    import subprocess
+
+    import forge_mcp.doctor as doctor
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(doctor.sys, "platform", "darwin", raising=False)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        """Capture security command and return success.
+
+        Design: test must not invoke the real Keychain.
+        Implementation: record cmd and return CompletedProcess(0).
+        Example: fake_run(['security'], timeout=10).
+        """
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    monkeypatch.setattr(doctor.Path, "home", staticmethod(lambda: doctor.Path("/nonexistent-home")))
+    label, status, _ = doctor.check_claude_auth()
+    assert (label, status) == ("claude_auth", "OK")
+    assert "Claude Code-credentials" in " ".join(captured["cmd"])
+
+
+def test_check_claude_auth_keychain_suffix_when_config_dir_set(monkeypatch, tmp_path) -> None:
+    """Pin A4 — Keychain service gets sha256(abspath(config_dir))[:8] suffix.
+
+    Design: CLAUDE_CONFIG_DIR uses a per-config-dir Keychain service suffix.
+    Implementation: set empty config dir, stub security success, assert suffix.
+    Example: pytest tests/test_doctor.py -k keychain_suffix -v.
+    """
+    import hashlib
+    import os
+    import subprocess
+
+    import forge_mcp.doctor as doctor
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(doctor.sys, "platform", "darwin", raising=False)
+    expected = hashlib.sha256(os.path.abspath(str(tmp_path)).encode()).hexdigest()[:8]
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        """Capture security command and return success.
+
+        Design: test must not invoke the real Keychain.
+        Implementation: record cmd and return CompletedProcess(0).
+        Example: fake_run(['security'], timeout=10).
+        """
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    label, status, _ = doctor.check_claude_auth()
+    assert (label, status) == ("claude_auth", "OK")
+    assert f"Claude Code-credentials-{expected}" in " ".join(captured["cmd"])
+
+
+def test_check_claude_auth_fails_when_no_source(monkeypatch, tmp_path) -> None:
+    """Pin A4 — FAIL when env, file, and Keychain all miss.
+
+    Design: Rule 8 — no auth source means a hard FAIL status from doctor.
+    Implementation: clear env, point config dir at empty tmp, and stub security fail.
+    Example: pytest tests/test_doctor.py -k no_source -v.
+    """
+    import subprocess
+
+    import forge_mcp.doctor as doctor
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b""),
+    )
+    label, status, _ = doctor.check_claude_auth()
+    assert (label, status) == ("claude_auth", "FAIL")

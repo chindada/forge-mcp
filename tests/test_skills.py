@@ -1,93 +1,160 @@
-"""§6.4 step 7 required-skills live probe via Claude SDK seam."""
+"""A2 — skill probe reads the init SystemMessage data['skills'] list."""
 
 from __future__ import annotations
 
-import sys
-import types
+import asyncio
 from typing import Any
 
 import pytest
 
-from forge_mcp import skills
-from forge_mcp.skills import REQUIRED_SKILLS, SkillMissingError
 
+class _ProbeRunner:
+    """Minimal ClaudeRunner double exposing run_with_messages.
 
-class _Options:
-    """Fake ClaudeAgentOptions accepting arbitrary kwargs.
-
-    Design: skills tests must not require an installed Claude SDK.
-    Implementation: store kwargs for possible inspection.
-    Example: _Options(output_format={}).
+    Design: A2 opens a live session and reads init SystemMessage data['skills'];
+        the double returns a scripted init message.
+    Implementation: run_with_messages returns a ClaudeTurn-like object whose
+        messages include one init SystemMessage carrying data['skills'].
+    Example: _ProbeRunner(skills=['superpowers:writing-plans']).
     """
 
-    def __init__(self, **kwargs) -> None:
-        """Store provided option kwargs.
+    def __init__(
+        self, *, skills: list[str], has_skills_field: bool = True, delay: float = 0.0
+    ) -> None:
+        """Store the scripted probe behavior.
 
-        Design: build_options imports this fake class during tests.
-        Implementation: assign kwargs to self.kwargs.
-        Example: _Options(a=1).kwargs['a'] == 1.
+        Design: tests vary skills presence, field absence, and latency.
+        Implementation: assign constructor values to private attributes.
+        Example: _ProbeRunner(skills=[], has_skills_field=False).
         """
-        self.kwargs = kwargs
+        self._skills = skills
+        self._has = has_skills_field
+        self._delay = delay
+        self.last_session_id = None
+        self.consumed = 0
 
+    async def run_with_messages(
+        self, *, prompt: str, options: Any, system: str, stop: Any = None
+    ) -> Any:
+        """Return a ClaudeTurn-like result, honoring an optional stop predicate.
 
-class _FakeRunner:
-    """Stand-in ClaudeRunner returning canned structured response."""
-
-    def __init__(self, payload: dict) -> None:
-        """Store the payload returned by run.
-
-        Design: probe tests vary available skills without SDK calls.
-        Implementation: assign payload to an instance attribute.
-        Example: _FakeRunner({'available': []}).payload.
+        Design: A2 passes a stop predicate so the probe breaks on the init
+            message; the double models init followed by a trailing message and
+            stops pulling once stop fires.
+        Implementation: optionally sleep, then iterate a scripted stream,
+            counting consumed messages and breaking when stop(msg) is truthy.
+        Example: await runner.run_with_messages(prompt='x', options=o, system='', stop=p).
         """
-        self.payload = payload
+        from claude_agent_sdk import SystemMessage
 
-    async def run(self, *args, **kwargs):
-        """Return a StructuredResult containing the canned payload.
+        from forge_mcp.drivers._claude import ClaudeTurn, StructuredResult
 
-        Design: probe_required_skills reads result.structured.
-        Implementation: import production StructuredResult and instantiate it.
-        Example: await runner.run().structured.
+        _ = (prompt, options, system)
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        data = {"skills": list(self._skills)} if self._has else {}
+        init = SystemMessage(subtype="init", data=data)
+        trailing = SystemMessage(subtype="result", data={})
+        collected: list[Any] = []
+        for msg in (init, trailing):
+            self.consumed += 1
+            collected.append(msg)
+            if stop is not None and stop(msg):
+                break
+        return ClaudeTurn(result=StructuredResult(structured=None, text=""), messages=collected)
+
+    async def run(self, *, prompt: str, options: Any, system: str) -> Any:
+        """Delegate to run_with_messages and return its result.
+
+        Design: keeps this double compatible with the ClaudeRunner protocol.
+        Implementation: await run_with_messages and return .result.
+        Example: await runner.run(prompt='x', options=o, system='').
         """
-        from forge_mcp.drivers._claude import StructuredResult
+        return (await self.run_with_messages(prompt=prompt, options=options, system=system)).result
 
-        return StructuredResult(structured=self.payload, text="")
+    async def aclose(self) -> None:
+        """No-op close for protocol compatibility.
+
+        Design: lifecycle may close runners after probes.
+        Implementation: return None.
+        Example: await runner.aclose().
+        """
+        return None
 
 
-def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Install a fake claude_agent_sdk module into sys.modules.
+async def test_probe_passes_when_required_skills_present() -> None:
+    """Pin A2 — no raise when REQUIRED_SKILLS subset of init skills.
 
-    Design: build_options imports ClaudeAgentOptions lazily.
-    Implementation: set a SimpleNamespace-like module with _Options class.
-    Example: _install_fake_sdk(monkeypatch).
+    Design: REQUIRED_SKILLS must be a subset of data['skills'].
+    Implementation: pass a runner whose init lists the required skill.
+    Example: pytest tests/test_skills.py -k present -v.
     """
-    module: Any = types.ModuleType("claude_agent_sdk")
-    module.ClaudeAgentOptions = _Options
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.skills import REQUIRED_SKILLS, probe_required_skills
+
+    runner = _ProbeRunner(skills=list(REQUIRED_SKILLS) + ["other:thing"])
+    await probe_required_skills(runner=runner, claude_cli_path=None)
 
 
-async def test_missing_skill_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin a forge-mcp behavior.
+async def test_probe_raises_skill_missing_when_absent() -> None:
+    """Pin A2 — SkillMissingError when a required skill is absent.
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+    Design: a missing required skill must hard-fail preflight.
+    Implementation: pass a runner whose init skills omit the required id.
+    Example: pytest tests/test_skills.py -k missing -v.
     """
-    _install_fake_sdk(monkeypatch)
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.skills import SkillMissingError, probe_required_skills
+
+    runner = _ProbeRunner(skills=["unrelated:skill"])
     with pytest.raises(SkillMissingError):
-        await skills.probe_required_skills(
-            runner=_FakeRunner({"available": []}), claude_cli_path=None
-        )
+        await probe_required_skills(runner=runner, claude_cli_path=None)
 
 
-async def test_all_present_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin a forge-mcp behavior.
+async def test_probe_raises_when_init_lacks_skills_field() -> None:
+    """Pin A2 — cannot-verify hard fail when init omits 'skills'.
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+    Design: if init lacks skills the probe cannot verify and must raise.
+    Implementation: pass a runner whose init data dict omits skills.
+    Example: pytest tests/test_skills.py -k lacks_skills -v.
     """
-    _install_fake_sdk(monkeypatch)
-    await skills.probe_required_skills(
-        runner=_FakeRunner({"available": list(REQUIRED_SKILLS)}), claude_cli_path=None
-    )
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.skills import SkillMissingError, probe_required_skills
+
+    runner = _ProbeRunner(skills=[], has_skills_field=False)
+    with pytest.raises(SkillMissingError):
+        await probe_required_skills(runner=runner, claude_cli_path=None)
+
+
+async def test_probe_times_out(monkeypatch) -> None:
+    """Pin A2 — SkillProbeTimeout when the probe exceeds its budget.
+
+    Design: preflight holds the target lock, so the probe is bounded by wait_for.
+    Implementation: shrink timeout and use a slow runner.
+    Example: pytest tests/test_skills.py -k times_out -v.
+    """
+    pytest.importorskip("claude_agent_sdk")
+    import forge_mcp.skills as skills_mod
+    from forge_mcp.skills import SkillProbeTimeout, probe_required_skills
+
+    monkeypatch.setattr(skills_mod, "SKILL_PROBE_TIMEOUT_SECONDS", 0.01)
+    runner = _ProbeRunner(skills=list(skills_mod.REQUIRED_SKILLS), delay=0.5)
+    with pytest.raises(SkillProbeTimeout):
+        await probe_required_skills(runner=runner, claude_cli_path=None)
+
+
+async def test_probe_stops_after_init_message() -> None:
+    """Pin A2 — probe breaks out of the stream once the init skills are read.
+
+    Design: §A2 requires not waiting out the throwaway turn; the probe must
+        stop after the init SystemMessage carrying data['skills'].
+    Implementation: a runner that yields init then a trailing message records
+        consumption; after the probe runs only the init was consumed.
+    Example: pytest tests/test_skills.py -k stops_after_init -v.
+    """
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.skills import REQUIRED_SKILLS, probe_required_skills
+
+    runner = _ProbeRunner(skills=list(REQUIRED_SKILLS))
+    await probe_required_skills(runner=runner, claude_cli_path=None)
+    assert runner.consumed == 1  # §A2 — trailing message never consumed.

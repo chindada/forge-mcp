@@ -8,10 +8,10 @@ PYTEST_ARGS ?=
 RUFF_ARGS ?=
 RUFF_CHECK_ARGS ?=
 
-.PHONY: help setup-tools setup update fmt lint test test-slow test-all build clean ci
+.PHONY: help setup-tools setup update fmt lint test test-slow test-all e2e build clean ci
 
 help: ## Show this help (default target)
-	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z][a-zA-Z_-]*:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z][a-zA-Z0-9_-]*:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 setup-tools: ## Install uv (one-time bootstrap)
 	@if ! command -v uv >/dev/null 2>&1; then \
@@ -47,6 +47,9 @@ test-slow: ## Run slow tests (real claude + codex required)
 
 test-all: ## Run every test (fast + slow) in one pytest invocation
 	uv run pytest $(PYTEST_ARGS)
+
+e2e: ## Run the real-CLI e2e (slow; needs claude + codex + auth)
+	uv run pytest -m slow $(PYTEST_ARGS)
 
 build: ## Build wheel + sdist to dist/
 	uv build

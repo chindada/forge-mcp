@@ -64,6 +64,7 @@ class CodexRunner(Protocol):
         sandbox_policy: Any,
         approval_mode: Any,
         env: dict | None,
+        run_log_path: Path | None = None,
     ) -> CodexSession: ...
     async def interrupt(self) -> None: ...
     async def aclose(self) -> None: ...
@@ -73,31 +74,33 @@ class CodexRunner(Protocol):
 def build_app_server_config(*, codex_bin: str, cwd: Path, env: dict | None = None) -> Any:
     """Construct the Codex app-server config without MCP servers (§10.2).
 
-    Design: §15 removes MCP server attachments, so no TOML override translator
-        or auto-approval helper exists in this seam.
-    Implementation: lazily import AppServerConfig and pass executable/cwd/env.
+    Design: §15 removes MCP server attachments; A5 uses the real `codex_bin`
+        field name instead of the stale executable kwarg.
+    Implementation: lazily import AppServerConfig and pass codex_bin/cwd/env.
     Example: build_app_server_config(codex_bin='codex', cwd=Path('/repo')).
     """
     from openai_codex import AppServerConfig  # type: ignore
 
-    return AppServerConfig(executable=codex_bin, cwd=str(cwd), env=env or {})  # type: ignore[call-arg]
+    return AppServerConfig(codex_bin=codex_bin, cwd=str(cwd), env=env or {})
 
 
 def sandbox_policy_for(*, target_dir: Path, iteration_dir: Path, network_access: bool) -> Any:
     """Return a workspace-write sandbox with network toggle (§H7).
 
     Design: §H7 makes network access a convenience knob, not a security
-        boundary; writable_roots still bound filesystem writes.
-    Implementation: lazily import SandboxPolicy and pass roots plus the supplied
-        network_access flag.
+        boundary; A6 builds the real tagged-union RootModel.
+    Implementation: lazily import SandboxPolicy and model_validate the
+        workspaceWrite payload with networkAccess.
     Example: sandbox_policy_for(target_dir=t, iteration_dir=i, network_access=False).
     """
-    from openai_codex import SandboxPolicy  # type: ignore
+    from openai_codex.types import SandboxPolicy  # type: ignore
 
-    return SandboxPolicy(
-        mode="workspaceWrite",
-        writable_roots=[str(target_dir), str(iteration_dir)],
-        network_access=network_access,
+    return SandboxPolicy.model_validate(
+        {
+            "type": "workspaceWrite",
+            "writableRoots": [str(target_dir), str(iteration_dir)],
+            "networkAccess": network_access,
+        }
     )
 
 
@@ -137,67 +140,95 @@ def never_approval_mode() -> Any:
     return ApprovalMode.deny_all
 
 
-class _RunLogTeeingStderr:
-    """Tee Codex subprocess stderr into run.log (§10.2).
+def _make_teeing_deque(original: Any, run_log_path: Path) -> Any:
+    """Build a deque(maxlen=400) whose append tees to run.log (§13/B7).
 
-    Design: kept after §15 because stderr is load-bearing for debugging
-        generator crashes.
-    Implementation: best-effort monkey patch of a private SDK deque append;
-        missing attributes are ignored.
-    Example: with _RunLogTeeingStderr(session, run_log): ...
+    Design: Codex stderr is forensic; the SDK drains an internal deque(maxlen=400)
+        from a daemon thread started in __aenter__, so replace it before open.
+    Implementation: preserve buffered lines and maxlen; override append to
+        write '[codex-stderr] <line>' to run.log fail-soft.
+    Example: sync._stderr_lines = _make_teeing_deque(sync._stderr_lines, path).
+    """
+    import collections
+
+    class _TeeingDeque(collections.deque):
+        """Deque subclass that mirrors appended lines to run.log.
+
+        Design: replacing the SDK deque preserves its append contract.
+        Implementation: call super().append then append a prefixed log line.
+        Example: tee.append('stderr').
+        """
+
+        def append(self, line: Any) -> None:  # type: ignore[override]
+            """Append one item and tee it to run.log.
+
+            Design: forensic logging must be best-effort only.
+            Implementation: suppress OSError after preserving deque behavior.
+            Example: tee.append('boom').
+            """
+            super().append(line)
+            try:
+                with run_log_path.open("a") as handle:
+                    handle.write(f"[codex-stderr] {line}\n")
+            except OSError:
+                pass
+
+    teeing = _TeeingDeque(maxlen=getattr(original, "maxlen", 400))
+    teeing.extend(original)
+    return teeing
+
+
+class _CodexStreamSession:
+    """Adapt an AsyncTurnHandle stream into forge's CodexEvent iterator (A6).
+
+    Design: §10.2 generator consumes event.kind/payload; A6 maps ev.method to
+        CodexEvent.kind and closes AsyncCodex when streaming ends.
+    Implementation: normalize dict/model_dump payloads and delegate closing to
+        the runner's idempotent close helper.
+    Example: async for event in _CodexStreamSession(...): ...
     """
 
-    def __init__(self, session: Any, run_log_path: Path) -> None:
-        """Bind a session and log path for later patching.
+    def __init__(self, *, codex: Any, handle: Any, runner: CodexRunnerImpl) -> None:
+        """Bind the open codex, turn handle, and owning runner.
 
-        Design: per-session scope avoids global monkey patches.
-        Implementation: store original append only after __enter__ succeeds.
-        Example: _RunLogTeeingStderr(session, Path('run.log')).
+        Design: the session owns success-path cleanup of the codex it streams.
+        Implementation: store references for iteration and close.
+        Example: _CodexStreamSession(codex=c, handle=h, runner=r).
         """
-        self._session = session
-        self._path = run_log_path
-        self._original: Any = None
+        self._codex = codex
+        self._handle = handle
+        self._runner = runner
 
-    def __enter__(self) -> _RunLogTeeingStderr:
-        """Install the stderr tee when the SDK exposes the expected deque.
+    async def __aiter__(self) -> AsyncIterator[CodexEvent]:
+        """Yield normalized CodexEvents, closing the codex on exhaustion.
 
-        Design: private SDK structure may change, so this helper degrades
-            silently rather than failing a run.
-        Implementation: replace deque.append with a wrapper writing run.log.
-        Example: with tee: await run().
+        Design: A6 maps method to kind; A6-lifecycle closes on stream end.
+        Implementation: model_dump pydantic payloads, pass dicts, otherwise {}.
+        Example: async for ev in session: ...
         """
         try:
-            deque = self._session._stderr_deque
-            self._original = deque.append
+            async for ev in self._handle.stream():
+                payload = getattr(ev, "payload", None)
+                model_dump = getattr(payload, "model_dump", None)
+                if callable(model_dump):
+                    dumped = model_dump()
+                    payload_dict = dumped if isinstance(dumped, dict) else {}
+                elif isinstance(payload, dict):
+                    payload_dict = payload
+                else:
+                    payload_dict = {}
+                yield CodexEvent(kind=getattr(ev, "method", ""), payload=payload_dict)
+        finally:
+            await self._runner._close_codex(self._codex)
 
-            def _tee(line: str) -> None:
-                """Append one stderr line to both sinks.
+    async def close(self) -> None:
+        """Idempotently close the underlying codex (§8.5 path symmetry).
 
-                Design: preserve SDK behavior while adding forensic logging.
-                Implementation: call original append then write a prefixed line.
-                Example: _tee('stderr text').
-                """
-                self._original(line)
-                with self._path.open("a") as handle:
-                    handle.write(f"[codex-stderr] {line}\n")
-
-            deque.append = _tee  # type: ignore[method-assign]
-        except AttributeError:
-            pass
-        return self
-
-    def __exit__(self, *exc_info: Any) -> None:
-        """Restore the original append hook on exit.
-
-        Design: local patching must not leak across Codex sessions.
-        Implementation: if an original was captured, assign it back best-effort.
-        Example: tee.__exit__(None, None, None).
+        Design: lifecycle close paths must be idempotent.
+        Implementation: delegate to the runner's one-shot _close_codex.
+        Example: await session.close().
         """
-        if self._original is not None:
-            try:
-                self._session._stderr_deque.append = self._original  # type: ignore[attr-defined]
-            except AttributeError:
-                pass
+        await self._runner._close_codex(self._codex)
 
 
 class CodexRunnerImpl:
@@ -213,11 +244,13 @@ class CodexRunnerImpl:
         """Construct an empty runner.
 
         Design: no SDK session exists until a generator turn starts.
-        Implementation: store active session for aclose/terminate.
+        Implementation: store active session/codex for aclose/terminate.
         Example: runner = CodexRunnerImpl().
         """
         self._session: Any | None = None
         self._thread: Any | None = None
+        self._codex: Any | None = None
+        self._closed = False
 
     @property
     def last_thread_id(self) -> str | None:
@@ -240,43 +273,81 @@ class CodexRunnerImpl:
         sandbox_policy: Any,
         approval_mode: Any,
         env: dict | None,
+        run_log_path: Path | None = None,
     ) -> CodexSession:
         """Spawn one Codex turn under the supplied policy.
 
-        Design: §10.2 generator runs one Codex turn per iteration.
-        Implementation: create AsyncCodex, create a thread, start a run, and
-            return the streaming session.
+        Design: §10.2 generator runs one Codex turn per iteration; A6 uses the
+            real surface AsyncCodex(config=...), thread_start(), thread.turn().
+        Implementation: open AsyncCodex, start a thread and turn, then return a
+            stream wrapper that closes the codex on exhaustion.
         Example: session = await runner.turn(instructions='go', ...).
         """
-        from openai_codex import AsyncCodex  # type: ignore
+        from openai_codex import AsyncCodex, TextInput  # type: ignore
 
-        codex = AsyncCodex(
-            app_server_config=server_config,  # type: ignore[call-arg]
-            sandbox_policy=sandbox_policy,  # type: ignore[call-arg]
-            approval_mode=approval_mode,  # type: ignore[call-arg]
-            env=env,  # type: ignore[call-arg]
-        )
-        self._thread = await codex.threads.create()  # type: ignore[attr-defined]
-        thread = self._thread
-        assert thread is not None
-        self._session = await thread.runs.create(developer_instructions=instructions)
-        return cast(CodexSession, self._session)
+        _ = env
+        self._closed = False
+        codex = AsyncCodex(config=server_config)
+        self._install_stderr_tee(codex, run_log_path)
+        await codex.__aenter__()
+        try:
+            self._thread = await codex.thread_start()
+            handle = await self._thread.turn(
+                TextInput(text=instructions),
+                cwd=getattr(server_config, "cwd", None),
+                sandbox_policy=sandbox_policy,
+                approval_mode=approval_mode,
+            )
+        except BaseException:
+            await self._close_codex(codex)
+            raise
+        session = _CodexStreamSession(codex=codex, handle=handle, runner=self)
+        self._session = session
+        self._codex = codex
+        return cast(CodexSession, session)
+
+    async def _close_codex(self, codex: Any) -> None:
+        """Idempotently close the AsyncCodex (A6-lifecycle).
+
+        Design: all close paths share a one-shot guard so double-close is a no-op.
+        Implementation: guard with self._closed and suppress close errors.
+        Example: await runner._close_codex(codex).
+        """
+        if self._closed or codex is None:
+            return
+        self._closed = True
+        try:
+            await codex.close()
+        except Exception:
+            pass
+
+    def _install_stderr_tee(self, codex: Any, run_log_path: Path | None) -> None:
+        """Replace codex._client._sync._stderr_lines with a teeing deque (B7).
+
+        Design: §13 installs before __aenter__ so the drain thread appends to
+            the teeing deque; shifted private SDK layout is non-fatal.
+        Implementation: guard private attributes with AttributeError and swap
+            in _make_teeing_deque on success.
+        Example: self._install_stderr_tee(codex, Path('run.log')).
+        """
+        if run_log_path is None:
+            return
+        try:
+            sync = codex._client._sync
+            sync._stderr_lines = _make_teeing_deque(sync._stderr_lines, run_log_path)
+        except AttributeError:
+            pass
 
     async def aclose(self) -> None:
         """Grace-close the active session (§8.5).
 
         Design: lifecycle closes SDK resources before releasing locks on
-            cancellation/failure paths.
-        Implementation: call session.close if present and suppress cleanup
-            errors so terminal handling can continue.
+            cancellation/failure paths and is idempotent with stream cleanup.
+        Implementation: delegate to the one-shot _close_codex and clear refs.
         Example: await runner.aclose().
         """
-        if self._session is not None:
-            try:
-                await self._session.close()
-            except Exception:
-                pass
-            self._session = None
+        await self._close_codex(self._codex)
+        self._session = None
 
     async def interrupt(self) -> None:
         """Best-effort SDK-native interrupt of the active Codex run (§H10).
@@ -309,3 +380,4 @@ class CodexRunnerImpl:
         Example: runner.terminate().
         """
         self._session = None
+        self._codex = None

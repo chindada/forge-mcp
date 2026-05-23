@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
@@ -64,7 +65,9 @@ class ClaudeRunner(Protocol):
     last_session_id: str | None
 
     async def run(self, *, prompt: str, options: Any, system: str) -> StructuredResult: ...
-    async def run_with_messages(self, *, prompt: str, options: Any, system: str) -> ClaudeTurn: ...
+    async def run_with_messages(
+        self, *, prompt: str, options: Any, system: str, stop: Callable[[Any], bool] | None = None
+    ) -> ClaudeTurn: ...
     async def interrupt(self) -> None: ...
     async def aclose(self) -> None: ...
     def terminate(self) -> None: ...
@@ -87,7 +90,8 @@ def build_options(
     Design: a single chokepoint prevents option drift and threads the §6.5
         Claude CLI runtime hatch into actual SDK calls.
     Implementation: import the SDK lazily and populate only non-None options;
-        `run_log_path` is accepted for call-site symmetry; hooks thread §H10.
+        envelope bare output schemas, wire run_log_path to stderr, and thread
+        hooks for §H10.
     Example: build_options(setting_sources=CLAUDE_SETTING_SOURCES).
     """
     from claude_agent_sdk import ClaudeAgentOptions  # type: ignore
@@ -99,7 +103,11 @@ def build_options(
     if setting_sources is not None:
         kwargs["setting_sources"] = setting_sources
     if output_format is not None:
-        kwargs["output_format"] = output_format
+        # §10.1/A3 — the subprocess transport emits --json-schema only for the envelope.
+        if output_format.get("type") == "json_schema":
+            kwargs["output_format"] = output_format
+        else:
+            kwargs["output_format"] = {"type": "json_schema", "schema": output_format}
     if add_dirs:
         kwargs["add_dirs"] = [str(path) for path in add_dirs]
     if disallowed_tools:
@@ -112,6 +120,22 @@ def build_options(
         kwargs["cli_path"] = str(cli_path)
     if hooks is not None:
         kwargs["hooks"] = hooks
+    if run_log_path is not None:
+        # §13/B8 — tee Claude subprocess stderr into private run.log.
+        def _tee_claude_stderr(line: str) -> None:
+            """Append one Claude stderr line to run.log fail-soft.
+
+            Design: §13 forensic stderr capture must never fail a run.
+            Implementation: open run.log in append mode and write a prefixed line.
+            Example: _tee_claude_stderr('error text').
+            """
+            try:
+                with run_log_path.open("a") as handle:
+                    handle.write(f"[claude-stderr] {line}\n")
+            except OSError:
+                pass
+
+        kwargs["stderr"] = _tee_claude_stderr
     return ClaudeAgentOptions(**kwargs)
 
 
@@ -204,22 +228,22 @@ def truncate_for_warning(text: str, max_len: int = 1000) -> str:
 def drain_text(messages: list[Any]) -> StructuredResult:
     """Join the canonical assistant answer, structured channel preferred.
 
-    Design: §10.1 output_format may emit only StructuredOutput tool_use blocks,
-        so drivers must not rely on plain text alone.
-    Implementation: scan content blocks, keep the last StructuredOutput dict,
-        and concatenate text block contents as fallback.
+    Design: §10.1/A3 structured output lands on ResultMessage.structured_output,
+        not a StructuredOutput tool-use block; TextBlock exposes .text only.
+    Implementation: keep the last structured_output dict and concatenate any
+        content block whose .text is a string.
     Example: drain_text(messages).structured returns a dict or None.
     """
     structured: dict | None = None
     text_parts: list[str] = []
     for msg in messages:
+        so = getattr(msg, "structured_output", None)
+        if isinstance(so, dict):
+            structured = so
         for block in getattr(msg, "content", None) or []:
-            if getattr(block, "name", None) == "StructuredOutput":
-                inp = getattr(block, "input", None)
-                if isinstance(inp, dict):
-                    structured = inp
-            elif getattr(block, "type", None) == "text":
-                text_parts.append(getattr(block, "text", ""))
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                text_parts.append(text)
     return StructuredResult(structured=structured, text="".join(text_parts))
 
 
@@ -267,8 +291,8 @@ class ClaudeRunnerImpl:
 
     Design: §5.2 confines direct SDK usage to this seam and creates a fresh
         session per call.
-    Implementation: lazily import ClaudeSDKClient, collect all messages, and
-        return drained structured/text content.
+    Implementation: lazily import ClaudeSDKClient, consume receive_response,
+        collect all messages, and return drained structured/text content.
     Example: await ClaudeRunnerImpl().run(prompt='hi', options=o, system='').
     """
 
@@ -306,9 +330,13 @@ class ClaudeRunnerImpl:
             subtype = msg.get("subtype") if isinstance(msg, dict) else getattr(msg, "subtype", None)
             if subtype != "init":
                 return
-            sid = (
-                msg.get("session_id") if isinstance(msg, dict) else getattr(msg, "session_id", None)
-            )
+            if isinstance(msg, dict):
+                sid = msg.get("session_id")
+            else:
+                data = getattr(msg, "data", None)
+                sid = data.get("session_id") if isinstance(data, dict) else None
+                if sid is None:
+                    sid = getattr(msg, "session_id", None)
             if isinstance(sid, str) and sid:
                 self.last_session_id = sid
         except Exception:
@@ -324,13 +352,19 @@ class ClaudeRunnerImpl:
         """
         return (await self.run_with_messages(prompt=prompt, options=options, system=system)).result
 
-    async def run_with_messages(self, *, prompt: str, options: Any, system: str) -> ClaudeTurn:
+    async def run_with_messages(
+        self, *, prompt: str, options: Any, system: str, stop: Callable[[Any], bool] | None = None
+    ) -> ClaudeTurn:
         """Run one Claude turn and retain raw messages for recovery.
 
         Design: planner/remediation recovery needs Write tool_use blocks while
-            preserving fresh-session semantics.
+            preserving fresh-session semantics; A1 consumes one turn via
+            receive_response() so the stream terminates on ResultMessage. §A2
+            lets the skill probe pass a stop predicate to break out the moment
+            the init message is read — the async-with teardown aborts the
+            throwaway turn (no manual interrupt).
         Implementation: use ClaudeSDKClient as an async context manager, query,
-            collect receive_messages, then drain them.
+            collect receive_response, and break early when stop(msg) is truthy.
         Example: turn = await runner.run_with_messages(prompt='x', options=o, system='s').
         """
         from claude_agent_sdk import ClaudeSDKClient  # type: ignore
@@ -340,9 +374,11 @@ class ClaudeRunnerImpl:
         async with ClaudeSDKClient(options=options) as client:
             self._client = client
             await client.query(prompt=prompt)  # type: ignore[call-arg]
-            async for msg in client.receive_messages():
+            async for msg in client.receive_response():
                 self._absorb_system_message(msg)
                 messages.append(msg)
+                if stop is not None and stop(msg):
+                    break  # §A2 — exiting the context manager aborts the turn.
         self._client = None
         return ClaudeTurn(result=drain_text(messages), messages=messages)
 
