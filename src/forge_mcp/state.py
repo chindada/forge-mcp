@@ -10,6 +10,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .ids import RUN_ID_PATTERN
+
 StateLiteral = Literal[
     "init",
     "canonicalizing",
@@ -46,7 +48,7 @@ class RunState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     state: StateLiteral
-    run_id: str = Field(min_length=8, max_length=8, pattern=r"^[0-9a-f]{8}$")
+    run_id: str = Field(min_length=8, max_length=8, pattern=RUN_ID_PATTERN)
     target_dir: str
     iteration: int = Field(ge=0)
     started_at: datetime

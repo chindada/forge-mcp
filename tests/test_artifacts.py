@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 from forge_mcp.artifacts import (
     atomic_write_json,
@@ -64,6 +65,23 @@ def test_escape_md_inline_order():
     Example: pytest runs this test in the non-slow suite.
     """
     assert escape_md_inline(r"a|b\c") == r"a\|b\\c"
+
+
+def test_escape_md_inline_collapses_newlines_to_br() -> None:
+    """§10.4 / finding 3 — newlines become <br> after pipe/backslash escaping.
+
+    Design: multi-line gap prose must not break markdown table rows; a single
+        shared escaper fixes all three tables.
+    Implementation: feed CRLF/CR/LF and assert each becomes <br>, that pipes and
+        backslashes are still escaped, and that no raw newline remains.
+    Example: escape_md_inline('a\nb') returns 'a<br>b'.
+    """
+    assert escape_md_inline("a\nb") == "a<br>b"
+    assert escape_md_inline("a\r\nb") == "a<br>b"
+    assert escape_md_inline("a\rb") == "a<br>b"
+    assert escape_md_inline("a|b\\c\nd") == "a\\|b\\\\c<br>d"
+    assert "\n" not in escape_md_inline("x\ny\nz")
+    assert escape_md_inline("a|b\\c") == "a\\|b\\\\c"
 
 
 def test_escape_md_heading_guard():
@@ -144,6 +162,35 @@ def test_prune_keeps_newest_n_and_current(harness_dir) -> None:
     assert "dddddddd" in remaining and "cccccccc" in remaining
     assert "aaaaaaaa" in remaining
     assert "bbbbbbbb" not in remaining
+
+
+def test_prune_old_runs_keeps_non_run_id_dirs(tmp_path: Path) -> None:
+    """§H9 / finding 7 — prune only acts on real run-id dirs.
+
+    Design: prune previously used len(name)==8 and could delete any 8-char dir;
+        the matcher must be ^[0-9a-f]{8}$ so siblings survive.
+    Implementation: create one real run-id dir plus 8-char non-hex / uppercase
+        siblings and assert only the real run is eligible for pruning.
+    Example: pytest asserts the 8-char 'BACKUP01' dir survives.
+    """
+    from forge_mcp.artifacts import prune_old_runs
+
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    real = harness / "abcd1234"
+    real.mkdir()
+    upper = harness / "ABCDEF12"
+    upper.mkdir()
+    nonhex = harness / "backup_x"
+    nonhex.mkdir()
+    sibling = harness / "0000abcd"
+    sibling.mkdir()
+
+    prune_old_runs(harness, keep_last=1)
+
+    assert upper.exists()
+    assert nonhex.exists()
+    assert real.exists() or sibling.exists()
 
 
 def test_write_sessions_json_creates_ordered_private_file(tmp_path):

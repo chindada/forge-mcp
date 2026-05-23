@@ -12,6 +12,59 @@ from mcp.shared.exceptions import McpError
 from forge_mcp.config import RunConfig
 from forge_mcp.models import RunForgeInput
 from forge_mcp.preflight import _canonicalize_target_dir, prepare_run
+from forge_mcp.skills import SkillMissingError, SkillProbeTimeout
+
+
+@pytest.fixture
+def preflight_happy_inputs(target_dir: Path, monkeypatch):
+    """Return inputs/config with all unrelated preflight checks stubbed OK.
+
+    Design: finding 4 tests must isolate exception translation around the skill
+        probe path rather than exercising real CLIs or auth.
+    Implementation: monkeypatch doctor checks and TargetLock to no-op doubles.
+    Example: inputs, config = preflight_happy_inputs.
+    """
+    from forge_mcp import preflight as preflight_mod
+
+    class _Lock:
+        """No-op lock double exposing a stable run id.
+
+        Design: prepare_run transfers lock ownership but tests only need shape.
+        Implementation: acquire/release are no-ops and run_id is fixed.
+        Example: lock = _Lock(path); lock.acquire().
+        """
+
+        run_id = "abcd1234"
+
+        def __init__(self, _path) -> None:
+            """Accept the production constructor argument.
+
+            Design: TargetLock is constructed from the harness run.lock path.
+            Implementation: ignore the path in this test double.
+            Example: _Lock(Path('run.lock')).
+            """
+
+        def acquire(self, adopt_run_id=None) -> None:
+            """No-op acquire matching TargetLock.
+
+            Design: the test focuses on probe errors after acquisition.
+            Implementation: intentionally do nothing.
+            Example: lock.acquire(adopt_run_id=None).
+            """
+
+        def release(self) -> None:
+            """No-op release matching TargetLock.
+
+            Design: prepare_run releases on post-lock failures.
+            Implementation: intentionally do nothing.
+            Example: lock.release().
+            """
+
+    monkeypatch.setattr(preflight_mod, "TargetLock", _Lock)
+    monkeypatch.setattr(preflight_mod, "check_claude_cli", lambda _config: ("claude", "OK", "x"))
+    monkeypatch.setattr(preflight_mod, "check_codex", AsyncMock(return_value=("codex", "OK", "x")))
+    monkeypatch.setattr(preflight_mod, "check_claude_auth", lambda: ("auth", "OK", "x"))
+    return RunForgeInput(target_dir=str(target_dir), design_doc_content="x"), RunConfig()
 
 
 async def test_target_dir_missing_raises_invalid_params(tmp_path: Path) -> None:
@@ -80,6 +133,88 @@ async def test_prepare_run_does_not_write_canonical_design(target_dir: Path, mon
         assert not (prepared.harness_dir / prepared.run_id / "inputs" / "design.md").exists()
     finally:
         prepared.lock.release()
+
+
+async def test_prepare_run_tags_missing_skill(monkeypatch, preflight_happy_inputs) -> None:
+    """§W2 / finding 4 — a missing skill surfaces a tagged McpError.
+
+    Design: prepare_run must translate domain skill errors to a tagged
+        infra_failure McpError so nothing crosses the wire untagged.
+    Implementation: force probe_required_skills to raise SkillMissingError and
+        assert prepare_run raises McpError whose message carries the kind tag.
+    Example: pytest asserts '[FORGE_ERR_' appears in the message.
+    """
+    from forge_mcp import preflight as preflight_mod
+
+    inputs, config = preflight_happy_inputs
+
+    async def boom(**kwargs) -> None:
+        """Raise the missing-skill domain exception.
+
+        Design: the test controls the exact post-lock failure.
+        Implementation: ignore kwargs and raise SkillMissingError.
+        Example: await boom() raises SkillMissingError.
+        """
+        raise SkillMissingError(["superpowers:writing-plans"])
+
+    monkeypatch.setattr(preflight_mod, "probe_required_skills", boom)
+    with pytest.raises(McpError) as ei:
+        await prepare_run(inputs, config)
+    assert "[FORGE_ERR_" in ei.value.error.message
+
+
+async def test_prepare_run_tags_skill_probe_timeout(monkeypatch, preflight_happy_inputs) -> None:
+    """§W2 / finding 4 — a skill-probe timeout surfaces a tagged McpError.
+
+    Design: SkillProbeTimeout is a known domain error and must be tagged.
+    Implementation: force probe_required_skills to raise SkillProbeTimeout and
+        assert the tagged McpError.
+    Example: pytest asserts McpError is raised with a kind tag.
+    """
+    from forge_mcp import preflight as preflight_mod
+
+    inputs, config = preflight_happy_inputs
+
+    async def boom(**kwargs) -> None:
+        """Raise the timeout domain exception.
+
+        Design: the test controls the exact post-lock failure.
+        Implementation: ignore kwargs and raise SkillProbeTimeout.
+        Example: await boom() raises SkillProbeTimeout.
+        """
+        raise SkillProbeTimeout()
+
+    monkeypatch.setattr(preflight_mod, "probe_required_skills", boom)
+    with pytest.raises(McpError) as ei:
+        await prepare_run(inputs, config)
+    assert "[FORGE_ERR_" in ei.value.error.message
+
+
+async def test_prepare_run_catch_all_tags_unexpected(monkeypatch, preflight_happy_inputs) -> None:
+    """§W2 / finding 4 — an unexpected exception is tagged by the catch-all.
+
+    Design: defense in depth — any non-McpError from a preflight step becomes a
+        tagged infra_failure rather than crossing the boundary raw.
+    Implementation: force a step to raise a raw OSError and assert McpError.
+    Example: pytest asserts the catch-all converts OSError to McpError.
+    """
+    from forge_mcp import preflight as preflight_mod
+
+    inputs, config = preflight_happy_inputs
+
+    async def boom(**kwargs) -> None:
+        """Raise an unexpected raw exception from a post-lock step.
+
+        Design: the catch-all should translate this non-domain exception.
+        Implementation: ignore kwargs and raise OSError.
+        Example: await boom() raises OSError.
+        """
+        raise OSError("unreadable design doc")
+
+    monkeypatch.setattr(preflight_mod, "probe_required_skills", boom)
+    with pytest.raises(McpError) as ei:
+        await prepare_run(inputs, config)
+    assert "[FORGE_ERR_" in ei.value.error.message
 
 
 async def test_resume_without_candidate_raises_server_error(target_dir: Path, monkeypatch) -> None:

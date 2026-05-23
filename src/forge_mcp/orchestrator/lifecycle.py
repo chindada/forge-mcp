@@ -97,6 +97,46 @@ async def emit_terminal_status(status: Any, terminal_status: str) -> None:
     )
 
 
+async def _finalize_terminal(
+    sm: RunStateMachine,
+    ledger: RunLedger,
+    deps: Any,
+    *,
+    status: str,
+    reason: str | None = None,
+) -> None:
+    """Run the one shared terminal-finalization tail for result-producing paths.
+
+    Design: finding 1 — the inline engine path, handle_timeout, and
+        handle_failure previously each re-implemented this tail, which let
+        apply_caps_and_overflow run twice on the timeout path. One helper,
+        called once per path, makes double-application structurally impossible.
+        handle_cancellation (§8.5) is NOT a caller — it produces no RunResult.
+    Implementation: transition to the terminal state, emit state, write the
+        design-flaws sidecar (OSError-guarded), apply result caps + overflow
+        emits, then emit exactly one terminal status event.
+    Example: await _finalize_terminal(sm, ledger, deps, status='incomplete').
+    """
+    sm.transition(status, reason=reason)  # type: ignore[arg-type]
+    await _emit_if_present(deps, "emit_state")
+    design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
+    try:
+        write_design_flaws(deps.run_dir, design_flaws_full)
+        await _emit_if_present(deps, "emit_path", "design_flaws.json")
+    except OSError as exc:
+        ledger.warnings.append(
+            "design_flaws.json write failed (lineage feed-forward disabled): "
+            f"{type(exc).__name__}: {exc}"
+        )
+        deps.logger.warning("design_flaws.json write failed", exc_info=True)
+    apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
+    if ledger.unresolved_overflow_path:
+        await _emit_if_present(deps, "emit_path", "unresolved-gaps-overflow.md")
+    if ledger.design_flaw_overflow_path:
+        await _emit_if_present(deps, "emit_path", "design-flaw-gaps-overflow.md")
+    await emit_terminal_status(deps.status, status)
+
+
 async def _emit_if_present(deps: Any, method: str, *args: Any) -> None:
     """Best-effort artifact emission for lifecycle handlers (§S5.4).
 
@@ -144,9 +184,10 @@ async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> N
 
     Design: §6.3/§8.5 separate runtime cap from client disconnect; timeout
         goes finalizing → incomplete after closing in-flight SDK sessions so
-        they cannot outlive the cap.
+        they cannot outlive the cap. Finding 1: the terminal tail is shared.
     Implementation: transition finalizing, close drivers, collect latest
-        unresolved gaps, set decided_at, transition incomplete, apply caps.
+        unresolved gaps, set decided_at, then run the shared terminal tail to
+        incomplete (caps applied exactly once).
     Example: await handle_timeout(sm, ledger, deps).
     """
     sm.transition("finalizing")
@@ -154,25 +195,7 @@ async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> N
     await close_drivers(deps)
     ledger.unresolved_gaps = collect_unresolved_gaps(deps.run_dir)
     ledger.decided_at = datetime.now(UTC)
-    sm.transition("incomplete")
-    await _emit_if_present(deps, "emit_state")
-
-    design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
-    try:
-        write_design_flaws(deps.run_dir, design_flaws_full)
-        await _emit_if_present(deps, "emit_path", "design_flaws.json")
-    except OSError as exc:
-        ledger.warnings.append(
-            "design_flaws.json write failed (lineage feed-forward disabled): "
-            f"{type(exc).__name__}: {exc}"
-        )
-        deps.logger.warning("design_flaws.json write failed", exc_info=True)
-    apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
-    if ledger.unresolved_overflow_path:
-        await _emit_if_present(deps, "emit_path", "unresolved-gaps-overflow.md")
-    if ledger.design_flaw_overflow_path:
-        await _emit_if_present(deps, "emit_path", "design-flaw-gaps-overflow.md")
-    await emit_terminal_status(deps.status, "incomplete")
+    await _finalize_terminal(sm, ledger, deps, status="incomplete")
 
 
 async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc: Exception) -> None:
@@ -181,10 +204,12 @@ async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc:
     Design: §6.3/§8.5 — failure returns a RunResult; traceback must be
         truncated to ≤4096 before RunResult construction, and unresolved_gaps
         are best-effort collected from disk so a crash still surfaces known
-        gaps.
+        gaps. Finding 1: the terminal tail is shared; failures jump straight to
+        failed with no finalizing transition.
     Implementation: close drivers, record metadata, truncate traceback,
         best-effort collect unresolved gaps while preserving the original
-        exception, transition failed, apply caps.
+        exception, set decided_at, then run the shared terminal tail to failed
+        with reason=str(exc).
     Example: await handle_failure(sm, ledger, deps, RuntimeError('boom')).
     """
     await close_drivers(deps)
@@ -198,25 +223,7 @@ async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc:
         # §8.5: malformed eval.json must not mask the original exception.
         ledger.unresolved_gaps = []
     ledger.decided_at = datetime.now(UTC)
-    sm.transition("failed", reason=str(exc))
-    await _emit_if_present(deps, "emit_state")
-
-    design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
-    try:
-        write_design_flaws(deps.run_dir, design_flaws_full)
-        await _emit_if_present(deps, "emit_path", "design_flaws.json")
-    except OSError as exc:
-        ledger.warnings.append(
-            "design_flaws.json write failed (lineage feed-forward disabled): "
-            f"{type(exc).__name__}: {exc}"
-        )
-        deps.logger.warning("design_flaws.json write failed", exc_info=True)
-    apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
-    if ledger.unresolved_overflow_path:
-        await _emit_if_present(deps, "emit_path", "unresolved-gaps-overflow.md")
-    if ledger.design_flaw_overflow_path:
-        await _emit_if_present(deps, "emit_path", "design-flaw-gaps-overflow.md")
-    await emit_terminal_status(deps.status, "failed")
+    await _finalize_terminal(sm, ledger, deps, status="failed", reason=str(exc))
 
 
 def collect_unresolved_gaps(run_dir: Path) -> list[EvalGap]:

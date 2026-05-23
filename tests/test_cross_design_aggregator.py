@@ -58,6 +58,40 @@ def test_aggregator_requires_three_recent_distinct_fingerprints(tmp_path: Path) 
     assert patterns[0].distinct_fingerprints == 3
 
 
+def test_find_cross_design_patterns_skips_non_run_id_dir(tmp_path: Path) -> None:
+    """§X1 / finding 7 — aggregator ignores state.json outside run-id dirs.
+
+    Design: the */state.json glob must shape-check parent.name so scratch dirs
+        cannot contribute statistical priors.
+    Implementation: write two valid run ids plus one non-run-id state.json that
+        would otherwise hit the frequency floor, and assert no pattern surfaces.
+    Example: pytest asserts a 'scratchpd' dir is skipped.
+    """
+    now = datetime.now(UTC)
+    _run(tmp_path, "00000001", "fp1", "missing_validation", now)
+    _run(tmp_path, "00000002", "fp2", "missing_validation", now)
+    bad = tmp_path / "scratchpd"
+    (bad / "inputs").mkdir(parents=True)
+    write_state(
+        bad / "state.json",
+        RunState(
+            state="completed",
+            run_id="00000003",
+            target_dir="/r",
+            iteration=1,
+            started_at=now,
+            last_updated_at=now,
+        ),
+    )
+    (bad / "inputs" / "design.fingerprint").write_text("fp3\n", encoding="utf-8")
+    (bad / "design_flaws.json").write_text(
+        '{"gaps":[{"fault_kind":"missing_validation","explanation":"example"}]}\n',
+        encoding="utf-8",
+    )
+
+    assert cross_design.find_cross_design_patterns(tmp_path) == []
+
+
 def test_aggregator_empty_harness_yields_empty_digest(tmp_path: Path) -> None:
     """§X2: an empty harness yields no patterns and a header-only digest file.
 

@@ -9,17 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 from ..artifacts import escape_md, escape_md_inline
+from ..ids import is_run_id
 from ..models import DesignFlawGap, EvalGap, EvalResult
 from ..state import read_state
 
-_RUN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _TERMINAL_STATES = frozenset({"completed", "incomplete", "failed"})
 _GAP_TITLE_MAX = 200
 _PROSE_MAX = 500
@@ -126,7 +125,7 @@ def find_lineage_runs(
         return []
     candidates: list[LineageCandidate] = []
     for path in entries:
-        if not _RUN_ID_RE.match(path.name):
+        if not is_run_id(path.name):
             continue
         try:
             if path.is_symlink() or not path.is_dir():

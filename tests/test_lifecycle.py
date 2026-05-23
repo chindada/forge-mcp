@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import forge_mcp.orchestrator.lifecycle as lifecycle_mod
 from forge_mcp.lockfile import TargetLock
 from forge_mcp.orchestrator.ledger import RunLedger
 from forge_mcp.orchestrator.lifecycle import (
@@ -456,3 +457,63 @@ def test_poll_task_cancellation_raises_cancelled_error() -> None:
     poll_task_cancellation(None)
     with pytest.raises(asyncio.CancelledError):
         poll_task_cancellation(_Task())
+
+
+async def test_handle_timeout_applies_caps_exactly_once(monkeypatch, tmp_path: Path) -> None:
+    """§8.1/§8.3 — timeout finalization applies result caps exactly once.
+
+    Design: finding 1 — the timeout path must not double-apply caps now that
+        the terminal tail is shared.
+    Implementation: count apply_caps_and_overflow invocations across the
+        handler call.
+    Example: pytest asserts the counter equals 1 after handle_timeout.
+    """
+    sm = _sm(tmp_path)
+    ledger = RunLedger()
+    deps = _deps(tmp_path)
+    calls = {"n": 0}
+    real = lifecycle_mod.apply_caps_and_overflow
+
+    def counting(*args, **kwargs):
+        """Count calls before delegating to the real caps helper.
+
+        Design: the test observes call cardinality without changing behavior.
+        Implementation: increment a mutable counter and forward all arguments.
+        Example: counting(ledger, tmp_path, logger) returns real result.
+        """
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle_mod, "apply_caps_and_overflow", counting)
+    await lifecycle_mod.handle_timeout(sm, ledger, deps)
+    assert calls["n"] == 1
+    assert sm.current.state == "incomplete"
+
+
+async def test_handle_failure_applies_caps_exactly_once(monkeypatch, tmp_path: Path) -> None:
+    """§6.3/§8.5 — failure finalization applies result caps exactly once.
+
+    Design: finding 1 — the failure path shares the terminal tail and must
+        call caps once.
+    Implementation: count apply_caps_and_overflow invocations.
+    Example: pytest asserts the counter equals 1 after handle_failure.
+    """
+    sm = _sm(tmp_path)
+    ledger = RunLedger()
+    calls = {"n": 0}
+    real = lifecycle_mod.apply_caps_and_overflow
+
+    def counting(*args, **kwargs):
+        """Count calls before delegating to the real caps helper.
+
+        Design: the test observes call cardinality without changing behavior.
+        Implementation: increment a mutable counter and forward all arguments.
+        Example: counting(ledger, tmp_path, logger) returns real result.
+        """
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle_mod, "apply_caps_and_overflow", counting)
+    await lifecycle_mod.handle_failure(sm, ledger, _deps(tmp_path), RuntimeError("boom"))
+    assert calls["n"] == 1
+    assert sm.current.state == "failed"

@@ -7,6 +7,7 @@ and the §R9.1 module-isolation pin in tests/test_resources.py.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import os
@@ -15,8 +16,9 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ids import is_run_id
+
 _HARNESS_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{12}$")
-_RUN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _ITERATION_DIR_RE = re.compile(r"^iteration-[1-9]\d*$")
 
 
@@ -96,7 +98,7 @@ def encode_uri(harness_token: str, run_id: str, subpath: str) -> str:
         "forge://aBcDeFgHiJkL/12345678/plan/plan.md".
     """
     assert _HARNESS_TOKEN_RE.match(harness_token), harness_token
-    assert _RUN_ID_RE.match(run_id), run_id
+    assert is_run_id(run_id), run_id
     return f"forge://{harness_token}/{run_id}/{subpath}"
 
 
@@ -126,7 +128,7 @@ def decode_uri(uri: str) -> tuple[str, str, str]:
     if len(path_parts) < 2 or not path_parts[0] or not path_parts[1]:
         raise ValueError(f"forge URI missing run_id or subpath: {uri!r}")
     run_id, *rest = path_parts
-    if not _RUN_ID_RE.match(run_id):
+    if not is_run_id(run_id):
         raise ValueError(f"bad run_id: {run_id!r}")
     return harness_token, run_id, "/".join(rest)
 
@@ -167,6 +169,12 @@ class _ResourceScope:
 
 _ACTIVE_RUNS: dict[tuple[str, str], _ResourceScope] = {}
 
+# §S6 / finding 5 — strong refs to in-flight broadcast tasks. CPython's event
+# loop keeps only a weak ref to a bare create_task result, so without this set
+# the GC could collect the task before it runs. add_done_callback(discard)
+# clears entries as tasks complete (the documented asyncio idiom).
+_BROADCAST_TASKS: set[asyncio.Task[None]] = set()
+
 
 async def _broadcast_list_changed() -> None:
     """Broadcast resources/list_changed to every known session (§S6).
@@ -187,21 +195,24 @@ async def _broadcast_list_changed() -> None:
 
 
 def _fire_list_changed() -> None:
-    """Schedule a best-effort listChanged broadcast (§S6).
+    """Schedule a best-effort listChanged broadcast, holding a strong ref (§S6).
 
     Design: register/deregister are sync helpers; when no event loop is running
         there is no connected async host to notify, so the side channel returns.
-    Implementation: get the running loop and create a background task; swallow
+        Finding 5: the scheduled task is anchored in _BROADCAST_TASKS so the GC
+        cannot collect it before it runs, per the CPython create_task docs.
+    Implementation: get the running loop and create a background task; add it to
+        the module set and register add_done_callback(discard); swallow
         RuntimeError from loop absence only.
     Example: _fire_list_changed() after active-run registry mutation.
     """
-    import asyncio
-
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_broadcast_list_changed())
+    task = loop.create_task(_broadcast_list_changed())
+    _BROADCAST_TASKS.add(task)
+    task.add_done_callback(_BROADCAST_TASKS.discard)
 
 
 def register_active_run(scope: _ResourceScope) -> None:

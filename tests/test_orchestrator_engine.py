@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -520,6 +521,112 @@ async def test_iteration_cap_unresolved_gaps_come_from_latest_eval_json(tmp_path
     assert any(g.title == "DISK_SENTINEL" for g in result.unresolved_gaps)
 
 
+async def test_inline_incomplete_applies_caps_exactly_once(tmp_path: Path, monkeypatch) -> None:
+    """§8.1 — inline incomplete outcome applies result caps exactly once.
+
+    Design: finding 1 — the inline path must call the shared tail (and thus
+        caps) once, not run a separate post-try caps block.
+    Implementation: count apply_caps_and_overflow invocations during run().
+    Example: pytest asserts the counter equals 1 after Orchestrator.run().
+    """
+    import forge_mcp.orchestrator.lifecycle as lifecycle_mod
+
+    calls = {"n": 0}
+    real = lifecycle_mod.apply_caps_and_overflow
+
+    def counting(*args, **kwargs):
+        """Count calls before delegating to the real caps helper.
+
+        Design: the test observes call cardinality without changing behavior.
+        Implementation: increment a mutable counter and forward all arguments.
+        Example: counting(ledger, tmp_path, logger) returns real result.
+        """
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    async def fake_run_phases(deps, sm, ledger, base_git):
+        """Return an inline incomplete status without SDK calls.
+
+        Design: exercise the inline finalization branch, not timeout handling.
+        Implementation: return incomplete directly from the phase runner.
+        Example: await fake_run_phases(...) == ('incomplete', None).
+        """
+        return ("incomplete", None)
+
+    prepared = _prepared(tmp_path)
+    monkeypatch.setattr(lifecycle_mod, "apply_caps_and_overflow", counting)
+    monkeypatch.setattr(engine_mod, "run_phases", fake_run_phases)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+
+    result = await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+    assert calls["n"] == 1
+    assert result.status == "incomplete"
+
+
+async def test_resume_preserves_durable_started_at_and_lci(tmp_path: Path, monkeypatch) -> None:
+    """§7 / §H2 / finding 6 — resume continues the durable record, not a zeroed one.
+
+    Design: RunStateMachine.__init__ must not overwrite started_at,
+        last_completed_iteration, and iteration with fresh zeros on resume.
+    Implementation: pre-write a durable state.json with lci=3 and an old
+        started_at, build a resuming orchestrator, and assert state.json still
+        carries those durable values after a finalizing incomplete run.
+    Example: pytest asserts last_completed_iteration == 3 post-seed.
+    """
+    from forge_mcp.orchestrator.resume import ResumePoint
+    from forge_mcp.state import RunState, read_state, write_state
+
+    base = _prepared(tmp_path)
+    run_dir = base.harness_dir / base.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    point = ResumePoint(
+        run_id=base.run_id,
+        run_dir=run_dir,
+        last_completed_iteration=3,
+        start_iteration=4,
+    )
+    prepared = PreparedRun(
+        harness_dir=base.harness_dir,
+        lock=base.lock,
+        run_id=base.run_id,
+        config=base.config,
+        resume_point=point,
+    )
+    old_started = datetime.now(UTC) - timedelta(hours=2)
+    write_state(
+        run_dir / "state.json",
+        RunState(
+            state="iter_evaluating",
+            run_id=base.run_id,
+            iteration=3,
+            target_dir=str(base.harness_dir.parent),
+            started_at=old_started,
+            last_updated_at=old_started,
+            last_completed_iteration=3,
+        ),
+    )
+
+    async def fake_run_iteration_loop(deps, sm, ledger, base_git, *, start_iteration=1):
+        """Return immediately so resume seeding is the behavior under test.
+
+        Design: no new iter_done transition should rewrite last_completed_iteration.
+        Implementation: assert the resume anchor and return incomplete.
+        Example: await fake_run_iteration_loop(..., start_iteration=4).
+        """
+        assert start_iteration == 4
+        return ("incomplete", None)
+
+    monkeypatch.setattr(engine_mod, "run_iteration_loop", fake_run_iteration_loop)
+    monkeypatch.setattr(engine_mod, "capture_state", lambda _target: None)
+    monkeypatch.setattr(engine_mod, "capture_uncommitted", lambda _target: None)
+
+    await Orchestrator(prepared, _inputs(prepared), RunConfig(), Ctx(), _drivers()).run()
+    durable = read_state(run_dir / "state.json")
+    assert durable.started_at == old_started
+    assert durable.last_completed_iteration == 3
+
+
 def test_engine_run_initializes_logger_and_deps_before_try() -> None:
     """Pin a forge-mcp behavior.
 
@@ -541,7 +648,7 @@ def test_engine_run_initializes_logger_and_deps_before_try() -> None:
     disk_idx = body.find("disk_space_warn_if_low")
     deps_idx = body.find("deps = PhaseDeps")
     umask_idx = body.find("previous_umask = os.umask(0o077)")
-    try_idx = body.find("try:")
+    try_idx = body.find("try:", umask_idx)
     assert disk_idx != -1 and deps_idx != -1 and umask_idx != -1 and try_idx != -1
     assert disk_idx < umask_idx < try_idx
     assert deps_idx < umask_idx < try_idx

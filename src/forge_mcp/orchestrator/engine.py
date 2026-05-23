@@ -18,14 +18,13 @@ from ..artifacts import (
     create_run_dir,
     prune_old_runs,
     write_design_fingerprint,
-    write_design_flaws,
     write_prior_attempts,
 )
 from ..doctor import disk_space_warn_if_low
 from ..gitguard import capture_state, capture_uncommitted
 from ..models import EvalResult, RunForgeInput, RunResult
 from ..preflight import PreparedRun
-from ..state import RunState
+from ..state import RunState, read_state
 from ..status import Status
 from ..subscriptions import ResourceNotifier
 from . import lineage
@@ -34,9 +33,8 @@ from .cross_design import render_cross_design_digest
 from .emitter import _Emitter, _NullNotifier
 from .ledger import RunLedger
 from .lifecycle import (
-    apply_caps_and_overflow,
+    _finalize_terminal,
     collect_unresolved_gaps,
-    emit_terminal_status,
     handle_cancellation,
     handle_failure,
     handle_timeout,
@@ -208,17 +206,35 @@ class Orchestrator:
         started_at = datetime.now(UTC)
         run_dir = create_run_dir(self._prepared.harness_dir, self._prepared.run_id)
         ledger = RunLedger()
-        sm = RunStateMachine(
-            run_dir / "state.json",
-            RunState(
+        resume_point = self._prepared.resume_point
+        if resume_point is not None:
+            # §7 / §H2 / finding 6 — continue the durable record so started_at,
+            # iteration, and last_completed_iteration survive resume instead of
+            # being zeroed by a fresh RunState.
+            try:
+                initial = read_state(run_dir / "state.json")
+            except Exception:
+                # Defensive: durable state unreadable — seed from the resume
+                # anchor so resume still re-enters at the right iteration.
+                initial = RunState(
+                    state="init",
+                    run_id=self._prepared.run_id,
+                    iteration=resume_point.last_completed_iteration,
+                    target_dir=str(self._prepared.harness_dir.parent),
+                    started_at=started_at,
+                    last_updated_at=started_at,
+                    last_completed_iteration=resume_point.last_completed_iteration,
+                )
+        else:
+            initial = RunState(
                 state="init",
                 run_id=self._prepared.run_id,
                 iteration=0,
                 target_dir=str(self._prepared.harness_dir.parent),
                 started_at=started_at,
                 last_updated_at=started_at,
-            ),
-        )
+            )
+        sm = RunStateMachine(run_dir / "state.json", initial)
         status = Status(self._prepared.run_id, self._ctx, run_dir / "status.log", task=self._task)
         emitter = _Emitter(self._notifier, self._harness_token, self._prepared.run_id)
         status.set_max_iterations(self._inputs.max_iterations)
@@ -265,7 +281,6 @@ class Orchestrator:
                 ledger.warnings.append("run retention pruning failed (non-fatal)")
             terminal_status = "failed"
             try:
-                resume_point = self._prepared.resume_point
                 inputs_dir = run_dir / "inputs"
                 if resume_point is None:
                     sm.transition("canonicalizing")  # §8.1
@@ -383,22 +398,14 @@ class Orchestrator:
                 sm.transition("finalizing")
                 await emitter.emit_state()
                 ledger.decided_at = datetime.now(UTC)
-                if terminal_status == "incomplete" and ledger.stop_reason:
-                    sm.transition("incomplete", reason=ledger.stop_reason)
-                else:
-                    sm.transition(terminal_status)  # type: ignore[arg-type]
-                await emitter.emit_state()
-                design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
-                try:
-                    write_design_flaws(run_dir, design_flaws_full)
-                    await emitter.emit_path("design_flaws.json")
-                except OSError as exc:
-                    ledger.warnings.append(
-                        "design_flaws.json write failed (lineage feed-forward disabled): "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    logger.warning("design_flaws.json write failed", exc_info=True)
-                await emit_terminal_status(status, terminal_status)  # §8.1
+                # finding 1 — one shared terminal tail; caps run once, before the
+                # terminal status event, matching handle_timeout/handle_failure.
+                reason = (
+                    ledger.stop_reason
+                    if (terminal_status == "incomplete" and ledger.stop_reason)
+                    else None
+                )
+                await _finalize_terminal(sm, ledger, deps, status=terminal_status, reason=reason)
             except TimeoutError:
                 terminal_status = "incomplete"
                 await handle_timeout(sm, ledger, deps)
@@ -409,13 +416,6 @@ class Orchestrator:
             except Exception as exc:  # §8.1 — KeyboardInterrupt/SystemExit must propagate
                 terminal_status = "failed"
                 await handle_failure(sm, ledger, deps, exc)
-            if terminal_status in ("completed", "incomplete"):
-                # §8.1: caps run on every result-producing inline outcome.
-                apply_caps_and_overflow(ledger, run_dir, logger)
-                if ledger.unresolved_overflow_path:
-                    await emitter.emit_path("unresolved-gaps-overflow.md")
-                if ledger.design_flaw_overflow_path:
-                    await emitter.emit_path("design-flaw-gaps-overflow.md")
             result = build_result(
                 run_id=self._prepared.run_id,
                 run_dir=run_dir,

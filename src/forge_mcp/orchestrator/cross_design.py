@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from ..ids import is_run_id
 from ..state import read_state
 
 _LOG = logging.getLogger("forge_mcp.cross_design")
@@ -177,6 +178,8 @@ def find_cross_design_patterns(harness_dir: Path) -> list[CrossPattern]:
     now = datetime.now(UTC)
     buckets: dict[str, list[_Hit]] = defaultdict(list)
     for state_path in harness_dir.glob("*/state.json"):
+        if not is_run_id(state_path.parent.name):
+            continue  # finding 7 — defensive shape check on the */state.json glob
         try:
             for hit in _hits_for_run(state_path):
                 buckets[hit.fault_kind].append(hit)

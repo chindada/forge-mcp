@@ -490,8 +490,49 @@ def test_resources_module_imports_stdlib_only():
                 names = {alias.name for alias in node.names}
                 assert names == {"subscriptions"}
                 continue
+            if node.level == 1 and node.module == "ids":
+                # finding 7 — ids is a stdlib-only leaf; the §R9.1 guarantee holds.
+                continue
             top = (node.module or "").split(".", 1)[0]
             assert top in allowed_top_levels, f"forbidden from-import: {node.module}"
+
+
+async def test_fire_list_changed_anchors_then_clears(monkeypatch) -> None:
+    """§S6 / finding 5 — the broadcast task is strongly referenced then cleared.
+
+    Design: a bare create_task may be GC'd before running; the documented idiom
+        holds a strong ref in a module set and discards it on done.
+    Implementation: stub the broadcast coro, fire it, assert the set is
+        non-empty while pending, then await and assert the done-callback empties
+        the set.
+    Example: pytest asserts _BROADCAST_TASKS is empty after the task finishes.
+    """
+    import asyncio
+
+    import forge_mcp.resources as resources_mod
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_broadcast() -> None:
+        """Wait until released so the anchor can be observed.
+
+        Design: the test needs a pending task between schedule and completion.
+        Implementation: signal started and wait on an event controlled by test.
+        Example: await fake_broadcast() blocks until release.set().
+        """
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(resources_mod, "_broadcast_list_changed", fake_broadcast)
+    resources_mod._BROADCAST_TASKS.clear()
+    resources_mod._fire_list_changed()
+    await started.wait()
+    assert len(resources_mod._BROADCAST_TASKS) == 1
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(resources_mod._BROADCAST_TASKS) == 0
 
 
 def test_allowlist_includes_lineage_artifacts() -> None:

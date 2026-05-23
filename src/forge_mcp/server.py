@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +34,7 @@ from .drivers.evaluator import EvaluatorDriver
 from .drivers.generator import GeneratorDriver
 from .drivers.planner import PlannerDriver
 from .errors import tag
+from .ids import is_run_id
 from .models import RunForgeInput, RunResult
 from .orchestrator import Orchestrator
 from .preflight import prepare_run
@@ -49,6 +49,7 @@ from .resources import (
 )
 
 INVALID_PARAMS = -32602
+SERVER_ERROR = -32000
 RUN_FORGE_DESCRIPTION = "Run the Planner / Generator / Evaluator loop (§C1)."
 
 server = Server("forge-mcp")
@@ -68,7 +69,6 @@ except ValueError as _exc:
     raise
 _RESOURCE_LOGGER: logging.Logger = logging.getLogger("forge_mcp.resources")
 _RESOURCE_NOT_FOUND_CODE = -32002  # §R-Decision 8 — MCP-spec, not exported.
-_RUN_ID_DIR_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
 def _resource_not_found(uri: AnyUrl) -> McpError:
@@ -166,7 +166,7 @@ async def list_resources_handler(request: types.ListResourcesRequest) -> ListRes
             _RESOURCE_LOGGER.warning("root iterdir failed: %s root=%r", exc, root_dir)
             continue
         for run_id_dir in run_id_dirs:
-            if not run_id_dir.is_dir() or not _RUN_ID_DIR_RE.match(run_id_dir.name):
+            if not run_id_dir.is_dir() or not is_run_id(run_id_dir.name):
                 continue
             key = (root_token, run_id_dir.name)
             if key in scopes_by_key:
@@ -351,34 +351,41 @@ async def run_forge_handler(arguments: dict[str, Any]) -> CallToolResult | Creat
         message = tag("invalid_params", str(exc))
         raise McpError(ErrorData(code=INVALID_PARAMS, message=message)) from exc
     config = RunConfig.from_env()
-    prepared = await prepare_run(inputs, config)
-    ctx = server.request_context
-    # §S6 — track before register_active_run broadcasts.
-    subscriptions._REGISTRY.note_connected(ctx.session)
-    # §R3.2 — compute once so task-mode and direct-call branches share identity.
-    harness_token = compute_harness_token(prepared.harness_dir)
-    if _client_requested_task_mode(ctx):
+    try:
+        prepared = await prepare_run(inputs, config)
+        ctx = server.request_context
+        # §S6 — track before register_active_run broadcasts.
+        subscriptions._REGISTRY.note_connected(ctx.session)
+        # §R3.2 — compute once so task-mode and direct-call branches share identity.
+        harness_token = compute_harness_token(prepared.harness_dir)
+        if _client_requested_task_mode(ctx):
 
-        async def work(task: ServerTaskContext) -> CallToolResult:
-            """Run the orchestrator inside the server task context (§C1.4).
+            async def work(task: ServerTaskContext) -> CallToolResult:
+                """Run the orchestrator inside the server task context (§C1.4).
 
-            Design: task mode survives client disconnect while preserving fresh
-                phase sessions and normal RunResult construction. §R3.2 threads
-                the precomputed harness_token through.
-            Implementation: delegate to _orchestrator_entry and adapt the model
-                to CallToolResult for task completion storage.
-            Example: result = await work(task).
-            """
-            result = await _orchestrator_entry(
-                prepared, inputs, config, ctx, task=task, harness_token=harness_token
-            )
-            return _result_to_call_tool_result(result)
+                Design: task mode survives client disconnect while preserving
+                    fresh phase sessions and normal RunResult construction.
+                    §R3.2 threads the precomputed harness_token through.
+                Implementation: delegate to _orchestrator_entry and adapt the
+                    model to CallToolResult for task completion storage.
+                Example: result = await work(task).
+                """
+                result = await _orchestrator_entry(
+                    prepared, inputs, config, ctx, task=task, harness_token=harness_token
+                )
+                return _result_to_call_tool_result(result)
 
-        return await ctx.experimental.run_task(work)
-    result = await _orchestrator_entry(
-        prepared, inputs, config, ctx, task=None, harness_token=harness_token
-    )
-    return _result_to_call_tool_result(result)
+            return await ctx.experimental.run_task(work)
+        result = await _orchestrator_entry(
+            prepared, inputs, config, ctx, task=None, harness_token=harness_token
+        )
+        return _result_to_call_tool_result(result)
+    except McpError:
+        raise
+    except Exception as exc:
+        # §W2 / finding 4 — boundary catch-all; BaseException still propagates.
+        message = tag("infra_failure", f"run_forge failed: {type(exc).__name__}: {exc}")
+        raise McpError(ErrorData(code=SERVER_ERROR, message=message)) from exc
 
 
 def _client_requested_task_mode(ctx: Any) -> bool:

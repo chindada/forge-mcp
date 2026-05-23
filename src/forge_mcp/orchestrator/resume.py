@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ..ids import is_run_id
 from ..state import read_state
 
 _TERMINAL = frozenset({"completed", "incomplete", "failed"})
@@ -41,6 +42,8 @@ def find_resumable_run(harness_dir: Path) -> ResumePoint | None:
     if not harness_dir.exists():
         return None
     for state_path in harness_dir.glob("*/state.json"):
+        if not is_run_id(state_path.parent.name):
+            continue  # finding 7 — defensive shape check on the */state.json glob
         try:
             state = read_state(state_path)
         except Exception:

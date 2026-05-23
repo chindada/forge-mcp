@@ -37,11 +37,11 @@ def _src_root() -> Path:
 def _emission_corpus() -> str:
     """Concatenate every emitter call line across the source package.
 
-    Design: emission sites all funnel through _Emitter methods (emit_state /
-        emit_path / emit_iteration), so a line-oriented scan for those calls is
-        a faithful proxy for "an emission site exists".
+    Design: emission sites funnel through _Emitter methods or the lifecycle
+        _emit_if_present shim used by shared terminal finalization, so the scan
+        includes both call shapes.
     Implementation: read all *.py under the package, keep only lines mentioning
-        an emitter call, and join them into one searchable blob.
+        an emitter call or lifecycle shim call, and join them into one blob.
     Example: "summary.md" in _emission_corpus() once Task 2 lands.
     """
     blob: list[str] = []
@@ -49,9 +49,15 @@ def _emission_corpus() -> str:
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            if not isinstance(node, ast.Call):
                 continue
-            if node.func.attr not in {"emit_state", "emit_path", "emit_iteration"}:
+            if isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                name = node.func.id
+            else:
+                continue
+            if name not in {"emit_state", "emit_path", "emit_iteration", "_emit_if_present"}:
                 continue
             segment = ast.get_source_segment(source, node)
             if segment is not None:

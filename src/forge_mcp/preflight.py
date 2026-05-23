@@ -23,7 +23,7 @@ from .errors import FailureKind, tag
 from .lockfile import LockBusy, TargetLock
 from .models import RunForgeInput
 from .orchestrator.resume import ResumePoint, find_resumable_run
-from .skills import probe_required_skills
+from .skills import SkillMissingError, SkillProbeTimeout, probe_required_skills
 
 INVALID_PARAMS = -32602
 SERVER_ERROR = -32000
@@ -133,12 +133,37 @@ async def prepare_run(inputs: RunForgeInput, config: RunConfig) -> PreparedRun:
     """Validate and prepare a run before orchestration starts (§6.4).
 
     Design: lock acquisition happens before slow SDK probes, and any later
-        failure releases the lock before surfacing SERVER_ERROR.
+        failure releases the lock before surfacing SERVER_ERROR. Finding 4:
+        a catch-all guarantees no non-McpError crosses the boundary untagged
+        (§W2, Rule 8 fail-loud); the existing post-lock except still releases
+        the lock before the re-raised McpError reaches this catch-all.
     Implementation: validate target/design, create harness, acquire TargetLock,
-        run shared env checks and skill probe, then return PreparedRun.
+        run shared env checks and the (specifically-tagged) skill probe, then
+        return PreparedRun; wrap the whole body so unexpected exceptions become
+        a tagged infra_failure McpError.
     Example: prepared = await prepare_run(inputs, RunConfig.from_env()).
     """
     os.umask(0o077)
+    try:
+        return await _prepare_run_inner(inputs, config)
+    except McpError:
+        raise
+    except Exception as exc:
+        # §W2 / finding 4 — defense in depth; BaseException still propagates.
+        _raise(SERVER_ERROR, f"preflight failed: {type(exc).__name__}: {exc}", kind="infra_failure")
+        raise
+
+
+async def _prepare_run_inner(inputs: RunForgeInput, config: RunConfig) -> PreparedRun:
+    """Run the ordered preflight steps that prepare_run wraps (§6.4).
+
+    Design: finding 4 — the ordered preflight steps live here so prepare_run's
+        catch-all can wrap them without obscuring control flow; this helper may
+        raise McpError (tagged) or unexpected exceptions (caught by the wrapper).
+    Implementation: canonicalize/validate target+design, ensure harness, acquire
+        the lock, run env + skill probes, and return the PreparedRun handoff.
+    Example: prepared = await _prepare_run_inner(inputs, config).
+    """
     target_dir = _canonicalize_target_dir(inputs.target_dir)
     _fail_if_not_ok(check_target_dir_writable(target_dir), code=INVALID_PARAMS)
     _load_design_doc(inputs)
@@ -158,9 +183,13 @@ async def prepare_run(inputs: RunForgeInput, config: RunConfig) -> PreparedRun:
     try:
         _fail_if_not_ok(check_claude_cli(config), code=SERVER_ERROR)
         _fail_if_not_ok(await check_codex(config), code=SERVER_ERROR)
-        await probe_required_skills(
-            runner=ClaudeRunnerImpl(), claude_cli_path=config.claude_cli_path
-        )
+        try:
+            await probe_required_skills(
+                runner=ClaudeRunnerImpl(), claude_cli_path=config.claude_cli_path
+            )
+        except (SkillMissingError, SkillProbeTimeout) as exc:
+            # §W2 / finding 4 — known domain errors get a specific tag.
+            _raise(SERVER_ERROR, f"skill probe failed: {exc}", kind="infra_failure")
         _fail_if_not_ok(check_claude_auth(), code=SERVER_ERROR)
     except Exception:
         lock.release()

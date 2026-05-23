@@ -15,12 +15,39 @@ from fakes import (
     FakeSessionPlanner,
 )
 from mcp.server.experimental.task_context import ServerTaskContext
+from mcp.shared.exceptions import McpError
 
 from forge_mcp.config import RunConfig
 from forge_mcp.lockfile import TargetLock
 from forge_mcp.models import EvalResult, RunForgeInput
 from forge_mcp.orchestrator.engine import Orchestrator
 from forge_mcp.preflight import PreparedRun
+
+
+async def test_run_forge_handler_boundary_tags_unexpected(monkeypatch) -> None:
+    """§W2 / finding 4 — the handler boundary tags any unexpected exception.
+
+    Design: belt-and-suspenders — even if prepare_run somehow raised a raw
+        exception, run_forge_handler must convert it to a tagged McpError.
+    Implementation: monkeypatch prepare_run to raise a raw RuntimeError and
+        assert run_forge_handler raises a tagged McpError.
+    Example: pytest asserts '[FORGE_ERR_' in the surfaced message.
+    """
+    import forge_mcp.server as server_mod
+
+    async def boom(inputs, config) -> None:
+        """Raise an unexpected raw preflight exception.
+
+        Design: the boundary catch-all should be the only code under test.
+        Implementation: ignore arguments and raise RuntimeError.
+        Example: await boom(inputs, config) raises RuntimeError.
+        """
+        raise RuntimeError("unexpected non-McpError from preflight")
+
+    monkeypatch.setattr(server_mod, "prepare_run", boom)
+    with pytest.raises(McpError) as ei:
+        await server_mod.run_forge_handler({"target_dir": "/tmp", "design_doc_content": "x"})
+    assert "[FORGE_ERR_" in ei.value.error.message
 
 
 def _build_prepared(tmp_path: Path) -> PreparedRun:

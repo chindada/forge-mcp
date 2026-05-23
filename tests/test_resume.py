@@ -74,6 +74,34 @@ def test_find_returns_none_when_all_terminal(harness_dir: Path) -> None:
     assert find_resumable_run(harness_dir) is None
 
 
+def test_find_resumable_run_skips_non_run_id_dir(tmp_path: Path) -> None:
+    """§H2 / finding 7 — resume ignores a state.json in a non-run-id dir.
+
+    Design: the */state.json glob must shape-check parent.name so a stray dir
+        containing a state.json is never offered as a resume candidate.
+    Implementation: write a non-terminal state.json under a non-run-id dir and
+        assert find_resumable_run returns None.
+    Example: pytest asserts a 'scratchpd' dir is skipped.
+    """
+    harness = tmp_path / ".harness"
+    bad = harness / "scratchpd"
+    bad.mkdir(parents=True)
+    now = datetime.now(UTC)
+    write_state(
+        bad / "state.json",
+        RunState(
+            state="iter_generating",
+            run_id="abcd1234",
+            iteration=2,
+            target_dir=str(tmp_path),
+            started_at=now,
+            last_updated_at=now,
+            last_completed_iteration=1,
+        ),
+    )
+    assert find_resumable_run(harness) is None
+
+
 def test_find_skips_run_with_no_durable_anchor(harness_dir: Path) -> None:
     """Pin a forge-mcp behavior.
 

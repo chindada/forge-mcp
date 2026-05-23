@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .ids import is_run_id
 from .models import DesignFlawGap, EvalResult
 
 
@@ -88,8 +89,9 @@ def prune_old_runs(harness_dir: Path, *, keep_last: int, current_run_id: str | N
 
     Design: §H9 bounds sensitive artifact retention while never deleting the
         current or resumed run directory.
-    Implementation: sort 8-hex run dirs by state.json started_at with mtime
-        fallback, keep newest keep_last plus current, and rmtree the rest.
+    Implementation: sort run-id-shaped dirs (via is_run_id) by state.json
+        started_at with mtime fallback, keep newest keep_last plus current, and
+        rmtree the rest.
     Example: prune_old_runs(Path('/repo/.harness'), keep_last=10).
     """
     from .state import read_state
@@ -98,7 +100,7 @@ def prune_old_runs(harness_dir: Path, *, keep_last: int, current_run_id: str | N
         return
     entries: list[tuple[float, Path]] = []
     for path in harness_dir.glob("*"):
-        if not path.is_dir() or len(path.name) != 8:
+        if not path.is_dir() or not is_run_id(path.name):
             continue
         try:
             sort_key = read_state(path / "state.json").started_at.timestamp()
@@ -117,15 +119,18 @@ def prune_old_runs(harness_dir: Path, *, keep_last: int, current_run_id: str | N
 
 
 def escape_md_inline(value: str) -> str:
-    """Escape markdown table-sensitive inline text.
+    """Escape markdown table-sensitive inline text, collapsing line breaks.
 
-    Design: §10.4 pins backslash-before-pipe escaping so gap tables remain
-        parseable even when model output contains separators.
-    Implementation: replace backslashes first, then pipes, preserving all other
-        characters verbatim.
-    Example: escape_md_inline('a|b\\c') returns 'a\\|b\\\\c'.
+    Design: §10.4 pins backslash-before-pipe escaping so gap tables stay
+        parseable. Finding 3: multi-line prose previously broke table rows, so
+        all CR/LF variants collapse to a GFM cell line-break (<br>) AFTER the
+        backslash/pipe escaping (<br> carries no further-escaped character).
+    Implementation: escape backslashes, then pipes, then normalize CRLF/CR/LF
+        to <br> so no raw newline survives in a table cell.
+    Example: escape_md_inline('a|b\\c\\nd') returns 'a\\|b\\\\c<br>d'.
     """
-    return value.replace("\\", "\\\\").replace("|", "\\|")
+    escaped = value.replace("\\", "\\\\").replace("|", "\\|")
+    return escaped.replace("\r\n", "<br>").replace("\r", "<br>").replace("\n", "<br>")
 
 
 def escape_md(value: str) -> str:
