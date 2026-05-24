@@ -103,6 +103,68 @@ Exactly one of `design_doc_path` / `design_doc_content` must be supplied; provid
 
 Other fields include `run_id`, `run_dir` (the `<target_dir>/.harness/<run-id>/` path), `iterations_used`, `runtime_seconds`, `unresolved_gaps`, `artifacts` (paths to `plan.md`, per-iteration `eval.md`, …), and a human-readable `message`.
 
+### Run lifecycle
+
+A run is a state machine over the `StateLiteral` values written to
+`state.json`. Solid edges are normal transitions; the thick `==>` edges show
+the evaluator's two read roots — the user's `target_dir` (the repo under
+review) and `run_dir/inputs/design.md` (the frozen design spec, written once
+during `canonicalizing`). Those two roots are invariant across iterations
+and read in a fresh session (no prior gaps, plan, or contract are fed in);
+the prompt may carry a per-iteration `changed_files` review-ordering hint
+(§H8), but the underlying artifacts do not change.
+
+`finalizing` is reached only on natural cap-hit or normal-completion paths
+and exits to `completed` or `incomplete`. Two terminals bypass `finalizing`
+entirely: dashed edges are the §8.5 cancellation path (any live phase →
+`cancelling` → `failed`, with the run lock released between them); a fatal
+exception in any live phase short-circuits directly to `failed` via
+`handle_failure` in `lifecycle.py` (not drawn — would duplicate the cancel
+fan-out).
+
+```mermaid
+flowchart TD
+    Start([run_forge entry]) --> canon[canonicalizing<br/>§8.1]
+    canon --> planning
+    planning --> planned[planned<br/>plan.md written]
+    planned --> gen[iter_generating]
+
+    gen -->|verify_command set| ver[iter_verifying]
+    gen -->|no verify_command| eval[iter_evaluating]
+    ver --> eval
+
+    eval -->|gaps found| triage[iter_triaging<br/>classify_gaps §11.1]
+    eval -->|no gaps| done[iter_done]
+    triage --> done
+
+    code[("target_dir<br/>(repo under review)")]
+    spec[("run_dir/inputs/design.md<br/>(frozen design)")]
+    code ==>|reads| eval
+    spec ==>|reads, invariant across N| eval
+
+    done -->|all gaps resolved<br/>AND verify passed| fin[finalizing]
+    done -->|non-progress break<br/>H-Inv 4| fin
+    done -->|iteration_n == max_iterations| fin
+    done -->|otherwise| rem[iter_remediating]
+    rem -->|N := N+1<br/>contract.md for next iter| gen
+
+    fin --> completed([completed])
+    fin --> incomplete([incomplete])
+
+    cancel[cancelling]
+    cancel --> failed([failed])
+
+    canon -.->|§8.5 cancel| cancel
+    planning -.->|§8.5 cancel| cancel
+    gen -.->|§8.5 cancel| cancel
+    ver -.->|§8.5 cancel| cancel
+    eval -.->|§8.5 cancel| cancel
+    triage -.->|§8.5 cancel| cancel
+    done -.->|§8.5 cancel| cancel
+    rem -.->|§8.5 cancel| cancel
+    fin -.->|§8.5 cancel| cancel
+```
+
 ### Task-mode callers (`call_tool_as_task`)
 
 When invoking `run_forge` via `session.experimental.call_tool_as_task(...)`
