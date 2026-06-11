@@ -99,9 +99,11 @@ An eighth normative brief, the **SDK realignment & drift-proofing** doc
 (`docs/specs/forge-mcp-sdk-realignment.md`), differs in kind from the
 seven above: it is a **remediation brief**, not a pure addition. It
 realigns both SDK seams (`drivers/_claude.py`, `drivers/_codex.py`) and
-preflight to the installed `@main` SDKs (`claude-agent-sdk` 0.2.85,
-`openai-codex` 0.131.0a4 — reproducibility still via the committed
-`uv.lock`), revives two design-required-but-dead forensic features (the
+preflight to the then-installed `@main` SDKs (`claude-agent-sdk` 0.2.85,
+`openai-codex` 0.131.0a4 at the time — the `openai-codex` `@main` pin has
+since been retired for the published PyPI beta `>=0.1.0b2`, see the Tooling
+section; reproducibility still via the committed `uv.lock`), revives two
+design-required-but-dead forensic features (the
 Codex and Claude `stderr`→`run.log` tees), and adds an SDK-contract
 drift-detection layer (`tests/test_sdk_contract.py`, fast + in PR CI) so
 the class of defect cannot recur. It cites by fix group —
