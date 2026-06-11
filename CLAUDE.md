@@ -148,6 +148,25 @@ schema-pin tests continue to derive from
 `RunResult.model_json_schema()` — **no shift for this brief**:
 `RunForgeInput` / `RunResult` are untouched (G-Decision 5).
 
+An eleventh companion normative brief, the **behavioral discipline** doc
+(`docs/specs/forge-mcp-behavioral-discipline.md`), imports the four
+"reduce common LLM coding mistakes" principles into the packaged driver
+prompts — adding a `## Scope discipline` section and a fourth
+`Assumptions` summary field to `generator_system.md`, and a "plan only
+what the design requires" sentence to `planner_system.md` — in its own
+`§B*`, `B-Invariant N`, and `B-Decision N` namespaces (cite as e.g.
+`# §B2 scope discipline`, `# §B-Inv 1 scope not effort`; the `§` prefix
+distinguishes these from the SDK-realignment brief's bare `B#`
+fix-group labels, which carry no `§`). It **extends §P** (the
+prompt-engineering brief, which remains the prompts' content owner) and
+is **bound by the §1 context-anxiety north star**, superseding nothing:
+the base doc still wins on anything it specifies, and the ten prior
+briefs each still win in their own namespaces. The §18 schema-pin tests
+continue to derive from `RunForgeInput.model_json_schema()` /
+`RunResult.model_json_schema()` — **no shift for this brief**:
+prompts and docs only; `RunForgeInput` / `RunResult` are untouched
+(B-Decision 4).
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is

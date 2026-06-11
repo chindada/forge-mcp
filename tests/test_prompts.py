@@ -316,3 +316,64 @@ def test_triage_has_accept_vs_demote_example() -> None:
     text = files("forge_mcp.prompts").joinpath("evaluator_triage.md").read_text()
     fragment = "For example: a gap citing the exact sentence"
     assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_generator_has_scope_discipline_section() -> None:
+    """Pin the generator scope-discipline section (§B5 item 1, §B-Inv 1).
+
+    Design: §B-Inv 1 scope not effort — the generator completes the contract
+        fully but implements nothing beyond it; the reconciliation fragment
+        and the surgical fragment are the load-bearing spans of the new
+        Scope discipline section.
+    Implementation: canonicalize whitespace and assert both verbatim
+        fragments are present in generator_system.md.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("generator_system.md").read_text()
+    for fragment in (
+        "Extra scope is not extra credit",
+        "Every line you change should trace to a contract requirement",
+    ):
+        assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_generator_has_assumptions_field() -> None:
+    """Pin the generator summary.md Assumptions field (§B5 item 2, §B-Decision 2).
+
+    Design: §B2.2 — the Definition of done gains a fourth Assumptions
+        section, the autonomous loop's substitute for asking a human about
+        a resolvable contract ambiguity.
+    Implementation: canonicalize whitespace and assert the verbatim
+        assumptions fragment is present in generator_system.md.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("generator_system.md").read_text()
+    fragment = "any contract ambiguity you resolved by choosing an interpretation"
+    assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
+
+
+def test_planner_has_scope_sentence() -> None:
+    """Pin the planner plan-only-what-is-required sentence (§B5 item 3, §B3).
+
+    Design: §B3 — the planner's thoroughness mandate is balanced by a
+        Simplicity clause: plan only what the design requires and record
+        ambiguity in open questions rather than silently picking.
+    Implementation: canonicalize whitespace and assert the verbatim
+        fragment is present in planner_system.md.
+    Example: pytest runs this prompt pin in the non-slow suite.
+    """
+    from importlib.resources import files
+
+    from forge_mcp.orchestrator.triage import canonicalize_for_citation
+
+    text = files("forge_mcp.prompts").joinpath("planner_system.md").read_text()
+    fragment = "Plan only what the design requires"
+    assert canonicalize_for_citation(fragment) in canonicalize_for_citation(text)
