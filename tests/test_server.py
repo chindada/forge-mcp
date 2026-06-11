@@ -194,9 +194,7 @@ async def test_task_mode_cancellation_follows_section_8_5_five_step_ordering(
 
         last_session_id = None
 
-        async def implement(
-            self, ctx, *, codex_bin, status_cb, env=None, network_access=True
-        ) -> None:
+        async def implement(self, ctx, *, codex_bin, status_cb, env=None) -> None:
             """Flip the cancellation flag and return.
 
             Design: simulates a long generator turn that ends just as the

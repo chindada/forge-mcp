@@ -88,7 +88,6 @@ Point it at a design document on disk (`design_doc_path`) or paste the text inli
 | `verify_command`         | string | _(none)_     | Shell command run to confirm the feature works                                                                                   |
 | `verify_timeout_seconds` | int    | `1800`       | Timeout for `verify_command`; `1`–`86400`                                                                                        |
 | `resume`                 | bool   | `false`      | Resume the last incomplete run in `target_dir`                                                                                   |
-| `network_access`         | bool   | `true`       | Allow network during the Generator phase (convenience knob, **not** a security boundary — see [Security model](#security-model)) |
 | `ignore_prior_attempts`  | bool   | `false`      | Opt out of cross-run learning for this call                                                                                      |
 
 Exactly one of `design_doc_path` / `design_doc_content` must be supplied; providing both or neither is rejected.
@@ -243,15 +242,36 @@ The `run.log` file may contain sensitive prompt/output snippets and is written w
 
 ## Security model
 
-The Generator executes arbitrary commands in `target_dir` for the duration of a
-run. `network_access` is a convenience knob (defaulting to `true` so dependency
-installation and `verify_command` work), **not a security boundary**. forge-mcp
-deliberately does not ship an in-process command denylist (it would be security
-theater for an agent that can author and execute scripts). The real isolation
-boundary is the deployer's OS/container sandbox: run forge-mcp against a
-disposable/scratch checkout inside an OS/container sandbox you control.
+The Generator executes with **full host access**
+(`Sandbox.full_access` — the SDK spelling of codex's
+`danger-full-access`): unrestricted filesystem writes, unrestricted
+network, and no approval prompts (`ApprovalMode.deny_all`). forge-mcp
+provides **no in-process isolation boundary at all**. This is a
+deliberate, documented posture, not an oversight: the verify gate
+already runs caller-supplied shell commands unsandboxed, the
+planner/evaluator already run with `bypassPermissions`, and
+generator-authored code already executes unsandboxed whenever the
+verify gate runs it — a generator-only sandbox provided asymmetric
+friction, not security. forge-mcp also deliberately ships no in-process
+command denylist (security theater for an agent that can author and
+execute scripts). The only real isolation boundary is the one the
+deployer provides: **run forge-mcp exclusively against a disposable or
+scratch checkout inside an OS/container sandbox you control** (dev
+container, VM, jail). Official Codex guidance sanctions full access
+precisely and only for such externally-isolated environments.
 
-See the [long-run hardening brief (§H7)](docs/specs/forge-mcp-long-run-hardening.md) for the full security rationale.
+See the [generator full-access brief (§F)](docs/specs/forge-mcp-generator-full-access.md)
+for the rationale; §H7 of the
+[long-run hardening brief](docs/specs/forge-mcp-long-run-hardening.md)
+records the threat-model groundwork this brief completes.
+
+**Migration (≥ this version):** the `network_access` input field was
+removed (see the [generator full-access brief
+(§F3)](docs/specs/forge-mcp-generator-full-access.md)). Callers still
+passing it — saved MCP invocations, scripts, recipes — must drop the
+field; it now fails validation (`extra_forbidden`). There is no
+behavioral replacement: network is always available to the generator,
+as it already was by default.
 
 ## Cross-run learning
 

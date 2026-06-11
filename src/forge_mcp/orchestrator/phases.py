@@ -193,23 +193,19 @@ def _make_status_cb(deps: PhaseDeps, phase: str, iteration_n: int) -> Any:
 
 
 async def _run_generator(deps: PhaseDeps, iteration_n: int) -> None:
-    """Invoke generator.implement with backward-compatible fake support (§H7).
+    """Invoke generator.implement for one iteration (§F2.4).
 
-    Design: production drivers accept network_access, but existing test fakes
-        may model the earlier seam; hardening should not force unrelated tests
-        to update when behavior is otherwise identical.
-    Implementation: inspect the bound method signature and pass network_access
-        only when accepted; all other arguments match the production seam.
+    Design: §F2.4 deletes the §H7 signature-inspection branch along with the
+        network knob; the generator seam takes codex_bin and status_cb only.
+    Implementation: build the bound status callback and call implement
+        directly with the production arguments.
     Example: await _run_generator(deps, 1).
     """
-    implement = deps.drivers.generator.implement
-    kwargs: dict[str, Any] = {
-        "codex_bin": deps.config.codex_bin,
-        "status_cb": _make_status_cb(deps, "iter_generating", iteration_n),
-    }
-    if "network_access" in inspect.signature(implement).parameters:
-        kwargs["network_access"] = deps.inputs.network_access
-    await implement(_ctx(deps, iteration_n), **kwargs)
+    await deps.drivers.generator.implement(
+        _ctx(deps, iteration_n),
+        codex_bin=deps.config.codex_bin,
+        status_cb=_make_status_cb(deps, "iter_generating", iteration_n),
+    )
 
 
 async def _evaluate(

@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -271,7 +273,26 @@ def test_run_forge_input_new_optional_fields_default() -> None:
     assert inp.verify_command is None
     assert inp.verify_timeout_seconds == 1800
     assert inp.resume is False
-    assert inp.network_access is True
+
+
+def test_network_access_rejected_as_extra_forbidden() -> None:
+    """Pin F-Inv 4 — RunForgeInput rejects the removed network_access knob.
+
+    Design: §F3 deletes the knob and keeps extra="forbid", so a stale caller
+        passing network_access fails loudly at validation (F-Decision 2:
+        delete, not deprecate) instead of being silently accepted.
+    Implementation: construct RunForgeInput with network_access=True and
+        assert pydantic raises ValidationError naming the field.
+    Example: pytest tests/test_models.py -k network_access_rejected -v.
+    """
+    stale_input: dict[str, Any] = {
+        "target_dir": "/repo",
+        "design_doc_content": "d",
+        "network_access": True,
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        RunForgeInput(**stale_input)
+    assert "network_access" in str(exc_info.value)
 
 
 def test_verify_timeout_seconds_bounds_enforced() -> None:

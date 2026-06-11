@@ -175,28 +175,24 @@ def test_text_input_is_constructable() -> None:
     assert TextInput(text="go").text == "go"
 
 
-def test_thread_start_carries_sandbox_workspace_write_overrides() -> None:
-    """Pin: thread_start exposes sandbox+config and the §H7 override keys exist (A6).
+def test_sandbox_full_access_preset_and_thread_start_params() -> None:
+    """Pin: Sandbox.full_access wire value and thread_start params (§F5 item 3).
 
-    Design: openai-codex 0.132 moved writable_roots/network_access out of the
-        per-turn SandboxPolicy union into thread_start(config=...) overrides;
-        sandbox_config_for builds that dict. A drift in the param names or the
-        sandbox_workspace_write field names would silently drop the §H7 boundary,
-        so pin all three: the Sandbox preset, thread_start's sandbox/config
-        params, and SandboxWorkspaceWrite's writable_roots/network_access fields.
-    Implementation: inspect AsyncCodex.thread_start params and the
-        SandboxWorkspaceWrite model fields the override dict targets.
-    Example: pytest tests/test_sdk_contract.py -k sandbox_workspace_write -v.
+    Design: §F1 records the namespace trap — the v2 Sandbox enum wire value
+        is "full-access" while codex config.toml spells the same mode
+        "danger-full-access"; pin the enum value as the drift canary, plus
+        the thread_start sandbox/approval_mode/cwd params the §F2.2 normative
+        call site uses. A beta rename fails CI fast, not in the slow e2e.
+    Implementation: importorskip openai_codex, assert the enum member's
+        .value, and inspect AsyncCodex.thread_start's signature.
+    Example: pytest tests/test_sdk_contract.py -k full_access -v.
     """
     pytest.importorskip("openai_codex")
     from openai_codex import AsyncCodex, Sandbox
-    from openai_codex.generated.v2_all import SandboxWorkspaceWrite
 
-    assert Sandbox.workspace_write is not None
+    assert Sandbox.full_access.value == "full-access"
     params = set(inspect.signature(AsyncCodex.thread_start).parameters)
-    assert {"sandbox", "config"} <= params
-    fields = set(SandboxWorkspaceWrite.model_fields)
-    assert {"writable_roots", "network_access"} <= fields
+    assert {"sandbox", "approval_mode", "cwd"} <= params
 
 
 def test_approval_mode_deny_all_exists() -> None:

@@ -8,7 +8,7 @@ from typing import Any
 
 from ..artifacts import atomic_write_text
 from ..runcontext import RunContext
-from ._codex import CodexRunner, build_app_server_config, never_approval_mode, sandbox_config_for
+from ._codex import CodexRunner, build_app_server_config, never_approval_mode
 
 _STATUS_EVENT_KINDS = {"command_execution", "function_call", "file_change", "web_search"}
 
@@ -51,15 +51,15 @@ class GeneratorDriver:
         *,
         codex_bin: str,
         status_cb: Callable[..., Awaitable[None]],
-        network_access: bool = True,
         env: dict | None = None,
     ) -> None:
         """Run one Codex implementation turn for the current iteration.
 
         Design: §9.2 generator reads iteration-N/contract.md and writes only to
             target_dir plus that iteration directory; no MCP servers are passed.
-        Implementation: construct seam configs with §H7 network toggle, stream
-            notable events to status, and write a backstop summary if omitted.
+        Implementation: construct seam configs (§F2 — the seam applies the
+            full-access preset itself), stream notable events to status, and
+            write a backstop summary if omitted.
         Example: await driver.implement(ctx, codex_bin='codex', status_cb=cb).
         """
         if ctx.iteration_n is None:
@@ -73,11 +73,6 @@ class GeneratorDriver:
         session = await self._runner.turn(
             instructions=instructions,
             server_config=build_app_server_config(codex_bin=codex_bin, cwd=ctx.target_dir, env=env),
-            sandbox_config=sandbox_config_for(
-                target_dir=ctx.target_dir,
-                iteration_dir=iteration_dir,
-                network_access=network_access,
-            ),
             approval_mode=never_approval_mode(),
             env=env,
             run_log_path=ctx.run_dir / "run.log",  # §13/B7 tee Codex stderr to run.log.

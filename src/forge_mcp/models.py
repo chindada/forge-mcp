@@ -40,7 +40,6 @@ class RunForgeInput(BaseModel):
     verify_command: str | None = None
     verify_timeout_seconds: Annotated[int, Field(ge=1, le=24 * 60 * 60)] = 1800
     resume: bool = False
-    network_access: bool = True
     ignore_prior_attempts: bool = Field(
         default=False,
         description=(

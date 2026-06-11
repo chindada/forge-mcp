@@ -61,7 +61,6 @@ class CodexRunner(Protocol):
         *,
         instructions: str,
         server_config: Any,
-        sandbox_config: Any,
         approval_mode: Any,
         env: dict | None,
         run_log_path: Path | None = None,
@@ -84,28 +83,6 @@ def build_app_server_config(*, codex_bin: str, cwd: Path, env: dict | None = Non
     from openai_codex import CodexConfig  # type: ignore
 
     return CodexConfig(codex_bin=codex_bin, cwd=str(cwd), env=env or {})
-
-
-def sandbox_config_for(*, target_dir: Path, iteration_dir: Path, network_access: bool) -> dict:
-    """Return the workspace-write thread config overrides with a network toggle (§H7).
-
-    Design: §H7 makes network access a convenience knob, not a security
-        boundary. openai-codex 0.132 retired the per-turn SandboxPolicy
-        tagged-union; the public `sandbox` arg now carries only the coarse
-        Sandbox preset, so the detailed writable roots and network flag travel
-        as a `sandbox_workspace_write` override on thread_start(config=...).
-    Implementation: build the dict[str, Any] config overrides consumed by
-        thread_start — sandbox_mode plus sandbox_workspace_write with the two
-        writable roots and the network flag (snake_case wire keys, no aliases).
-    Example: sandbox_config_for(target_dir=t, iteration_dir=i, network_access=False).
-    """
-    return {
-        "sandbox_mode": "workspace-write",
-        "sandbox_workspace_write": {
-            "writable_roots": [str(target_dir), str(iteration_dir)],
-            "network_access": network_access,
-        },
-    }
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -274,21 +251,19 @@ class CodexRunnerImpl:
         *,
         instructions: str,
         server_config: Any,
-        sandbox_config: Any,
         approval_mode: Any,
         env: dict | None,
         run_log_path: Path | None = None,
     ) -> CodexSession:
-        """Spawn one Codex turn under the supplied sandbox config.
+        """Spawn one Codex turn with unconditional full host access (§F2).
 
-        Design: §10.2 generator runs one Codex turn per iteration. openai-codex
-            0.132 carries the coarse sandbox preset via the Sandbox enum and the
-            §H7 writable-roots/network policy via thread_start(config=...); the
-            per-turn SandboxPolicy union of 0.131 is gone, so the detailed config
-            is applied at thread start, not on the turn.
+        Design: §F2.2 — the generator is the deployer-isolated workhorse, so
+            every thread starts with the typed Sandbox.full_access preset and
+            deny_all approvals; no config= overrides exist (F-Inv 2 bans the
+            "full-access" vs "danger-full-access" string-namespace trap).
         Implementation: open AsyncCodex(config=...), thread_start with the
-            workspace-write preset + sandbox_config overrides + approval mode,
-            run one turn, and return a stream wrapper that closes on exhaustion.
+            full-access preset + approval mode, run one turn, and return a
+            stream wrapper that closes on exhaustion.
         Example: session = await runner.turn(instructions='go', ...).
         """
         from openai_codex import AsyncCodex, Sandbox, TextInput  # type: ignore
@@ -301,10 +276,9 @@ class CodexRunnerImpl:
         cwd = getattr(server_config, "cwd", None)
         try:
             thread = await codex.thread_start(
-                sandbox=Sandbox.workspace_write,
+                sandbox=Sandbox.full_access,  # §F2; §F-Inv 2 typed preset only.
                 approval_mode=approval_mode,
                 cwd=cwd,
-                config=sandbox_config,
             )
             self._thread = thread
             handle = await thread.turn(

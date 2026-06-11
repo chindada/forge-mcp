@@ -456,59 +456,6 @@ async def test_break_mid_loop_returns_incomplete_before_cap(tmp_path: Path) -> N
     assert "unchanged" in ledger.stop_reason
 
 
-async def test_generator_receives_network_access(tmp_path: Path) -> None:
-    """Pin §H7 generator threading of inputs.network_access.
-
-    Design: the network toggle must reach the generator only when its implement
-        seam accepts it; phases inspects the signature before passing it.
-    Implementation: a generator fake whose implement accepts network_access
-        records the value; drive one no-gap iteration with network_access False
-        and assert the recorded value.
-    Example: await run_iteration_loop(...) with inputs.network_access False.
-    """
-
-    class _NetGenerator:
-        """Generator fake recording the network_access it is called with.
-
-        Design: isolates the threading behavior from Codex execution.
-        Implementation: implement accepts network_access and writes a summary.
-        Example: gen.seen_network_access is False after the call.
-        """
-
-        def __init__(self) -> None:
-            """Initialize the recorded flag as unset.
-
-            Design: a sentinel distinguishes 'not called' from a real value.
-            Implementation: assign None until implement runs.
-            Example: _NetGenerator().seen_network_access is None.
-            """
-            self.seen_network_access = None
-
-        async def implement(self, ctx, *, codex_bin, status_cb, network_access=True, env=None):
-            """Record network_access and write the iteration summary.
-
-            Design: mirrors the production implement seam shape (§H7).
-            Implementation: store the flag and create iteration-N/summary.md.
-            Example: await gen.implement(ctx, codex_bin='codex', status_cb=cb).
-            """
-            self.seen_network_access = network_access
-            iter_dir = ctx.run_dir / f"iteration-{ctx.iteration_n}"
-            iter_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            (iter_dir / "summary.md").write_text("# summary\n")
-
-    evaluator = FakeEvaluator([EvalResult(no_gaps=True, gaps=[], summary="ok")])
-    deps, sm, ledger = _deps(tmp_path, evaluator, max_iterations=1)
-    gen = _NetGenerator()
-    deps.drivers.generator = gen
-    deps.inputs.network_access = False
-    (deps.run_dir / "plan").mkdir(exist_ok=True)
-    (deps.run_dir / "plan" / "plan.md").write_text("# plan\n")
-
-    status, n = await run_iteration_loop(deps, sm, ledger, base_git=None)
-    assert (status, n) == ("completed", 1)
-    assert gen.seen_network_access is False
-
-
 async def test_no_verify_command_gate_is_inert(tmp_path: Path) -> None:
     """Pin a forge-mcp behavior.
 

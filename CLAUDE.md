@@ -115,6 +115,25 @@ this brief does not **explicitly** supersede. The §18 schema-pin tests
 are unaffected — its own non-goal forbids any `RunForgeInput` /
 `RunResult` change.
 
+A ninth normative brief, the **generator full-access** doc
+(`docs/specs/forge-mcp-generator-full-access.md`), moves the Codex
+generator to unconditional full host access (`Sandbox.full_access` +
+`ApprovalMode.deny_all`) and deletes the `network_access` knob from
+`RunForgeInput`, in its own `§F*`, `F-Invariant N`, and `F-Decision N`
+namespaces (cite as e.g. `# §F2 full-access thread start`, `# §F-Inv 4
+no dead knobs`). Like the SDK-realignment brief it is **partially a
+supersession brief**: it explicitly overrides the base doc's §10.2 /
+Decision 9 workspace-write sandbox clause and the hardening brief's §H7
+`network_access` knob (the two clauses named in its F0.4); on everything
+else the base doc and the eight prior briefs still win in their own
+namespaces. forge-mcp therefore provides **no in-process isolation for
+the generator** — the deployer's OS/container sandbox is the only real
+boundary (F-Inv 5; README "Security model" is normative). The §18
+schema-pin tests **shift for this brief** — the only brief to change the
+`RunForgeInput` pin: `RunForgeInput.model_json_schema()` loses the
+`network_access` property and the pins update to the new verbatim
+shape; `RunResult.model_json_schema()` is untouched.
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is

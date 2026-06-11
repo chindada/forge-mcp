@@ -365,43 +365,6 @@ def test_generator_implement_has_no_mcp_servers_param() -> None:
     assert "mcp_servers" not in inspect.signature(GeneratorDriver.implement).parameters
 
 
-def test_sandbox_config_network_access_flip(tmp_path) -> None:
-    """Pin §H7 network_access flips the Codex thread sandbox_workspace_write override.
-
-    Design: §H7 makes network access a caller knob. openai-codex 0.132 retired
-        the per-turn SandboxPolicy union, so the flag now lives in the
-        thread_start(config=...) override at
-        sandbox_workspace_write.network_access, with the two writable roots.
-    Implementation: build the override dict with network_access False and True
-        and read the nested flag and writable_roots precisely.
-    Example: sandbox_config_for(..., network_access=False) disables network.
-    """
-    from forge_mcp.drivers._codex import sandbox_config_for
-
-    def _net(cfg: dict) -> bool:
-        """Read the network-access flag off the override dict.
-
-        Design: §H7 flag lives at sandbox_workspace_write.network_access.
-        Implementation: index the nested override dict.
-        Example: _net(cfg) is False for a network-disabled config.
-        """
-        return bool(cfg["sandbox_workspace_write"]["network_access"])
-
-    off = sandbox_config_for(
-        target_dir=tmp_path, iteration_dir=tmp_path / "iter", network_access=False
-    )
-    on = sandbox_config_for(
-        target_dir=tmp_path, iteration_dir=tmp_path / "iter", network_access=True
-    )
-    assert _net(off) is False
-    assert _net(on) is True
-    assert off["sandbox_workspace_write"]["writable_roots"] == [
-        str(tmp_path),
-        str(tmp_path / "iter"),
-    ]
-    assert off["sandbox_mode"] == "workspace-write"
-
-
 async def test_claude_runner_last_session_id_none_before_first_call(monkeypatch) -> None:
     """Pin §C2.2 — ClaudeRunnerImpl.last_session_id is None until first run.
 
@@ -663,7 +626,6 @@ async def test_codex_turn_streams_method_to_kind_and_closes_on_exhaustion(monkey
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_config=object(),
         approval_mode=object(),
         env=None,
     )
@@ -722,7 +684,6 @@ async def test_codex_turn_closes_codex_when_setup_raises(monkeypatch) -> None:
         await runner.turn(
             instructions="go",
             server_config=object(),
-            sandbox_config=object(),
             approval_mode=object(),
             env=None,
         )
@@ -763,7 +724,6 @@ async def test_codex_turn_double_close_is_idempotent(monkeypatch) -> None:
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_config=object(),
         approval_mode=object(),
         env=None,
     )
@@ -806,7 +766,6 @@ async def test_codex_runner_last_thread_id_fail_soft_when_id_missing(monkeypatch
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_config=object(),
         approval_mode=object(),
         env=None,
     )
@@ -903,7 +862,6 @@ async def test_codex_stderr_tees_to_run_log(monkeypatch, tmp_path) -> None:
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_config=object(),
         approval_mode=object(),
         env=None,
         run_log_path=run_log,
@@ -912,3 +870,99 @@ async def test_codex_stderr_tees_to_run_log(monkeypatch, tmp_path) -> None:
     runner._codex._client._sync._stderr_lines.append("boom")
     _ = [ev async for ev in session]
     assert "[codex-stderr] boom" in run_log.read_text()
+
+
+async def test_codex_thread_start_full_access_and_no_config(monkeypatch) -> None:
+    """Pin F-Inv 1 + F-Inv 2 — thread_start gets the typed full-access preset.
+
+    Design: §F5 item 4: the single thread_start call site passes
+        sandbox=Sandbox.full_access via the typed parameter, no config=
+        kwarg at all (the "full-access" vs "danger-full-access" namespace
+        trap, F-Inv 2), and deny_all approvals (F-Inv 3).
+    Implementation: monkeypatch AsyncCodex with a kwargs-capturing fake,
+        run one turn with approval_mode=never_approval_mode(), drain the
+        stream, and assert the captured kwargs identities.
+    Example: pytest tests/test_drivers_protocols.py -k full_access -v.
+    """
+    import pytest
+
+    pytest.importorskip("openai_codex")
+    import openai_codex
+    from openai_codex import ApprovalMode, Sandbox
+
+    from forge_mcp.drivers._codex import CodexRunnerImpl, never_approval_mode
+
+    captured: dict[str, Any] = {}
+    closes = [0]
+    handle = _FakeTurnHandle([_Ev("turn/completed", {})])
+    thread = _FakeThread("thr_full", handle, {})
+
+    class _CapturingAsyncCodex(_FakeAsyncCodex):
+        """Fake AsyncCodex recording the kwargs thread_start receives.
+
+        Design: §F5 item 4 needs the exact kwargs the seam passed; the base
+            fake discards them.
+        Implementation: stash kwargs into the shared dict, then delegate.
+        Example: await _CapturingAsyncCodex(...).thread_start(sandbox=s).
+        """
+
+        async def thread_start(self, **kwargs: Any) -> Any:
+            """Record kwargs and return the configured fake thread.
+
+            Design: capture must not alter fake thread_start behavior.
+            Implementation: update the captured dict and call super().
+            Example: thread = await codex.thread_start(sandbox=s).
+            """
+            captured.update(kwargs)
+            return await super().thread_start(**kwargs)
+
+    def factory(*, config, **kwargs):
+        """Return the capturing fake AsyncCodex.
+
+        Design: production constructs AsyncCodex(config=server_config).
+        Implementation: ignore extra kwargs and build the capturing fake.
+        Example: factory(config=object()).
+        """
+        return _CapturingAsyncCodex(config=config, thread=thread, closes=closes)
+
+    monkeypatch.setattr(openai_codex, "AsyncCodex", factory)
+
+    runner = CodexRunnerImpl()
+    session = await runner.turn(
+        instructions="go",
+        server_config=object(),
+        approval_mode=never_approval_mode(),
+        env=None,
+    )
+    async for _ in session:
+        pass
+    assert captured["sandbox"] is Sandbox.full_access
+    assert "config" not in captured
+    assert captured["approval_mode"] is ApprovalMode.deny_all
+
+
+def test_src_carries_no_sandbox_or_network_knob_strings() -> None:
+    """Pin F-Inv 1 structurally — forbidden sandbox strings absent from src.
+
+    Design: §F5 item 5 grep guard in the repo's §15-guard tradition: no file
+        under src/forge_mcp/ may contain workspace-write, workspace_write,
+        sandbox_config_for, or network_access; full access is the only
+        generator posture and the knob must not quietly return.
+    Implementation: walk the installed package root (src layout) and scan
+        every .py/.md file's text for each forbidden substring.
+    Example: pytest tests/test_drivers_protocols.py -k knob_strings -v.
+    """
+    from pathlib import Path
+
+    import forge_mcp
+
+    root = Path(forge_mcp.__file__).parent
+    forbidden = ("workspace-write", "workspace_write", "sandbox_config_for", "network_access")
+    offenders = [
+        f"{path.relative_to(root)}: {needle}"
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and path.suffix in {".py", ".md"}
+        for needle in forbidden
+        if needle in path.read_text()
+    ]
+    assert offenders == []

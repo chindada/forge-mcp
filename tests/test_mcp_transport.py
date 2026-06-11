@@ -298,7 +298,7 @@ async def test_cancel_task_mid_run_marks_task_cancelled(tmp_path, monkeypatch) -
 
         last_session_id = None
 
-        async def implement(self, ctx, *, codex_bin, status_cb, env=None, network_access=True):
+        async def implement(self, ctx, *, codex_bin, status_cb, env=None):
             """Sleep long enough for the cancel to land.
 
             Design: tests rely on a deterministic mid-run pause point.
