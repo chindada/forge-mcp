@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 
@@ -966,3 +966,463 @@ def test_src_carries_no_sandbox_or_network_knob_strings() -> None:
         if needle in path.read_text()
     ]
     assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# §G4.1 — prune_offcwd_write_copies helper unit pins (artifact containment).
+# ---------------------------------------------------------------------------
+
+_PRUNE_CONTENT = "# recovered artifact body\nline two\n"
+
+
+class _PruneBlock:
+    """Stand-in Write tool_use block exposing .name and .input (§G4.1).
+
+    Design: §G2 iterates blocks exactly like collect_writes_to_basename, so
+        tests need only .name and .input attributes.
+    Implementation: plain attributes set in __init__.
+    Example: _PruneBlock('/tmp/plan.md', 'body').name == 'Write'.
+    """
+
+    def __init__(self, file_path, content=_PRUNE_CONTENT, name="Write"):
+        """Store the scripted block fields.
+
+        Design: §G4.1 needs malformed inputs too, so file_path may be None.
+        Implementation: build the input dict, omitting file_path when None.
+        Example: _PruneBlock(None).input == {'content': _PRUNE_CONTENT}.
+        """
+        self.name = name
+        self.input: dict[str, Any] = {"content": content}
+        if file_path is not None:
+            self.input["file_path"] = file_path
+
+
+class _PruneMsg:
+    """Stand-in message exposing a .content block list (§G4.1).
+
+    Design: §G2 reads getattr(msg, 'content', None) or [] like the sibling.
+    Implementation: assign the provided block list to .content.
+    Example: _PruneMsg([_PruneBlock('p')]).content[0].name == 'Write'.
+    """
+
+    def __init__(self, blocks):
+        """Store the scripted block list.
+
+        Design: each test hand-builds exactly the blocks it needs.
+        Implementation: assign verbatim.
+        Example: _PruneMsg([]).content == [].
+        """
+        self.content = blocks
+
+
+def _prune_setup(tmp_path):
+    """Build a target_dir + canonical plan.md layout for prune tests (§G4.1).
+
+    Design: tests mirror §13: canonical artifact under
+        <target>/.harness/<run-id>/plan/plan.md.
+    Implementation: mkdir the plan dir, write the canonical file with
+        _PRUNE_CONTENT, return (target, canonical).
+    Example: target, canonical = _prune_setup(tmp_path).
+    """
+
+    target = tmp_path / "target"
+    plan_dir = target / ".harness" / "rid00001" / "plan"
+    plan_dir.mkdir(parents=True)
+    canonical = plan_dir / "plan.md"
+    canonical.write_text(_PRUNE_CONTENT)
+    return target, canonical
+
+
+def test_prune_deletes_offcwd_copy_inside_target_dir(tmp_path) -> None:
+    """Pin §G2 — gated leak inside target_dir is pruned; canonical survives.
+
+    Design: G-Inv 1 — after recovery no authored file remains under
+        target_dir outside .harness/.
+    Implementation: physical copy at <target>/plan.md with matching content;
+        assert unlink, return value, and canonical untouched.
+    Example: pytest tests/test_drivers_protocols.py -k deletes_offcwd -v.
+    """
+    import os
+
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    leak = target / "plan.md"
+    leak.write_text(_PRUNE_CONTENT)
+    msgs = [_PruneMsg([_PruneBlock(str(leak))])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert removed == [os.path.abspath(leak)]
+    assert not leak.exists()
+    assert canonical.read_text() == _PRUNE_CONTENT
+
+
+def test_prune_resolves_relative_path_against_canonical_parent(tmp_path) -> None:
+    """Pin §G2 — relative file_path joins onto canonical_path.parent.
+
+    Design: §G2 forbids resolving against os.getcwd(); '../../../plan.md'
+        from <target>/.harness/<rid>/plan/ lands at <target>/plan.md.
+    Implementation: relative Write block; assert the target-root copy is gone.
+    Example: pytest tests/test_drivers_protocols.py -k relative_path -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    leak = target / "plan.md"
+    leak.write_text(_PRUNE_CONTENT)
+    msgs = [_PruneMsg([_PruneBlock("../../../plan.md")])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert len(removed) == 1
+    assert not leak.exists()
+
+
+def test_prune_spares_different_content(tmp_path) -> None:
+    """Pin G-Inv 2 — a same-basename file with different text survives.
+
+    Design: content-match is the single guard against deleting caller-owned
+        files; path-trust alone never deletes (G-Decision 2).
+    Implementation: leak file holds other text; assert untouched and [] back.
+    Example: pytest tests/test_drivers_protocols.py -k different_content -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    leak = target / "plan.md"
+    leak.write_text("a real, unrelated project file\n")
+    msgs = [_PruneMsg([_PruneBlock(str(leak))])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert removed == []
+    assert leak.read_text() == "a real, unrelated project file\n"
+
+
+def test_prune_spares_paths_outside_target_dir(tmp_path) -> None:
+    """Pin G-Decision 3 — strays outside target_dir are not the harness's.
+
+    Design: only copies inside the caller's workspace are the §13 leak;
+        external writes are left alone.
+    Implementation: matching-content copy in a sibling dir outside target;
+        assert untouched.
+    Example: pytest tests/test_drivers_protocols.py -k outside_target -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    stray = outside / "plan.md"
+    stray.write_text(_PRUNE_CONTENT)
+    msgs = [_PruneMsg([_PruneBlock(str(stray))])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert removed == []
+    assert stray.exists()
+
+
+def test_prune_never_deletes_canonical_path(tmp_path) -> None:
+    """Pin §G2 gate 1 — the just-rebuilt canonical file is never deleted.
+
+    Design: a Write block naming the canonical path itself must be skipped
+        even though basename and content both match.
+    Implementation: block file_path == canonical; assert survival and [].
+    Example: pytest tests/test_drivers_protocols.py -k never_deletes_canonical -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    msgs = [_PruneMsg([_PruneBlock(str(canonical))])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert removed == []
+    assert canonical.read_text() == _PRUNE_CONTENT
+
+
+def test_prune_skips_malformed_write_block(tmp_path) -> None:
+    """Pin §G2 — missing/None file_path is skipped, never KeyError/TypeError.
+
+    Design: mirrors collect_writes_to_basename's defensive accessors; the
+        gate-swallow does not cover these, so the accessors must.
+    Implementation: one block without file_path, one with file_path=None;
+        assert no exception and no deletion.
+    Example: pytest tests/test_drivers_protocols.py -k malformed -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    none_block = _PruneBlock(None)
+    none_block.input["file_path"] = None
+    msgs = [_PruneMsg([_PruneBlock(None), none_block])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert removed == []
+
+
+def test_prune_returns_empty_when_target_dir_none(tmp_path) -> None:
+    """Pin §G2 — target_dir=None returns [] with no filesystem access.
+
+    Design: the guard is the first statement; nothing is resolved or stat'd.
+    Implementation: a would-match leak exists on disk; with target_dir=None
+        it survives and [] is returned.
+    Example: pytest tests/test_drivers_protocols.py -k target_dir_none -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    leak = target / "plan.md"
+    leak.write_text(_PRUNE_CONTENT)
+    msgs = [_PruneMsg([_PruneBlock(str(leak))])]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=None
+    )
+
+    assert removed == []
+    assert leak.exists()
+
+
+def test_prune_dedupes_repeated_blocks_and_prunes_all_copies(tmp_path) -> None:
+    """Pin §G2 + G7.4 — duplicates de-duplicate; distinct copies all pruned.
+
+    Design: removed paths are collected in encounter order, de-duplicated by
+        resolved path; multiple distinct gated copies are all removed.
+    Implementation: two blocks naming the same leak plus one naming a second
+        leak in a subdir; assert both files gone and exactly two entries.
+    Example: pytest tests/test_drivers_protocols.py -k dedupes -v.
+    """
+    from forge_mcp.drivers._claude import prune_offcwd_write_copies
+
+    target, canonical = _prune_setup(tmp_path)
+    leak_a = target / "plan.md"
+    leak_a.write_text(_PRUNE_CONTENT)
+    sub = target / "docs"
+    sub.mkdir()
+    leak_b = sub / "plan.md"
+    leak_b.write_text(_PRUNE_CONTENT)
+    msgs = [
+        _PruneMsg([_PruneBlock(str(leak_a)), _PruneBlock(str(leak_a))]),
+        _PruneMsg([_PruneBlock(str(leak_b))]),
+    ]
+
+    removed = prune_offcwd_write_copies(
+        msgs, "plan.md", canonical_path=canonical, content=_PRUNE_CONTENT, target_dir=target
+    )
+
+    assert len(removed) == 2
+    assert not leak_a.exists() and not leak_b.exists()
+
+
+# ---------------------------------------------------------------------------
+# §G4.2 / §G4.3 — driver-level recovery + prune pins (planner & evaluator).
+# ---------------------------------------------------------------------------
+
+
+class _OffcwdRunner:
+    """ClaudeRunner double whose turn carries scripted Write blocks (§G4.2).
+
+    Design: recovery fires when the canonical file is absent after the turn;
+        the double never touches disk, so recovery + prune drive everything.
+    Implementation: run_with_messages returns a ClaudeTurn wrapping the
+        scripted message list; lifecycle methods are no-ops.
+    Example: PlannerDriver(_OffcwdRunner(msgs)).
+    """
+
+    def __init__(self, messages):
+        """Store the scripted turn messages.
+
+        Design: one fake == one Claude turn.
+        Implementation: assign list verbatim; last_session_id stays None.
+        Example: _OffcwdRunner([_PruneMsg([...])]).
+        """
+        self._messages = messages
+        self.last_session_id: str | None = None
+
+    async def run_with_messages(self, *, prompt, options, system, stop=None):
+        """Return the scripted ClaudeTurn.
+
+        Design: drivers reach the SDK only through this seam (§5.2).
+        Implementation: wrap stored messages in ClaudeTurn with empty text.
+        Example: turn = await runner.run_with_messages(prompt='p', options=o, system='s').
+        """
+        from forge_mcp.drivers._claude import ClaudeTurn, StructuredResult
+
+        _ = (prompt, options, system, stop)
+        return ClaudeTurn(
+            result=StructuredResult(structured=None, text=""), messages=self._messages
+        )
+
+    async def run(self, *, prompt, options, system):
+        """Satisfy the ClaudeRunner protocol; unused here.
+
+        Design: these tests exercise run_with_messages only.
+        Implementation: raise loudly on accidental use.
+        Example: never called by write_plan/write_remediation.
+        """
+        raise AssertionError("run() is not used in these tests")
+
+    async def interrupt(self) -> None:
+        """No-op interrupt for protocol compatibility.
+
+        Design: lifecycle is out of scope for prune pins.
+        Implementation: return None.
+        Example: await runner.interrupt().
+        """
+
+    async def aclose(self) -> None:
+        """No-op close for protocol compatibility.
+
+        Design: lifecycle is out of scope for prune pins.
+        Implementation: return None.
+        Example: await runner.aclose().
+        """
+
+    def terminate(self) -> None:
+        """No-op terminate for protocol compatibility.
+
+        Design: lifecycle is out of scope for prune pins.
+        Implementation: return None.
+        Example: runner.terminate().
+        """
+
+
+async def test_write_plan_recovery_prunes_offcwd_copy(tmp_path) -> None:
+    """Pin §G4.2 — planner recovery rebuilds plan.md and prunes the orphan.
+
+    Design: G-Decision 6 — the planner ctx has no target_dir; the containment
+        root is run_dir.parent.parent, which §13 makes exactly target_dir.
+    Implementation: physical leak at the temp target root; fake turn carries
+        the matching absolute Write; assert canonical present, leak gone, and
+        the descriptor extends the recovered prefix with the pruned suffix.
+    Example: pytest tests/test_drivers_protocols.py -k write_plan_recovery -v.
+    """
+    import pytest
+
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.drivers.planner import PlannerDriver
+    from forge_mcp.runcontext import RunContext
+
+    target = tmp_path
+    run_dir = target / ".harness" / "rid00001"
+    leak = target / "plan.md"
+    leak.write_text(_PRUNE_CONTENT)
+    msgs = [_PruneMsg([_PruneBlock(str(leak))])]
+    driver = PlannerDriver(cast(Any, _OffcwdRunner(msgs)))
+
+    descriptor = await driver.write_plan(RunContext(run_dir=run_dir))
+
+    assert (run_dir / "plan" / "plan.md").read_text() == _PRUNE_CONTENT
+    assert not leak.exists()
+    assert descriptor == ("recovered planner Write tool content for plan.md; pruned 1 off-cwd copy")
+
+
+async def test_write_plan_recovery_without_orphan_keeps_descriptor_text(tmp_path) -> None:
+    """Pin §G4.3 — recovery with no off-cwd copy keeps the original descriptor.
+
+    Design: the descriptor is extended, not replaced; the suffix appears only
+        when a copy was actually removed.
+    Implementation: the Write block names a path that does not exist on disk;
+        assert the canonical file is rebuilt and the descriptor is unchanged.
+    Example: pytest tests/test_drivers_protocols.py -k without_orphan -v.
+    """
+    import pytest
+
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.drivers.planner import PlannerDriver
+    from forge_mcp.runcontext import RunContext
+
+    target = tmp_path
+    run_dir = target / ".harness" / "rid00001"
+    msgs = [_PruneMsg([_PruneBlock(str(target / "plan.md"))])]
+    driver = PlannerDriver(cast(Any, _OffcwdRunner(msgs)))
+
+    descriptor = await driver.write_plan(RunContext(run_dir=run_dir))
+
+    assert (run_dir / "plan" / "plan.md").read_text() == _PRUNE_CONTENT
+    assert descriptor == "recovered planner Write tool content for plan.md"
+
+
+async def test_write_remediation_recovery_prunes_offcwd_copy(tmp_path) -> None:
+    """Pin §G4.2 + §G6.3 — remediation recovery prunes the target-root orphan.
+
+    Design: reproduces run 88c16115 under control: an absolute Write to the
+        target_dir root, byte-identical to the recovered contract.md; after
+        write_remediation, target_dir is clean apart from .harness/.
+    Implementation: leak at <tmp>/contract.md; ctx.target_dir set directly;
+        assert canonical iteration-2/contract.md, leak gone, suffixed
+        descriptor, and target_dir containing only .harness afterwards.
+    Example: pytest tests/test_drivers_protocols.py -k write_remediation_recovery -v.
+    """
+    import pytest
+
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.drivers.evaluator import EvaluatorDriver
+    from forge_mcp.models import EvalResult
+    from forge_mcp.runcontext import RunContext
+
+    target = tmp_path
+    run_dir = target / ".harness" / "rid00001"
+    run_dir.mkdir(parents=True)
+    leak = target / "contract.md"
+    leak.write_text(_PRUNE_CONTENT)
+    msgs = [_PruneMsg([_PruneBlock(str(leak))])]
+    driver = EvaluatorDriver(cast(Any, _OffcwdRunner(msgs)))
+    ctx = RunContext(run_dir=run_dir, target_dir=target, iteration_n=1)
+    eval_result = EvalResult(no_gaps=True, gaps=[], summary="ok")
+
+    descriptor = await driver.write_remediation(ctx, next_iteration_n=2, eval_result=eval_result)
+
+    assert (run_dir / "iteration-2" / "contract.md").read_text() == _PRUNE_CONTENT
+    assert not leak.exists()
+    assert descriptor == (
+        "recovered remediation Write tool content for contract.md; pruned 1 off-cwd copy"
+    )
+    assert [p.name for p in target.iterdir()] == [".harness"]
+
+
+async def test_write_remediation_recovery_without_orphan_keeps_descriptor_text(
+    tmp_path,
+) -> None:
+    """Pin §G4.3 — remediation descriptor unchanged when nothing was pruned.
+
+    Design: the suffix appears only when a copy was actually removed.
+    Implementation: Write block names a non-existent path; assert canonical
+        rebuilt and the original descriptor text returned verbatim.
+    Example: pytest tests/test_drivers_protocols.py -k remediation_recovery_without -v.
+    """
+    import pytest
+
+    pytest.importorskip("claude_agent_sdk")
+    from forge_mcp.drivers.evaluator import EvaluatorDriver
+    from forge_mcp.models import EvalResult
+    from forge_mcp.runcontext import RunContext
+
+    target = tmp_path
+    run_dir = target / ".harness" / "rid00001"
+    run_dir.mkdir(parents=True)
+    msgs = [_PruneMsg([_PruneBlock(str(target / "contract.md"))])]
+    driver = EvaluatorDriver(cast(Any, _OffcwdRunner(msgs)))
+    ctx = RunContext(run_dir=run_dir, target_dir=target, iteration_n=1)
+    eval_result = EvalResult(no_gaps=True, gaps=[], summary="ok")
+
+    descriptor = await driver.write_remediation(ctx, next_iteration_n=2, eval_result=eval_result)
+
+    assert (run_dir / "iteration-2" / "contract.md").read_text() == _PRUNE_CONTENT
+    assert descriptor == "recovered remediation Write tool content for contract.md"

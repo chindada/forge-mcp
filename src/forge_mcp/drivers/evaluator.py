@@ -21,6 +21,7 @@ from ._claude import (
     collect_writes_to_basename,
     git_deny_hooks,
     maybe_append_retry_suffix,
+    prune_offcwd_write_copies,
     truncate_for_warning,
 )
 
@@ -159,7 +160,8 @@ class EvaluatorDriver:
         Design: §9.2 transitions to iter_remediating before this call so a
             failure is attributed to remediation, not evaluation.
         Implementation: run Claude in the next iteration directory, optionally
-            prepend the §H3 pivot directive, and recover Write tool content.
+            prepend the §H3 pivot directive, recover Write tool content, and
+            prune content-identical off-cwd copies left inside target_dir (§G2).
         Example: await driver.write_remediation(ctx, next_iteration_n=2, eval_result=er).
         """
         next_dir = ctx.run_dir / f"iteration-{next_iteration_n}"
@@ -188,7 +190,17 @@ class EvaluatorDriver:
         if recovered is None:
             return None
         atomic_write_text(contract_path, recovered)
-        return truncate_for_warning("recovered remediation Write tool content for contract.md")
+        removed = prune_offcwd_write_copies(
+            turn.messages,
+            "contract.md",
+            canonical_path=contract_path,
+            content=recovered,
+            target_dir=ctx.target_dir,
+        )
+        msg = "recovered remediation Write tool content for contract.md"
+        if removed:
+            msg += f"; pruned {len(removed)} off-cwd copy"
+        return truncate_for_warning(msg)
 
 
 def _parse_and_validate(

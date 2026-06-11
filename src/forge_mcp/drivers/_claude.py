@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -284,6 +285,71 @@ def run_logger(run_dir: Path) -> logging.Logger:
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
+
+
+def prune_offcwd_write_copies(
+    messages: list[Any],
+    basename: str,
+    *,
+    canonical_path: Path,
+    content: str,
+    target_dir: Path | None,
+) -> list[str]:
+    """Delete content-identical off-cwd copies left by a recovered Write (§G2).
+
+    Design: §G completes §11.4 layer-2 — recovery rebuilt the canonical file
+        from the agent's Write content, but the misplaced physical copy would
+        leak past .harness/ into the caller's workspace (§13, G-Inv 1).
+        Deletion requires every gate: off-canonical, inside target_dir,
+        regular file, exact content match (G-Inv 2); errors are swallowed
+        per-candidate so the prune never fails the run (G-Inv 3).
+    Implementation: scan Write blocks exactly like collect_writes_to_basename,
+        resolve each file_path once via os.path.abspath (relative paths join
+        onto canonical_path.parent, the driver cwd — never os.getcwd();
+        abspath-not-realpath per G-Decision 4 / §13), then gate and unlink,
+        collecting removed paths in encounter order de-duplicated by resolved
+        path.
+    Example: prune_offcwd_write_copies(turn.messages, 'plan.md',
+        canonical_path=p, content=s, target_dir=t) == ['/abs/target/plan.md'].
+    """
+    if target_dir is None:
+        return []
+    canonical_abs = os.path.abspath(canonical_path)
+    root = Path(os.path.abspath(target_dir))
+    removed: list[str] = []
+    for msg in messages:
+        for block in getattr(msg, "content", None) or []:
+            if getattr(block, "name", None) != "Write":
+                continue
+            inp = getattr(block, "input", None) or {}
+            raw = str(inp.get("file_path") or "")
+            if Path(raw).name != basename:
+                continue
+            if os.path.isabs(raw):
+                resolved = os.path.abspath(raw)
+            else:
+                # §G2 — relative paths resolve against the driver cwd
+                # (canonical_path.parent), never the process os.getcwd().
+                resolved = os.path.abspath(canonical_path.parent / raw)
+            if resolved in removed:
+                continue  # §G2 — de-duplicate by resolved path.
+            if resolved == canonical_abs:
+                continue  # §G2 gate 1 — never delete the file recovery rebuilt.
+            if not Path(resolved).is_relative_to(root):
+                continue  # §G2 gate 2 — outside target_dir is not ours (G-Decision 3).
+            try:
+                candidate = Path(resolved)
+                if not candidate.is_file():
+                    continue  # §G2 gate 3 — regular file (symlinks followed; link removed).
+                if candidate.read_text() != content:
+                    continue  # §G2 gate 4 — content-match guard (G-Inv 2).
+                candidate.unlink()
+            except (OSError, ValueError):
+                # §G-Inv 3 — best-effort: swallow and continue to the next candidate
+                # (ValueError covers UnicodeDecodeError on a binary same-named file).
+                continue
+            removed.append(resolved)
+    return removed
 
 
 class ClaudeRunnerImpl:

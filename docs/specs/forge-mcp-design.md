@@ -719,7 +719,7 @@ Legacy defines these helpers in `drivers/generator.py` and the orchestrator impo
 
 `superpowers:writing-plans` defaults to saving at `docs/superpowers/plans/<date>-<feature>.md`; agents have historically followed that instead of cwd, landing `plan.md`/`contract.md` off-cwd and burning ~10 min before the post-condition fired. Two layers (both preserved):
 1. **Prevention** — the OVERRIDE block in `planner_system.md` / `evaluator_remediation.md` forbids absolute paths and the default location.
-2. **Recovery** — when cwd's `plan.md`/`contract.md` is missing, the driver buffers the full message stream and rescues the **last non-empty** `Write` tool_use whose basename matches (the agent's intent is in `input.content` regardless of where `file_path` pointed), rewrites it to the correct path, and returns a recovery descriptor `str` (capped via `truncate_for_warning`). The orchestrator surfaces it via `ledger.warnings` + `status.update(kind="warning")`.
+2. **Recovery** — when cwd's `plan.md`/`contract.md` is missing, the driver buffers the full message stream and rescues the **last non-empty** `Write` tool_use whose basename matches (the agent's intent is in `input.content` regardless of where `file_path` pointed), rewrites it to the correct path, and returns a recovery descriptor `str` (capped via `truncate_for_warning`). The orchestrator surfaces it via `ledger.warnings` + `status.update(kind="warning")`. Recovery then prunes any content-identical off-cwd copy the agent left inside `target_dir` (§G), so a disobeyed write cannot leak an artifact past `.harness/` (§13).
 
 ### 11.5 Result builder (`orchestrator/result.py`)
 

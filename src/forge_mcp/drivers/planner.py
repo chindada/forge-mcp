@@ -12,6 +12,7 @@ from ._claude import (
     build_options,
     collect_writes_to_basename,
     git_deny_hooks,
+    prune_offcwd_write_copies,
     truncate_for_warning,
 )
 
@@ -52,8 +53,9 @@ class PlannerDriver:
 
         Design: §9.1 uses a fresh Claude session; off-cwd-write recovery returns
             a descriptor surfaced as a ledger warning.
-        Implementation: load planner_system.md, run Claude in plan cwd, and
-            recover the last Write tool_use targeting plan.md if missing.
+        Implementation: load planner_system.md, run Claude in plan cwd, recover
+            the last Write tool_use targeting plan.md if missing, and prune
+            content-identical off-cwd copies left inside target_dir (§G2).
         Example: await driver.write_plan(ctx).
         """
         plan_dir = ctx.run_dir / "plan"
@@ -76,4 +78,14 @@ class PlannerDriver:
         if recovered is None:
             return None
         atomic_write_text(plan_path, recovered)
-        return truncate_for_warning("recovered planner Write tool content for plan.md")
+        removed = prune_offcwd_write_copies(
+            turn.messages,
+            "plan.md",
+            canonical_path=plan_path,
+            content=recovered,
+            target_dir=ctx.run_dir.parent.parent,
+        )
+        msg = "recovered planner Write tool content for plan.md"
+        if removed:
+            msg += f"; pruned {len(removed)} off-cwd copy"
+        return truncate_for_warning(msg)

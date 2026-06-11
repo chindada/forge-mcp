@@ -134,6 +134,20 @@ schema-pin tests **shift for this brief** — the only brief to change the
 `network_access` property and the pins update to the new verbatim
 shape; `RunResult.model_json_schema()` is untouched.
 
+A tenth companion normative brief, the **artifact containment** doc
+(`docs/specs/forge-mcp-artifact-containment.md`), completes the §11.4
+layer-2 off-cwd-write recovery so it also prunes the content-identical
+off-cwd copy a disobedient agent left inside `target_dir`, enforcing
+§13 containment, in its own `§G*`, `G-Invariant N`, and `G-Decision N`
+namespaces (cite as e.g. `# §G2 prune off-cwd copies`, `# §G-Inv 2
+content-match gate`). It completes §11.4 layer-2 and supersedes
+nothing: the base doc still wins on anything it specifies, and the
+nine prior briefs each still win in their own namespaces. The §18
+schema-pin tests continue to derive from
+`RunForgeInput.model_json_schema()` /
+`RunResult.model_json_schema()` — **no shift for this brief**:
+`RunForgeInput` / `RunResult` are untouched (G-Decision 5).
+
 The repository implements the §5 layout: `src/forge_mcp/` (orchestrator + drivers + schemas + prompts), `tests/`, `scripts/ci.sh`, `pyproject.toml`, `uv.lock`. Keep this file in sync as the code evolves.
 
 ## What forge-mcp is
