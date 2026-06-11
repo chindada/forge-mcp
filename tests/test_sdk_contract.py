@@ -8,7 +8,6 @@ slow e2e. Every test is importorskip-guarded.
 from __future__ import annotations
 
 import inspect
-from typing import Any, cast
 
 import pytest
 
@@ -116,10 +115,12 @@ def test_claude_transport_symbols_importable() -> None:
 
 
 def test_app_server_config_codex_bin_roundtrips() -> None:
-    """Pin: AppServerConfig(codex_bin=...) round-trips .codex_bin (A5).
+    """Pin: CodexConfig(codex_bin=...) round-trips .codex_bin/.cwd (A5).
 
     Design: the field is codex_bin, not executable; a rename breaks A5.
-    Implementation: build via the seam helper and read .codex_bin back.
+        openai-codex 0.132 renamed AppServerConfig → CodexConfig with the same
+        codex_bin/cwd kwargs, which the seam helper now builds.
+    Implementation: build via the seam helper and read .codex_bin/.cwd back.
     Example: pytest tests/test_sdk_contract.py -k codex_bin -v.
     """
     pytest.importorskip("openai_codex")
@@ -146,9 +147,11 @@ def test_async_codex_accepts_single_config_param() -> None:
 
 
 def test_async_thread_turn_signature_has_sandbox_approval_cwd() -> None:
-    """Pin: AsyncThread.turn signature includes sandbox_policy/approval_mode/cwd (A6).
+    """Pin: AsyncThread.turn signature includes sandbox/approval_mode/cwd (A6).
 
-    Design: A6 calls thread.turn(input, cwd=..., sandbox_policy=..., approval_mode=...).
+    Design: openai-codex 0.132 retired the per-turn sandbox_policy union; the
+        seam now calls thread.turn(input, cwd=..., approval_mode=...) with the
+        coarse sandbox preset, so turn must still expose sandbox/approval_mode/cwd.
     Implementation: importorskip AsyncThread and inspect turn's parameters.
     Example: pytest tests/test_sdk_contract.py -k turn_signature -v.
     """
@@ -156,7 +159,7 @@ def test_async_thread_turn_signature_has_sandbox_approval_cwd() -> None:
     from openai_codex import AsyncThread
 
     params = inspect.signature(AsyncThread.turn).parameters
-    assert {"sandbox_policy", "approval_mode", "cwd"} <= set(params)
+    assert {"sandbox", "approval_mode", "cwd"} <= set(params)
 
 
 def test_text_input_is_constructable() -> None:
@@ -172,25 +175,28 @@ def test_text_input_is_constructable() -> None:
     assert TextInput(text="go").text == "go"
 
 
-def test_sandbox_policy_model_validate_roundtrips_network_access() -> None:
-    """Pin: SandboxPolicy.model_validate exposes .root.network_access (A6).
+def test_thread_start_carries_sandbox_workspace_write_overrides() -> None:
+    """Pin: thread_start exposes sandbox+config and the §H7 override keys exist (A6).
 
-    Design: A6 builds SandboxPolicy via model_validate and reads
-        policy.root.network_access.
-    Implementation: validate both flag values and assert the readback.
-    Example: pytest tests/test_sdk_contract.py -k network_access -v.
+    Design: openai-codex 0.132 moved writable_roots/network_access out of the
+        per-turn SandboxPolicy union into thread_start(config=...) overrides;
+        sandbox_config_for builds that dict. A drift in the param names or the
+        sandbox_workspace_write field names would silently drop the §H7 boundary,
+        so pin all three: the Sandbox preset, thread_start's sandbox/config
+        params, and SandboxWorkspaceWrite's writable_roots/network_access fields.
+    Implementation: inspect AsyncCodex.thread_start params and the
+        SandboxWorkspaceWrite model fields the override dict targets.
+    Example: pytest tests/test_sdk_contract.py -k sandbox_workspace_write -v.
     """
     pytest.importorskip("openai_codex")
-    from openai_codex.types import SandboxPolicy
+    from openai_codex import AsyncCodex, Sandbox
+    from openai_codex.generated.v2_all import SandboxWorkspaceWrite
 
-    off = SandboxPolicy.model_validate(
-        {"type": "workspaceWrite", "writableRoots": ["/a"], "networkAccess": False}
-    )
-    on = SandboxPolicy.model_validate(
-        {"type": "workspaceWrite", "writableRoots": ["/a"], "networkAccess": True}
-    )
-    assert cast(Any, off.root).network_access is False
-    assert cast(Any, on.root).network_access is True
+    assert Sandbox.workspace_write is not None
+    params = set(inspect.signature(AsyncCodex.thread_start).parameters)
+    assert {"sandbox", "config"} <= params
+    fields = set(SandboxWorkspaceWrite.model_fields)
+    assert {"writable_roots", "network_access"} <= fields
 
 
 def test_approval_mode_deny_all_exists() -> None:

@@ -8,7 +8,7 @@ from typing import Any
 
 from ..artifacts import atomic_write_text
 from ..runcontext import RunContext
-from ._codex import CodexRunner, build_app_server_config, never_approval_mode, sandbox_policy_for
+from ._codex import CodexRunner, build_app_server_config, never_approval_mode, sandbox_config_for
 
 _STATUS_EVENT_KINDS = {"command_execution", "function_call", "file_change", "web_search"}
 
@@ -73,7 +73,7 @@ class GeneratorDriver:
         session = await self._runner.turn(
             instructions=instructions,
             server_config=build_app_server_config(codex_bin=codex_bin, cwd=ctx.target_dir, env=env),
-            sandbox_policy=sandbox_policy_for(
+            sandbox_config=sandbox_config_for(
                 target_dir=ctx.target_dir,
                 iteration_dir=iteration_dir,
                 network_access=network_access,

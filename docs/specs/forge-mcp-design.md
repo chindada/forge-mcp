@@ -145,7 +145,7 @@ tests/
 pyproject.toml
 README.md
 CLAUDE.md  (+ AGENTS.md symlink/copy)
-uv.lock                   # committed — pins the openai-codex @main commit
+uv.lock                   # committed — pins the exact openai-codex wheel
 ```
 
 ### 5.2 Dependency graph (allowed edges; cycles forbidden)
@@ -831,7 +831,7 @@ requires-python = ">=3.11"
 dependencies = [
   "mcp[cli] >=1.12,<2",
   "claude-agent-sdk >=0.1.20,<1",  # earliest exposing setting_sources + tools preset + output_format — see §20 note 7
-  "openai-codex @ git+https://github.com/openai/codex.git@main#subdirectory=sdk/python",
+  "openai-codex >=0.1.0b2",         # published beta; reproducibility via committed uv.lock — see Decision 7, §19
   "pydantic >=2.7,<3",
   "typer >=0.12",
   "filelock >=3.13",
@@ -841,7 +841,7 @@ dependencies = [
 forge = "forge_mcp.cli:main"
 ```
 
-- **`openai-codex` tracks `@main` deliberately** — it is pre-release with no PyPI release (forge-mcp Decision 7, §19: track `main`, accept churn). **Do not pin a SHA in `pyproject.toml`.** Reproducibility comes from **committing `uv.lock`**, which pins the exact resolved commit. That is the best-practice way to depend on a pre-release git package: floating ref in `pyproject`, exact commit in the lockfile.
+- **`openai-codex` pins the published PyPI beta** (forge-mcp Decision 7, §19: floor specifier `>=0.1.0b2`, accept beta churn). The SDK now ships tagged beta releases (`0.1.0bN`, Sigstore-attested) bundling the same `openai-codex-cli-bin`; the historical `@main` git import is retired. **Do not re-introduce a git ref or pin a SHA in `pyproject.toml`.** Reproducibility comes from **committing `uv.lock`**, which pins the exact resolved wheel. Beta-to-beta API drift is caught by the SDK-contract drift tests (`tests/test_sdk_contract.py`), not by freezing the version.
 - Stack: `uv` (package mode) + hatchling; ruff (`E,F,I,B,UP,ASYNC`, line 100) + ruff-format + pyright (basic) for the gate. Prompts are shipped in the wheel via `[tool.hatch.build.targets.wheel.force-include]`. `pytest` + `pytest-asyncio` (`asyncio_mode=auto`).
 
 ---
@@ -867,7 +867,7 @@ forge = "forge_mcp.cli:main"
 | 4 | Fresh SDK session per phase; artifacts carry cross-phase context | The context-anxiety north star. |
 | 5 | No resume in v1; crash leaves forensic state | Keeps v1 lean. |
 | 6 | Single-process async FastMCP orchestrator + three driver seams | SDKs already isolate via subprocess. |
-| 7 | `openai-codex` pinned to `@main` (+ committed `uv.lock`) | Pre-release, no PyPI; lockfile gives reproducibility. |
+| 7 | `openai-codex` pinned to published PyPI beta `>=0.1.0b2` (+ committed `uv.lock`) | Beta now published (Sigstore-attested); lockfile gives reproducibility, contract tests catch drift. |
 | 8 | Skill availability via live SDK probe with runtime `setting_sources` | Tests the same load path the run will use. |
 | 9 | Generator git-mutation prevention: dual-layer (system-prompt + multi-ref post-iteration check); `approval_mode=deny_all`, workspace-write sandbox, `networkAccess=True` | HEAD alone misses branch/tag/worktree creation. |
 | 10 | Design-doc xor enforced by `model_validator` (not schema `oneOf`) | Anthropic rejects top-level combinators on tool input schemas. |

@@ -208,7 +208,8 @@ class _Ev:
 class _FakeThread:
     """AsyncThread double exposing .id and an awaitable .turn(...).
 
-    Design: A6 calls await thread.turn(input, cwd=, sandbox_policy=, approval_mode=).
+    Design: openai-codex 0.132 calls await thread.turn(input, cwd=, approval_mode=);
+        the sandbox preset/config are applied at thread_start, not on the turn.
     Implementation: store id; turn records kwargs and returns a handle.
     Example: thread = _FakeThread('thr_1', handle, recorder).
     """
@@ -224,16 +225,15 @@ class _FakeThread:
         self._handle = handle
         self._recorder = recorder
 
-    async def turn(self, input: Any, *, cwd=None, sandbox_policy=None, approval_mode=None, **k):
+    async def turn(self, input: Any, *, cwd=None, approval_mode=None, sandbox=None, **k):
         """Record turn args and return the configured handle.
 
-        Design: mirrors AsyncThread.turn's keyword-only policy args.
+        Design: mirrors openai-codex 0.132 AsyncThread.turn keyword-only args
+            (sandbox preset/config now live on thread_start).
         Implementation: update recorder with observed arguments.
         Example: await thread.turn(TextInput(text='go'), cwd='/repo').
         """
-        self._recorder.update(
-            input=input, cwd=cwd, sandbox_policy=sandbox_policy, approval_mode=approval_mode
-        )
+        self._recorder.update(input=input, cwd=cwd, approval_mode=approval_mode, sandbox=sandbox)
         return self._handle
 
 
@@ -365,38 +365,41 @@ def test_generator_implement_has_no_mcp_servers_param() -> None:
     assert "mcp_servers" not in inspect.signature(GeneratorDriver.implement).parameters
 
 
-def test_sandbox_policy_network_access_flip(tmp_path) -> None:
-    """Pin §H7 network_access flips the Codex SandboxPolicy RootModel flag.
+def test_sandbox_config_network_access_flip(tmp_path) -> None:
+    """Pin §H7 network_access flips the Codex thread sandbox_workspace_write override.
 
-    Design: §H7 makes network access a caller knob; A6 reads the real SDK flag
-        at policy.root.network_access.
-    Implementation: build policies with network_access False and True and read
-        policy.root.network_access precisely.
-    Example: sandbox_policy_for(..., network_access=False) disables network.
+    Design: §H7 makes network access a caller knob. openai-codex 0.132 retired
+        the per-turn SandboxPolicy union, so the flag now lives in the
+        thread_start(config=...) override at
+        sandbox_workspace_write.network_access, with the two writable roots.
+    Implementation: build the override dict with network_access False and True
+        and read the nested flag and writable_roots precisely.
+    Example: sandbox_config_for(..., network_access=False) disables network.
     """
-    import pytest
+    from forge_mcp.drivers._codex import sandbox_config_for
 
-    pytest.importorskip("openai_codex")
-    from forge_mcp.drivers._codex import sandbox_policy_for
+    def _net(cfg: dict) -> bool:
+        """Read the network-access flag off the override dict.
 
-    def _net(policy) -> bool:
-        """Read the network-access flag off the SandboxPolicy RootModel.
-
-        Design: A6 builds SandboxPolicy via model_validate; the flag reads at
-            policy.root.network_access.
-        Implementation: read policy.root.network_access.
-        Example: _net(policy) is False for a network-disabled policy.
+        Design: §H7 flag lives at sandbox_workspace_write.network_access.
+        Implementation: index the nested override dict.
+        Example: _net(cfg) is False for a network-disabled config.
         """
-        return bool(policy.root.network_access)
+        return bool(cfg["sandbox_workspace_write"]["network_access"])
 
-    off = sandbox_policy_for(
+    off = sandbox_config_for(
         target_dir=tmp_path, iteration_dir=tmp_path / "iter", network_access=False
     )
-    on = sandbox_policy_for(
+    on = sandbox_config_for(
         target_dir=tmp_path, iteration_dir=tmp_path / "iter", network_access=True
     )
     assert _net(off) is False
     assert _net(on) is True
+    assert off["sandbox_workspace_write"]["writable_roots"] == [
+        str(tmp_path),
+        str(tmp_path / "iter"),
+    ]
+    assert off["sandbox_mode"] == "workspace-write"
 
 
 async def test_claude_runner_last_session_id_none_before_first_call(monkeypatch) -> None:
@@ -660,7 +663,7 @@ async def test_codex_turn_streams_method_to_kind_and_closes_on_exhaustion(monkey
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_policy=object(),
+        sandbox_config=object(),
         approval_mode=object(),
         env=None,
     )
@@ -719,7 +722,7 @@ async def test_codex_turn_closes_codex_when_setup_raises(monkeypatch) -> None:
         await runner.turn(
             instructions="go",
             server_config=object(),
-            sandbox_policy=object(),
+            sandbox_config=object(),
             approval_mode=object(),
             env=None,
         )
@@ -760,7 +763,7 @@ async def test_codex_turn_double_close_is_idempotent(monkeypatch) -> None:
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_policy=object(),
+        sandbox_config=object(),
         approval_mode=object(),
         env=None,
     )
@@ -803,7 +806,7 @@ async def test_codex_runner_last_thread_id_fail_soft_when_id_missing(monkeypatch
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_policy=object(),
+        sandbox_config=object(),
         approval_mode=object(),
         env=None,
     )
@@ -900,7 +903,7 @@ async def test_codex_stderr_tees_to_run_log(monkeypatch, tmp_path) -> None:
     session = await runner.turn(
         instructions="go",
         server_config=object(),
-        sandbox_policy=object(),
+        sandbox_config=object(),
         approval_mode=object(),
         env=None,
         run_log_path=run_log,

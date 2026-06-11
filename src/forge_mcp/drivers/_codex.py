@@ -61,7 +61,7 @@ class CodexRunner(Protocol):
         *,
         instructions: str,
         server_config: Any,
-        sandbox_policy: Any,
+        sandbox_config: Any,
         approval_mode: Any,
         env: dict | None,
         run_log_path: Path | None = None,
@@ -72,36 +72,40 @@ class CodexRunner(Protocol):
 
 
 def build_app_server_config(*, codex_bin: str, cwd: Path, env: dict | None = None) -> Any:
-    """Construct the Codex app-server config without MCP servers (§10.2).
+    """Construct the Codex launch config without MCP servers (§10.2).
 
     Design: §15 removes MCP server attachments; A5 uses the real `codex_bin`
-        field name instead of the stale executable kwarg.
-    Implementation: lazily import AppServerConfig and pass codex_bin/cwd/env.
+        field name instead of the stale executable kwarg. openai-codex 0.132
+        renamed AppServerConfig → CodexConfig, keeping the same
+        codex_bin/cwd/env constructor kwargs.
+    Implementation: lazily import CodexConfig and pass codex_bin/cwd/env.
     Example: build_app_server_config(codex_bin='codex', cwd=Path('/repo')).
     """
-    from openai_codex import AppServerConfig  # type: ignore
+    from openai_codex import CodexConfig  # type: ignore
 
-    return AppServerConfig(codex_bin=codex_bin, cwd=str(cwd), env=env or {})
+    return CodexConfig(codex_bin=codex_bin, cwd=str(cwd), env=env or {})
 
 
-def sandbox_policy_for(*, target_dir: Path, iteration_dir: Path, network_access: bool) -> Any:
-    """Return a workspace-write sandbox with network toggle (§H7).
+def sandbox_config_for(*, target_dir: Path, iteration_dir: Path, network_access: bool) -> dict:
+    """Return the workspace-write thread config overrides with a network toggle (§H7).
 
     Design: §H7 makes network access a convenience knob, not a security
-        boundary; A6 builds the real tagged-union RootModel.
-    Implementation: lazily import SandboxPolicy and model_validate the
-        workspaceWrite payload with networkAccess.
-    Example: sandbox_policy_for(target_dir=t, iteration_dir=i, network_access=False).
+        boundary. openai-codex 0.132 retired the per-turn SandboxPolicy
+        tagged-union; the public `sandbox` arg now carries only the coarse
+        Sandbox preset, so the detailed writable roots and network flag travel
+        as a `sandbox_workspace_write` override on thread_start(config=...).
+    Implementation: build the dict[str, Any] config overrides consumed by
+        thread_start — sandbox_mode plus sandbox_workspace_write with the two
+        writable roots and the network flag (snake_case wire keys, no aliases).
+    Example: sandbox_config_for(target_dir=t, iteration_dir=i, network_access=False).
     """
-    from openai_codex.types import SandboxPolicy  # type: ignore
-
-    return SandboxPolicy.model_validate(
-        {
-            "type": "workspaceWrite",
-            "writableRoots": [str(target_dir), str(iteration_dir)],
-            "networkAccess": network_access,
-        }
-    )
+    return {
+        "sandbox_mode": "workspace-write",
+        "sandbox_workspace_write": {
+            "writable_roots": [str(target_dir), str(iteration_dir)],
+            "network_access": network_access,
+        },
+    }
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -270,32 +274,42 @@ class CodexRunnerImpl:
         *,
         instructions: str,
         server_config: Any,
-        sandbox_policy: Any,
+        sandbox_config: Any,
         approval_mode: Any,
         env: dict | None,
         run_log_path: Path | None = None,
     ) -> CodexSession:
-        """Spawn one Codex turn under the supplied policy.
+        """Spawn one Codex turn under the supplied sandbox config.
 
-        Design: §10.2 generator runs one Codex turn per iteration; A6 uses the
-            real surface AsyncCodex(config=...), thread_start(), thread.turn().
-        Implementation: open AsyncCodex, start a thread and turn, then return a
-            stream wrapper that closes the codex on exhaustion.
+        Design: §10.2 generator runs one Codex turn per iteration. openai-codex
+            0.132 carries the coarse sandbox preset via the Sandbox enum and the
+            §H7 writable-roots/network policy via thread_start(config=...); the
+            per-turn SandboxPolicy union of 0.131 is gone, so the detailed config
+            is applied at thread start, not on the turn.
+        Implementation: open AsyncCodex(config=...), thread_start with the
+            workspace-write preset + sandbox_config overrides + approval mode,
+            run one turn, and return a stream wrapper that closes on exhaustion.
         Example: session = await runner.turn(instructions='go', ...).
         """
-        from openai_codex import AsyncCodex, TextInput  # type: ignore
+        from openai_codex import AsyncCodex, Sandbox, TextInput  # type: ignore
 
         _ = env
         self._closed = False
         codex = AsyncCodex(config=server_config)
         self._install_stderr_tee(codex, run_log_path)
         await codex.__aenter__()
+        cwd = getattr(server_config, "cwd", None)
         try:
-            self._thread = await codex.thread_start()
-            handle = await self._thread.turn(
+            thread = await codex.thread_start(
+                sandbox=Sandbox.workspace_write,
+                approval_mode=approval_mode,
+                cwd=cwd,
+                config=sandbox_config,
+            )
+            self._thread = thread
+            handle = await thread.turn(
                 TextInput(text=instructions),
-                cwd=getattr(server_config, "cwd", None),
-                sandbox_policy=sandbox_policy,
+                cwd=cwd,
                 approval_mode=approval_mode,
             )
         except BaseException:

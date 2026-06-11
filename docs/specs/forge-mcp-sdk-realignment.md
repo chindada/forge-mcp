@@ -33,6 +33,13 @@ via committed `uv.lock` per Decision 7):
 - `claude-agent-sdk` **0.2.85**
 - `openai-codex` **0.131.0a4**
 
+> **Superseded (2026-06-01):** the `openai-codex` `@main` git pin described
+> here was later retired in favor of the published PyPI beta
+> (`>=0.1.0b2`); see the updated Decision 7 / §19 in the base design doc.
+> This brief's SDK-shape facts and drift-detection layer
+> (`tests/test_sdk_contract.py`) still hold — the contract tests pass
+> unchanged against the published beta.
+
 ---
 
 ## 2. Verified SDK facts (the executor must not re-derive these)

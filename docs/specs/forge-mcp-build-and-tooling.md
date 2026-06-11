@@ -278,9 +278,9 @@ the venv. This matches `README.md`'s documented dev-setup invocation
 dependency in `uv.lock` to its latest compatible version (verified
 against `/astral-sh/uv` docs at design time). `uv sync --all-extras`
 applies the new lockfile to `.venv` including dev extras. For the
-git-pinned `openai-codex @ git+…@main`, `uv lock --upgrade`
-re-resolves the `@main` reference to the latest commit on the branch
-— verified by the implementing agent during §M7 scenario 4.
+PyPI-pinned `openai-codex >=0.1.0b2`, `uv lock --upgrade`
+re-resolves to the latest compatible published beta within the
+floor — verified by the implementing agent during §M7 scenario 4.
 
 `M-Decision 2 (no uv self update in update):` `uv` itself is NOT
 auto-upgraded by `make update`. Tool-version pinning is a
@@ -636,8 +636,8 @@ These are catalogued so future PRs do not re-derive them:
    distribution) ships bash. The brief disclaims Windows support; a
    future BSD-only contributor can override `SHELL` locally.
 
-3. **`uv lock --upgrade` re-resolving `openai-codex@main` to a broken
-   commit.** Mitigation: `update` is contributor-initiated, not
+3. **`uv lock --upgrade` re-resolving `openai-codex` to a broken
+   published beta.** Mitigation: `update` is contributor-initiated, not
    CI-automatic. The contributor runs `make ci` (or `make test`)
    after `make update` and reverts the lockfile if upstream is
    broken. The brief deliberately does NOT chain `update -> test`:

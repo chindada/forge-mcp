@@ -223,7 +223,7 @@ Test markers: `slow` (one e2e against real `claude` + `codex`, excluded by defau
 
 CLI entry points: `forge serve` (stdio MCP server), `forge doctor` (environment subset of preflight + disk-space warn + resolved `CLAUDE_CONFIG_DIR` / `claude` CLI path / codex paths). Both call the same check functions as `prepare_run` — single source of truth (§14).
 
-Pre-release dep: `openai-codex` tracks `@main` (Decision 7, §19 — no PyPI release). Reproducibility comes from a **committed `uv.lock`**; do not pin a SHA in `pyproject.toml`.
+Pre-release dep: `openai-codex` pins the published PyPI beta `>=0.1.0b2` (Decision 7, §19 — the SDK now ships tagged betas; the old `@main` git import is retired). Reproducibility comes from a **committed `uv.lock`**; do not re-introduce a git ref or pin a SHA in `pyproject.toml`. Beta-to-beta drift is caught by `tests/test_sdk_contract.py`.
 
 `claude-agent-sdk` floor is `>=0.1.20,<1` — earliest exposing `setting_sources`, the `tools` preset, and `output_format` (§20 note 7).
 

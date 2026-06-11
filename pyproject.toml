@@ -11,7 +11,7 @@ license = {text = "MIT"}
 dependencies = [
   "mcp[cli] >=1.12,<2",
   "claude-agent-sdk >=0.1.20,<1",
-  "openai-codex @ git+https://github.com/openai/codex.git@main#subdirectory=sdk/python",
+  "openai-codex >=0.1.0b2",
   "pydantic >=2.7,<3",
   "typer >=0.12",
   "filelock >=3.13",
