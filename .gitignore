@@ -43,8 +43,3 @@ Thumbs.db
 .superpowers/
 .mcp.json
 .uv-cache/
-
-# example
-examples/scratch-app/*
-!examples/scratch-app/.gitkeep
-
