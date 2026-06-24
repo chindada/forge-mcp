@@ -33,3 +33,18 @@ def test_generator_prompt_forbids_git_and_references_skill_by_capability():
     text = load_prompt("generator_system").lower()
     assert "git" in text and "commit" in text
     assert "skill tool" not in text  # Codex references skills by behavior, not a tool
+
+
+def test_claude_prompts_name_their_skill_capability():
+    """Design: §5.1/§5.3/§10.1-§10.2 the Claude stage prompts must name their skill
+        capability (the prompt-half of the "both halves" wiring), referenced by
+        capability so the literal id stays [verify-against-installed].
+    Implementation: assert the planner names the plan-writing capability and the
+        evaluator names the code-review capability.
+    Example: 'plan-writing capability' in planner_system; 'code-review capability'
+        in evaluator_system.
+    """
+    planner = load_prompt("planner_system").lower()
+    assert "plan-writing capability" in planner or "writing-plans skill" in planner
+    evaluator = load_prompt("evaluator_system").lower()
+    assert "code-review capability" in evaluator or "code-review skill" in evaluator

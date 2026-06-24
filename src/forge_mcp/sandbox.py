@@ -126,10 +126,13 @@ def capture_manifest(root: Path) -> Manifest:
         that detect_changes can perform a precise diff; symlinks to directories
         must be classified as symlink entries, not recursed as directories.
     Implementation: os.walk with followlinks=False so symlinked dirs are not
-        recursed; for each directory yielded by walk, check os.path.islink first
-        to classify symlinked dirs correctly; similarly check each file name in
-        the dirnames list that os.walk may have pruned but we catch via the
-        per-dir loop.  The root itself is not included in the manifest.
+        recursed. Record each walked directory (lstat -> dir entry) and each file
+        (stat -> file entry); any path that is a symlink -- whether it targets a
+        file or a directory -- is classified by os.path.islink and digested by its
+        target string. os.walk lists a symlink-to-directory in *dirnames* (never
+        re-yielding it as its own dirpath under followlinks=False), so it is
+        captured from dirnames before being pruned from the walk. The root itself
+        is not included in the manifest.
     Example: capture_manifest(Path("/sandbox")) returns {"pkg/a.py": Entry(...)}.
     """
     manifest: Manifest = {}
@@ -155,9 +158,18 @@ def capture_manifest(root: Path) -> Manifest:
                     mode=stat.S_IMODE(st.st_mode),
                 )
 
-        # Prune symlink-dirs from dirnames so os.walk won't descend into them;
-        # we already recorded them above and don't want to walk their contents.
-        dirnames[:] = [d for d in dirnames if not os.path.islink(dp / d)]
+        # A symlink-to-directory surfaces in *dirnames* (os.walk lists it) but,
+        # under followlinks=False, is never descended into nor re-yielded as its
+        # own dirpath -- so the os.path.islink(dp) branch above never sees it.
+        # Record each as a symlink entry here, then prune it so its contents are
+        # not walked (and so its target is never dereferenced).
+        symlink_dirs = [d for d in dirnames if os.path.islink(dp / d)]
+        for d in symlink_dirs:
+            lp = dp / d
+            rel = lp.relative_to(root).as_posix()
+            manifest[rel] = Entry(kind="symlink", digest=_digest_link(lp), mode=None)
+        pruned = set(symlink_dirs)
+        dirnames[:] = [d for d in dirnames if d not in pruned]
 
         # Record each file/symlink in this directory
         for name in filenames:

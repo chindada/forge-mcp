@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
+from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -159,17 +160,105 @@ class CodexRunner(Protocol):
 # ---------------------------------------------------------------------------
 
 
+class _StderrTeeDeque(deque):
+    """A bounded deque that mirrors each appended line into a run-log sink (§8.2).
+
+    Design: §8.2 forensic capture of Codex stderr. The SDK keeps its own bounded
+        in-memory buffer at ``codex._client._sync._stderr_lines``; swapping in this
+        subclass preserves that bounded behaviour (same ``maxlen``) while teeing
+        every appended line to ``run.log``. Fail-soft: a write error never disturbs
+        the turn.
+    Implementation: subclass ``deque`` so the SDK's append-and-evict semantics are
+        unchanged; override ``append``/``appendleft``/``extend`` to also write the
+        value (one line each) to an open text ``sink``, swallowing OSError/ValueError.
+        ``close()`` closes the sink idempotently.
+    Example: ``d = _StderrTeeDeque(maxlen=400, sink=fh); d.append("boom")`` buffers
+        and tees the line.
+    """
+
+    def __init__(self, iterable=(), maxlen: int | None = None, *, sink) -> None:
+        """Seed the deque (in-memory only) and remember the tee sink.
+
+        Design: §8.2 the swap must preserve any lines already buffered and the
+            original maxlen so the SDK's bounded buffer is unchanged.
+        Implementation: delegate to ``deque.__init__(iterable, maxlen)`` (which does
+            NOT tee the seed lines), then store the open sink for later appends.
+        Example: ``_StderrTeeDeque(existing, maxlen=400, sink=fh)``.
+        """
+        super().__init__(iterable, maxlen)
+        self._sink = sink
+
+    def _tee(self, value: object) -> None:
+        """Write one line for *value* to the sink, swallowing any I/O error.
+
+        Design: §8.2 forensic only — a closed/full/broken sink must never break
+            the Codex stream.
+        Implementation: write ``str(value)`` plus a newline and flush; ignore
+            OSError (I/O fault) and ValueError (sink already closed).
+        Example: ``self._tee("line")`` appends ``"line\\n"`` to run.log.
+        """
+        try:
+            self._sink.write(f"{value}\n")
+            self._sink.flush()
+        except (OSError, ValueError):
+            pass
+
+    def append(self, value: object) -> None:
+        """Tee *value* then append it to the bounded buffer.
+
+        Design: §8.2 the SDK appends stderr lines here; each must reach run.log.
+        Implementation: tee first, then ``deque.append`` (preserving maxlen evict).
+        Example: ``d.append("err")``.
+        """
+        self._tee(value)
+        super().append(value)
+
+    def appendleft(self, value: object) -> None:
+        """Tee *value* then left-append it to the bounded buffer.
+
+        Design: §8.2 cover the appendleft path symmetrically with append.
+        Implementation: tee first, then ``deque.appendleft``.
+        Example: ``d.appendleft("err")``.
+        """
+        self._tee(value)
+        super().appendleft(value)
+
+    def extend(self, values) -> None:
+        """Tee and append each value in *values* (per-item, preserving maxlen).
+
+        Design: §8.2 some SDK paths may batch-extend; tee every line.
+        Implementation: iterate and ``append`` each (which tees), rather than the
+            C-level batch extend.
+        Example: ``d.extend(["a", "b"])`` tees two lines.
+        """
+        for value in values:
+            self.append(value)
+
+    def close(self) -> None:
+        """Close the sink idempotently.
+
+        Design: §8.2 the run-log handle opened for the tee must be released when
+            the turn ends.
+        Implementation: close the sink, swallowing OSError (already closed).
+        Example: ``d.close()``.
+        """
+        try:
+            self._sink.close()
+        except OSError:
+            pass
+
+
 class CodexDriver:
     """Codex agent runner implementing the CodexRunner Protocol (§8.2).
 
-    Design: §8.2/D4 wraps AsyncCodex; installs a fail-soft stderr tee before
+    Design: §8.2 wraps AsyncCodex; installs a fail-soft stderr tee before
         __aenter__; starts a thread with full_access sandbox and deny_all
         approval mode; streams turn notifications as CodexEvents.
         Transient errors: ConnectionError | BrokenPipeError |
         TransportClosedError | is_retryable_error(exc).
         TimeoutError and CancelledError are ALWAYS re-raised (never transient).
     Implementation: lazy SDK imports inside generate(); stderr tee is
-        installed via _try_install_stderr_tee() which NEVER raises (D4);
+        installed via _try_install_stderr_tee() which NEVER raises (fail-soft);
         close is idempotent.
     Example: ``async for evt in driver.generate(instructions="hi", config=cfg): ...``.
     """
@@ -186,6 +275,7 @@ class CodexDriver:
         self._last_thread_id: str | None = None
         self._codex: object | None = None
         self._closed: bool = False
+        self._stderr_tee: _StderrTeeDeque | None = None
 
     @property
     def last_thread_id(self) -> str | None:
@@ -197,31 +287,46 @@ class CodexDriver:
         """
         return self._last_thread_id
 
-    def _try_install_stderr_tee(self, codex: object) -> None:
-        """Attach a warn-logging tee to the Codex stderr deque (§8.2/D4).
+    def _try_install_stderr_tee(self, codex: object, run_log_path: Path | None) -> None:
+        """Swap the Codex stderr deque for a run-log-teeing deque (§8.2), fail-soft.
 
-        Design: §8.2/D4 the tee lets operators see Codex stderr without
-            coupling hard to internal attribute paths that may change across
-            SDK versions; it MUST be fail-soft and never crash.
-        Implementation: navigates ``codex._client._sync._stderr_lines`` via
-            getattr chains; on any AttributeError emits a warning and returns
-            without installing the tee (degrade, never crash).
-        Example: if the attribute chain changes in a future SDK version,
-            generate() still works — just without stderr forwarding.
+        Design: §8.2 forensic stderr capture: replace the SDK's private bounded
+            deque at ``codex._client._sync._stderr_lines`` with a ``_StderrTeeDeque``
+            that mirrors each appended line into ``run.log`` while preserving the
+            SDK's bounded buffer. This is the single most drift-fragile attribute
+            chain in the seam, so it MUST degrade to no-tee (warn-and-continue) and
+            never crash.
+        Implementation: when ``run_log_path`` is None there is no sink, so skip.
+            Otherwise navigate ``_client._sync._stderr_lines``; only when it is a
+            ``deque`` open ``run.log`` in append mode and replace the attribute with a
+            ``_StderrTeeDeque`` carrying the SAME ``maxlen`` (seeded with the existing
+            lines, not re-teed). A missing/wrong-typed deque, or any AttributeError/
+            OSError, warns and leaves the SDK untouched. The installed tee is recorded
+            on ``self`` so ``_generate_impl`` can close its sink.
+        Example: ``_try_install_stderr_tee(codex, run_dir / "run.log")`` tees Codex
+            stderr; ``_try_install_stderr_tee(codex, None)`` is a no-op.
         """
+        self._stderr_tee = None
+        if run_log_path is None:
+            return
         try:
             client = getattr(codex, "_client", None)
             sync = getattr(client, "_sync", None)
-            stderr_lines = getattr(sync, "_stderr_lines", None)
-            if stderr_lines is None:
+            existing = getattr(sync, "_stderr_lines", None)
+            if sync is None or not isinstance(existing, deque):
                 warnings.warn(
                     "openai_codex: stderr deque not found at _client._sync._stderr_lines; "
-                    "stderr tee disabled (D4 fail-soft)",
+                    "stderr tee disabled (fail-soft)",
                     stacklevel=3,
                 )
-        except AttributeError:
+                return
+            sink = open(run_log_path, "a", encoding="utf-8")
+            tee = _StderrTeeDeque(existing, maxlen=existing.maxlen, sink=sink)
+            sync._stderr_lines = tee
+            self._stderr_tee = tee
+        except (AttributeError, OSError):
             warnings.warn(
-                "openai_codex: could not locate stderr deque; tee disabled (D4 fail-soft)",
+                "openai_codex: could not install stderr tee; disabled (fail-soft)",
                 stacklevel=3,
             )
 
@@ -270,7 +375,7 @@ class CodexDriver:
         from openai_codex import ApprovalMode, AsyncCodex, Sandbox, TextInput  # lazy import
 
         codex = AsyncCodex(config=config)
-        self._try_install_stderr_tee(codex)
+        self._try_install_stderr_tee(codex, run_log_path)
 
         try:
             async with codex as codex_ctx:
@@ -300,6 +405,9 @@ class CodexDriver:
                         await aclose()  # type: ignore[misc]  # runtime AsyncGenerator
         finally:
             self._codex = None
+            if self._stderr_tee is not None:
+                self._stderr_tee.close()
+                self._stderr_tee = None
 
     async def interrupt(self) -> None:
         """Best-effort interrupt of the current generate(); silently ignored if idle.

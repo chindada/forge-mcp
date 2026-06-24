@@ -85,9 +85,10 @@ async def probe_claude_skills(
     Example: ``await probe_claude_skills(runner=fake, required=("writing-plans",),
         deadline=30.0)`` returns [SkillProbe(label="writing-plans", status=...)]
     """
+    from forge_mcp.config import claude_bin  # lazy import (§10.4)
     from forge_mcp.drivers._claude import build_options  # lazy import
 
-    options = build_options(system="list skills only")
+    options = build_options(system="list skills only", cli_path=str(claude_bin()))
 
     try:
         async with asyncio.timeout(deadline):

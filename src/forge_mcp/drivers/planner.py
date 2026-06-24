@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forge_mcp.drivers._claude import ClaudeRunner, build_options, git_deny_hooks
+from forge_mcp.config import claude_bin
+from forge_mcp.drivers._claude import ClaudeRunner, build_options, git_deny_hooks, run_log_tee
 from forge_mcp.models import PlanSet
 from forge_mcp.prompts import load_prompt
 from forge_mcp.schemas import envelope
@@ -16,6 +17,7 @@ async def run_planner(
     spec_text: str,
     plan_schema: dict,
     cwd: Path,
+    run_log_path: Path | None = None,
 ) -> PlanSet:
     """Run the Planner stage and return a validated PlanSet (§5.1).
 
@@ -35,6 +37,8 @@ async def run_planner(
         output_format=envelope(plan_schema),
         hooks=git_deny_hooks(),
         cwd=str(cwd),
+        cli_path=str(claude_bin()),
+        stderr=run_log_tee(run_log_path) if run_log_path is not None else None,
     )
     result = await runner.run(prompt=spec_text, options=options)
     return PlanSet(**(result.structured_output or {}))

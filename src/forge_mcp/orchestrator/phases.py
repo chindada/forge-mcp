@@ -250,6 +250,7 @@ async def run_plan_loop(
                 contract_text=contract_text,
                 sandbox=sandbox,
                 surface=plan.surface,
+                run_log_path=layout.run_log,
             )
             light_replace(
                 layout.summary(plan.id, n), f"Iteration {n} generated for plan {plan.id}."
@@ -276,6 +277,7 @@ async def run_plan_loop(
                 sandbox=sandbox,
                 eval_schema=schemas["eval"],
                 cwd=sandbox,
+                run_log_path=layout.run_log,
             )
             write_json(layout.eval(plan.id, n), eval_result, durable=False)
 
@@ -290,6 +292,7 @@ async def run_plan_loop(
                     eval_result=eval_result,
                     triage_schema=schemas["triage"],
                     cwd=sandbox,
+                    run_log_path=layout.run_log,
                 )
                 write_json(layout.triage(plan.id, n), triage_result, durable=False)
                 triages = triage_result.triages

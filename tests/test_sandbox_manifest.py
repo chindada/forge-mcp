@@ -68,6 +68,35 @@ def test_detect_add_modify_delete_mode_typeflip(tmp_path: Path):
     )
 
 
+def test_symlink_to_directory_is_captured_and_detected(tmp_path: Path):
+    """Design: §7.2/§7.3 a symlink whose target is a directory is a symlink entry,
+        not recursed, and participates in add/modify/retarget/delete detection.
+    Implementation: os.walk lists symlink-dirs in dirnames; capture must record
+        them there. Build linkdir->realdir, snapshot, retarget, detect.
+    Example: linkdir captured as symlink; retarget reported as modified.
+    """
+    (tmp_path / "realdir").mkdir()
+    (tmp_path / "realdir" / "a.txt").write_text("a")
+    (tmp_path / "otherdir").mkdir()
+    os.symlink("realdir", tmp_path / "linkdir")  # symlink whose target is a dir
+
+    m = capture_manifest(tmp_path)
+    # The symlink-to-dir is a first-class symlink entry, never recursed as a dir.
+    assert m["linkdir"].kind == "symlink" and m["linkdir"].digest and m["linkdir"].mode is None
+    assert "linkdir/a.txt" not in m  # contents never walked through the link
+
+    base = capture_manifest(tmp_path)
+    (tmp_path / "linkdir").unlink()
+    os.symlink("otherdir", tmp_path / "linkdir")  # retarget
+    changes = {(c.path, c.kind, c.entry_kind) for c in detect_changes(tmp_path, base)}
+    assert ("linkdir", "modified", "symlink") in changes
+
+    # Deletion of a symlink-to-dir is detected too.
+    base2 = capture_manifest(tmp_path)
+    (tmp_path / "linkdir").unlink()
+    assert ("linkdir", "deleted") in {(c.path, c.kind) for c in detect_changes(tmp_path, base2)}
+
+
 def test_dangling_symlink_does_not_raise(tmp_path: Path):
     """Design: §7.2 symlink digest hashes the target string, never dereferenced.
     Implementation: a dangling link captures cleanly.

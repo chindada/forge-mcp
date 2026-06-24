@@ -15,6 +15,9 @@ from forge_mcp.schemas import envelope
 
 if TYPE_CHECKING:
     # Only imported at type-check time; not at runtime.
+    from collections.abc import Callable
+    from pathlib import Path
+
     from claude_agent_sdk import ClaudeAgentOptions
 
 
@@ -161,6 +164,34 @@ def build_options(
         kwargs["stderr"] = stderr
 
     return ClaudeAgentOptions(**kwargs)
+
+
+def run_log_tee(run_log_path: Path) -> Callable[[str], None]:
+    """Return a fail-soft callable that tees Claude CLI stderr into run.log (§8.1).
+
+    Design: §8.1 build_options' ``stderr`` is a Callable[[str],None] that tees the
+        Claude subprocess stderr to ``run.log`` for forensics; it must never break a
+        run, so write failures are swallowed.
+    Implementation: return a closure that opens run_log_path in append mode, writes
+        the chunk (newline-terminated), and ignores OSError. The per-call open keeps
+        the callable stateless so there is no handle to close.
+    Example: ``build_options(stderr=run_log_tee(run_dir / "run.log"), ...)``.
+    """
+
+    def _tee(chunk: str) -> None:
+        """Append one Claude stderr chunk to run.log, swallowing any I/O error.
+
+        Design: §8.1 forensic-only — a write fault must not disturb the run.
+        Implementation: open-append-close per chunk; newline-terminate; ignore OSError.
+        Example: ``_tee("traceback line")`` appends it to run.log.
+        """
+        try:
+            with open(run_log_path, "a", encoding="utf-8") as fh:
+                fh.write(chunk if chunk.endswith("\n") else f"{chunk}\n")
+        except OSError:
+            pass
+
+    return _tee
 
 
 # ---------------------------------------------------------------------------

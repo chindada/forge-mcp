@@ -288,6 +288,7 @@ class Orchestrator:
                 spec_text=layout.spec_md.read_text(),
                 plan_schema=PlanSet.model_json_schema(),
                 cwd=target_dir,
+                run_log_path=layout.run_log,
             )
             self._persist_planset(layout, planset)
             state.pending = {p.id for p in planset.plans}
@@ -716,6 +717,15 @@ class Orchestrator:
             for pid, r in state.reports.items()
             if r.terminal_state != "done"
         ]
+        # A DECLARED run-level verification that FAILED blocks completion (I6/§6.5):
+        # the merged tree is unverified, so the run is honestly incomplete even when
+        # every per-plan gate passed. An ABSENT command (run_verification_command is
+        # None, verify_note set) is the "passed-or-absent" case and does not block;
+        # `verified` then stays an honest False.
+        run_level_declared = planset.run_verification_command is not None
+        if run_level_declared and not run_verified and state.stop_reason is None:
+            state.stop_reason = "run-level verification failed"
+
         all_done = not state.pending and not non_completed and state.stop_reason is None
         verified = all_done and run_verified
 
@@ -727,6 +737,17 @@ class Orchestrator:
         else:
             status = "incomplete"
             summary = "Run finished incomplete; see unresolved_gaps."
+            # I7/§6.4: an incomplete run MUST carry a stop_reason. When the stop is
+            # driven solely by per-plan terminal outcomes (iteration cap, per-plan
+            # non-progress, or a per-plan failure) no run-level detector set one, so
+            # synthesize a run-level reason from the non-completed plans' own reasons.
+            if state.stop_reason is None:
+                reasons = sorted({r.failure_reason for r in non_completed if r.failure_reason})
+                state.stop_reason = (
+                    "; ".join(reasons)
+                    if reasons
+                    else f"{len(non_completed)} plan(s) did not complete"
+                )
 
         result = build_run_result(
             status=status,

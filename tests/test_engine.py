@@ -62,6 +62,181 @@ async def test_single_plan_run_completes_and_merges(tmp_path: Path):
     assert result.verified is False  # no run-level command declared -> honest False
 
 
+def _one_plan_planset(run_verification_command: str | None) -> dict:
+    """Build a one-plan planset writing out.txt with the given run-level command.
+
+    Design: §6.5/I6 the run-level gate tests need a single clean plan plus a
+        declared (passing/failing) or absent run-level verification command.
+    Implementation: return a planset dict with one backend plan (no per-plan
+        verify) and the supplied run_verification_command.
+    Example: _one_plan_planset('exit 1')['run_verification_command'] == 'exit 1'.
+    """
+    return {
+        "plans": [
+            {
+                "id": "p1",
+                "depends_on": [],
+                "surface": "backend",
+                "file_scope": ["**"],
+                "verification_command": None,
+                "body": "create out.txt",
+            }
+        ],
+        "run_verification_command": run_verification_command,
+    }
+
+
+@pytest.mark.driver
+async def test_run_level_verification_failure_blocks_completion(tmp_path: Path):
+    """Design: §6.5/I6 a DECLARED run-level verification that FAILS blocks
+        'completed' even when every per-plan gate passed; the run is honestly
+        'incomplete' with verified False and a stop_reason.
+    Implementation: a one-plan run whose plan completes (no_gaps) but whose declared
+        run_verification_command exits non-zero over the merged target_dir.
+    Example: status 'incomplete', verified False, stop_reason set.
+    """
+    target = tmp_path / "repo"
+    target.mkdir()
+    claude = FakeClaudeRunner(
+        [
+            structured(_one_plan_planset("exit 1")),
+            structured({"no_gaps": True, "summary": "ok", "gaps": []}),
+        ]
+    )
+    codex = FakeCodexRunner(
+        [CodexEvent(kind="turn.completed", payload={})],
+        on_generate=lambda sandbox: (Path(sandbox) / "out.txt").write_text("done"),
+    )
+
+    orch = Orchestrator()
+    result = await orch.run(
+        target_dir=target,
+        design_text="# design",
+        design_fingerprint="fp",
+        max_iterations=2,
+        max_runtime_minutes=600,
+        claude_runner=claude,
+        codex_runner=codex,
+        when=WHEN,
+    )
+    # Every plan completed, but the merged-tree gate failed -> honest non-completion.
+    assert result.status == "incomplete"
+    assert result.verified is False
+    assert result.stop_reason is not None
+
+
+@pytest.mark.driver
+async def test_run_level_verification_pass_sets_verified(tmp_path: Path):
+    """Design: §6.5/I6 a DECLARED run-level verification that PASSES over the merged
+        tree yields 'completed' with verified True.
+    Implementation: a one-plan run whose plan completes and whose declared
+        run_verification_command exits zero over target_dir.
+    Example: status 'completed', verified True.
+    """
+    target = tmp_path / "repo"
+    target.mkdir()
+    claude = FakeClaudeRunner(
+        [
+            structured(_one_plan_planset("exit 0")),
+            structured({"no_gaps": True, "summary": "ok", "gaps": []}),
+        ]
+    )
+    codex = FakeCodexRunner(
+        [CodexEvent(kind="turn.completed", payload={})],
+        on_generate=lambda sandbox: (Path(sandbox) / "out.txt").write_text("done"),
+    )
+
+    orch = Orchestrator()
+    result = await orch.run(
+        target_dir=target,
+        design_text="# design",
+        design_fingerprint="fp",
+        max_iterations=2,
+        max_runtime_minutes=600,
+        claude_runner=claude,
+        codex_runner=codex,
+        when=WHEN,
+    )
+    assert result.status == "completed"
+    assert result.verified is True
+
+
+@pytest.mark.driver
+async def test_incomplete_from_per_plan_cap_sets_stop_reason(tmp_path: Path):
+    """Design: §6.4/I7 an incomplete run driven solely by per-plan outcomes (here an
+        iteration-cap stop with an unresolved code-bug gap) MUST carry a run-level
+        stop_reason, not None.
+    Implementation: one plan, max_iterations=1; the eval finds a code-bug gap and
+        triage keeps it a code bug (not a design fault), so the plan hits its cap
+        'incomplete' and no run-level detector sets a stop_reason.
+    Example: status 'incomplete', stop_reason is not None, unresolved_gaps non-empty.
+    """
+    target = tmp_path / "repo"
+    target.mkdir()
+    planset = {
+        "plans": [
+            {
+                "id": "p1",
+                "depends_on": [],
+                "surface": "backend",
+                "file_scope": ["**"],
+                "verification_command": None,
+                "body": "implement thing",
+            }
+        ],
+        "run_verification_command": None,
+    }
+    gap_eval = {
+        "no_gaps": False,
+        "summary": "found a gap",
+        "gaps": [
+            {
+                "title": "missing thing",
+                "severity": "high",
+                "design_doc_section": "§X",
+                "current_state": "absent",
+                "expected_state": "present",
+                "suggested_fix": "add it",
+            }
+        ],
+    }
+    code_bug_triage = {
+        "triages": [
+            {
+                "gap_title": "missing thing",
+                "design_fault": False,
+                "fault_kind": None,
+                "cited_sections": [],
+                "explanation": "just a code bug",
+                "proposed_amendment": None,
+            }
+        ]
+    }
+    claude = FakeClaudeRunner(
+        [structured(planset), structured(gap_eval), structured(code_bug_triage)]
+    )
+    codex = FakeCodexRunner(
+        [CodexEvent(kind="turn.completed", payload={})],
+        on_generate=lambda sb: (Path(sb) / "out.txt").write_text("partial"),
+    )
+
+    orch = Orchestrator()
+    result = await orch.run(
+        target_dir=target,
+        design_text="# design",
+        design_fingerprint="fp",
+        max_iterations=1,
+        max_runtime_minutes=600,
+        claude_runner=claude,
+        codex_runner=codex,
+        when=WHEN,
+    )
+    # Driven only by the per-plan iteration cap, yet the run still reports WHY.
+    assert result.status == "incomplete"
+    assert result.stop_reason is not None
+    assert result.unresolved_gaps
+
+
 @pytest.mark.driver
 async def test_run_is_fresh_new_dir_each_call(tmp_path: Path):
     """Design: §6.6/I12 every call is a fresh timestamped run (no resume).

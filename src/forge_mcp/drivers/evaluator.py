@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forge_mcp.drivers._claude import ClaudeRunner, build_options, git_deny_hooks
+from forge_mcp.config import claude_bin
+from forge_mcp.drivers._claude import ClaudeRunner, build_options, git_deny_hooks, run_log_tee
 from forge_mcp.models import EvalResult, TriageResult
 from forge_mcp.prompts import load_prompt
 from forge_mcp.schemas import envelope
@@ -17,6 +18,7 @@ async def run_evaluator(
     sandbox: Path,
     eval_schema: dict,
     cwd: Path,
+    run_log_path: Path | None = None,
 ) -> EvalResult:
     """Run the Evaluator stage and return a validated EvalResult (§5.3).
 
@@ -36,6 +38,8 @@ async def run_evaluator(
         output_format=envelope(eval_schema),
         hooks=git_deny_hooks(),
         cwd=str(cwd),
+        cli_path=str(claude_bin()),
+        stderr=run_log_tee(run_log_path) if run_log_path is not None else None,
     )
     prompt = (
         f"## Frozen design spec\n\n{spec_text}\n\n"
@@ -54,6 +58,7 @@ async def run_triage(
     eval_result: EvalResult,
     triage_schema: dict,
     cwd: Path,
+    run_log_path: Path | None = None,
 ) -> TriageResult:
     """Run the Triage stage and return a validated TriageResult (§5.3).
 
@@ -73,6 +78,8 @@ async def run_triage(
         output_format=envelope(triage_schema),
         hooks=git_deny_hooks(),
         cwd=str(cwd),
+        cli_path=str(claude_bin()),
+        stderr=run_log_tee(run_log_path) if run_log_path is not None else None,
     )
     gaps_text = "\n".join(
         f"- {g.title} ({g.severity}): {g.current_state} → {g.expected_state}"
