@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forge-mcp"
+version = "0.1.0"
+description = "Stdio MCP server orchestrating a Planner -> Generator -> Evaluator loop"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "mcp[cli] >=1.12,<2",
+  "claude-agent-sdk >=0.1.20,<1",
+  "openai-codex >=0.1.0b2",
+  "pydantic >=2.7,<3",
+  "typer >=0.12",
+  "psutil >=5.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest >=8", "pytest-asyncio >=0.23", "ruff >=0.5", "pyright >=1.1.350"]
+
+[project.scripts]
+forge = "forge_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forge_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/forge_mcp/prompts" = "forge_mcp/prompts"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.pyright]
+include = ["src", "tests", "scripts"]
+typeCheckingMode = "basic"
+pythonVersion = "3.11"
+extraPaths = ["scripts"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+  "slow: real-CLI end-to-end (excluded by default)",
+  "mcp: FastMCP transport tests",
+  "driver: drivers exercised with mocked runners",
+]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
