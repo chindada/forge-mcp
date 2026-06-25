@@ -25,6 +25,110 @@ def _fake_codex_with_deque(maxlen: int = 400) -> types.SimpleNamespace:
     return types.SimpleNamespace(_client=types.SimpleNamespace(_sync=sync))
 
 
+class _RecordingThread:
+    """Fake Codex thread recording the turn() call and yielding no notifications.
+
+    Design: §5 the seam test must observe the sandbox/approval/config args the
+        driver passes to thread_start and turn() without the real SDK; this
+        double records them and returns an empty stream so _generate_impl runs
+        to completion.
+    Implementation: turn() stores its kwargs and returns a handle whose stream()
+        is an empty async generator; id is a constant.
+    Example: thread = _RecordingThread(); await thread.turn(...) sets turn_kwargs.
+    """
+
+    def __init__(self) -> None:
+        """Initialise with a stable id and empty recorded-kwargs slots.
+
+        Design: §5 the recorder must expose .id (read into last_thread_id) and
+            start with no recorded turn kwargs.
+        Implementation: set id to a constant and turn_kwargs to None.
+        Example: _RecordingThread().id == 'fake-thread'.
+        """
+        self.id = "fake-thread"
+        self.turn_kwargs: dict | None = None
+
+    async def turn(self, _text: object, **kwargs: object) -> object:
+        """Record the turn kwargs and return a handle over an empty stream.
+
+        Design: §5 the test asserts approval_mode on the turn; record it.
+        Implementation: store kwargs; return a handle whose stream() yields nothing.
+        Example: await thread.turn(TextInput(...), approval_mode=x) records x.
+        """
+        self.turn_kwargs = kwargs
+
+        async def _empty():
+            """Yield no notifications.
+
+            Design: §5 an empty turn stream lets _generate_impl finish cleanly.
+            Implementation: an async generator with a guarded yield never reached.
+            Example: ``async for _ in _empty(): ...`` iterates zero times.
+            """
+            if False:
+                yield None
+
+        return types.SimpleNamespace(stream=_empty)
+
+
+class _RecordingCodex:
+    """Fake AsyncCodex recording thread_start kwargs (§5 seam probe).
+
+    Design: §5 the test must capture the sandbox/approval/cwd/config the driver
+        passes to thread_start; this async-context double records them.
+    Implementation: __aenter__ returns self; thread_start stores kwargs and
+        returns a _RecordingThread; close is a no-op.
+    Example: codex = _RecordingCodex(); the driver records start_kwargs on it.
+    """
+
+    def __init__(self, *, config: object) -> None:
+        """Store the launch config and init empty recorded slots.
+
+        Design: §5 AsyncCodex is constructed with config=cfg; mirror that arg.
+        Implementation: keep config; set start_kwargs/thread to None.
+        Example: _RecordingCodex(config=cfg).config is cfg.
+        """
+        self.config = config
+        self.start_kwargs: dict | None = None
+        self.thread = _RecordingThread()
+
+    async def __aenter__(self) -> _RecordingCodex:
+        """Enter the async context returning self.
+
+        Design: §5 the driver does ``async with AsyncCodex(...) as ctx``.
+        Implementation: return self.
+        Example: ``async with _RecordingCodex(config=c) as ctx: ...``.
+        """
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        """Exit the async context as a no-op.
+
+        Design: §5 nothing to release in the double.
+        Implementation: return None.
+        Example: context exit is a no-op.
+        """
+        return None
+
+    async def thread_start(self, **kwargs: object) -> _RecordingThread:
+        """Record thread_start kwargs and return the recording thread.
+
+        Design: §5 the test asserts sandbox/approval_mode/config/cwd here.
+        Implementation: store kwargs; return the pre-built _RecordingThread.
+        Example: await codex.thread_start(sandbox=s) records s.
+        """
+        self.start_kwargs = kwargs
+        return self.thread
+
+    async def close(self) -> None:
+        """Close as a no-op.
+
+        Design: §5 aclose() delegates here; the double has nothing to free.
+        Implementation: return None.
+        Example: await codex.close() completes immediately.
+        """
+        return None
+
+
 def test_stderr_tee_installed_and_tees_to_run_log(tmp_path: Path):
     """Design: §8.2 the tee swaps the SDK's bounded deque for a teeing deque that
         mirrors each appended line into run.log while preserving maxlen.
@@ -102,3 +206,61 @@ def test_is_transient_classification():
     assert _codex.is_transient(TimeoutError()) is False
     assert _codex.is_transient(asyncio.CancelledError()) is False
     assert _codex.is_transient(OSError()) is False
+
+
+@pytest.mark.skipif(not codex_present, reason="openai-codex not installed")
+def test_thread_start_uses_workspace_write_and_network_config(monkeypatch, tmp_path: Path):
+    """Design: §5 the driver must start the Codex thread under workspace_write (NOT
+        full_access) with approval_mode=deny_all, the cwd None-guard, and the
+        inline network config enabling internet for workspace-write.
+    Implementation: monkeypatch AsyncCodex with a recording double, drive
+        _generate_impl to exhaustion, then assert the recorded thread_start and
+        turn kwargs carry Sandbox.workspace_write, ApprovalMode.deny_all,
+        config={'sandbox_workspace_write': {'network_access': True}}, and cwd=str(cwd).
+    Example: after the empty turn, start_kwargs['sandbox'] is Sandbox.workspace_write.
+    """
+    import openai_codex
+    from openai_codex import ApprovalMode, Sandbox
+
+    cfg = _codex.build_codex_config(codex_bin="codex", cwd=tmp_path)
+    captured: dict = {}
+
+    def _factory(*, config):
+        """Build and record the recording codex double.
+
+        Design: §5 capture the constructed double so the test can read its
+            recorded start/turn kwargs after the driver runs.
+        Implementation: construct _RecordingCodex(config=config), store it.
+        Example: _factory(config=cfg) returns a _RecordingCodex.
+        """
+        codex = _RecordingCodex(config=config)
+        captured["codex"] = codex
+        return codex
+
+    monkeypatch.setattr(openai_codex, "AsyncCodex", _factory)
+
+    driver = _codex.CodexDriver()
+
+    async def _drive() -> None:
+        """Consume the generator to exhaustion.
+
+        Design: §5 running the turn populates the recorded kwargs.
+        Implementation: async-for over _generate_impl, discarding events.
+        Example: ``await _drive()`` leaves captured['codex'] populated.
+        """
+        async for _ in driver._generate_impl(instructions="hi", config=cfg):
+            pass
+
+    asyncio.run(_drive())
+
+    codex = captured["codex"]
+    start = codex.start_kwargs
+    assert start is not None
+    assert start["sandbox"] is Sandbox.workspace_write
+    assert start["sandbox"] is not Sandbox.full_access
+    assert start["approval_mode"] is ApprovalMode.deny_all
+    assert start["config"] == {"sandbox_workspace_write": {"network_access": True}}
+    assert start["cwd"] == str(tmp_path)
+    assert codex.thread.turn_kwargs is not None
+    assert codex.thread.turn_kwargs["approval_mode"] is ApprovalMode.deny_all
+    assert codex.thread.turn_kwargs["cwd"] == str(tmp_path)

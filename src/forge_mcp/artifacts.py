@@ -11,11 +11,13 @@ from forge_mcp.state import durable_append, durable_replace, light_replace
 class RunLayout:
     """Single source of truth for every path under a forge-mcp run directory.
 
-    Design: §11 all file paths for a run are derived from a single root so no
-        caller hard-codes relative paths — downstream tasks import this class.
+    Design: §10 all file paths for a run are derived from a single root so no
+        caller hard-codes relative paths. With one plan per run the layout is
+        flat: plan.json/plan.md/plan_state.json and iteration-<n>/ live at the
+        run root (no plans/<id>/ nesting).
     Implementation: frozen dataclass with one field (root: Path); computed
-        properties return concrete Paths; class-method factory for_run wraps
-        construction.
+        properties return concrete Paths; iteration artifacts are keyed only on
+        n; class-method factory for_run wraps construction.
     Example: RunLayout.for_run(p).spec_md == p / 'spec.md'.
     """
 
@@ -25,20 +27,20 @@ class RunLayout:
     def for_run(cls, run_dir: Path) -> RunLayout:
         """Return a RunLayout rooted at run_dir.
 
-        Design: §11 callers construct layouts via this factory so the field
-            name stays an implementation detail.
+        Design: §10 callers construct layouts via this factory so the field name
+            stays an implementation detail.
         Implementation: construct and return a new frozen instance.
         Example: RunLayout.for_run(Path('/runs/abc')).root == Path('/runs/abc').
         """
         return cls(root=run_dir)
 
-    # ── top-level files ────────────────────────────────────────────────────
+    # ── top-level files ─────────────────────────────────────────
 
     @property
     def state_json(self) -> Path:
         """Return path to the run-level state file.
 
-        Design: §11 state.json is the durable orchestrator checkpoint.
+        Design: §10 state.json is the durable orchestrator checkpoint.
         Implementation: root / 'state.json'.
         Example: lay.state_json == run_dir / 'state.json'.
         """
@@ -48,29 +50,19 @@ class RunLayout:
     def run_log(self) -> Path:
         """Return path to the append-only run log.
 
-        Design: §11 run.log captures structured orchestrator events.
+        Design: §10 run.log captures structured orchestrator events.
         Implementation: root / 'run.log'.
         Example: lay.run_log == run_dir / 'run.log'.
         """
         return self.root / "run.log"
 
-    @property
-    def conflict_fingerprint(self) -> Path:
-        """Return path to the conflict-fingerprint JSON.
-
-        Design: §11 tracks git-conflict state to detect re-emergence.
-        Implementation: root / 'conflict_fingerprint.json'.
-        Example: lay.conflict_fingerprint.name == 'conflict_fingerprint.json'.
-        """
-        return self.root / "conflict_fingerprint.json"
-
-    # ── inputs/ ───────────────────────────────────────────────────────────
+    # ── inputs/ ────────────────────────────────────────────
 
     @property
     def inputs_dir(self) -> Path:
         """Return path to the inputs subdirectory.
 
-        Design: §11 immutable design inputs live under inputs/ to separate them
+        Design: §10 immutable design inputs live under inputs/ to separate them
             from orchestrator-owned artifacts.
         Implementation: root / 'inputs'.
         Example: lay.inputs_dir == run_dir / 'inputs'.
@@ -81,7 +73,7 @@ class RunLayout:
     def inputs_design(self) -> Path:
         """Return path to the immutable design document.
 
-        Design: §11 design.md is written once at init and never overwritten.
+        Design: §10 design.md is written once at init and never overwritten.
         Implementation: inputs_dir / 'design.md'.
         Example: lay.inputs_design.name == 'design.md'.
         """
@@ -91,19 +83,19 @@ class RunLayout:
     def design_fingerprint(self) -> Path:
         """Return path to the design fingerprint file.
 
-        Design: §11 stores the SHA-256 hex digest of design.md for integrity checks.
+        Design: §10 stores the SHA-256 hex digest of design.md for integrity checks.
         Implementation: inputs_dir / 'design.fingerprint'.
         Example: lay.design_fingerprint.name == 'design.fingerprint'.
         """
         return self.inputs_dir / "design.fingerprint"
 
-    # ── spec files ────────────────────────────────────────────────────────
+    # ── spec files ─────────────────────────────────────────
 
     @property
     def spec_md(self) -> Path:
         """Return path to the orchestrator-owned spec document.
 
-        Design: §11 spec.md evolves as amendments are accepted; distinct from
+        Design: §10 spec.md evolves as amendments are accepted; distinct from
             the immutable inputs/design.md.
         Implementation: root / 'spec.md'.
         Example: lay.spec_md == run_dir / 'spec.md'.
@@ -114,7 +106,7 @@ class RunLayout:
     def spec_amendments(self) -> Path:
         """Return path to the append-only spec amendments log.
 
-        Design: §11/I3 amendments are never replaced, only appended.
+        Design: §10/I3 amendments are never replaced, only appended.
         Implementation: root / 'spec_amendments.md'.
         Example: lay.spec_amendments.name == 'spec_amendments.md'.
         """
@@ -124,144 +116,111 @@ class RunLayout:
     def spec_fingerprint(self) -> Path:
         """Return path to the spec fingerprint file.
 
-        Design: §11 mirrors design_fingerprint for the evolving spec.md.
+        Design: §10 mirrors design_fingerprint for the evolving spec.md.
         Implementation: root / 'spec.fingerprint'.
         Example: lay.spec_fingerprint.name == 'spec.fingerprint'.
         """
         return self.root / "spec.fingerprint"
 
-    # ── planset ───────────────────────────────────────────────────────────
+    # ── plan (single, run-level) ──────────────────────────────
 
     @property
-    def planset_json(self) -> Path:
-        """Return path to the planset manifest JSON.
+    def plan_json(self) -> Path:
+        """Return path to the structured Plan JSON.
 
-        Design: §11 planset.json records all candidate plan IDs and metadata.
-        Implementation: root / 'planset.json'.
-        Example: lay.planset_json.name == 'planset.json'.
+        Design: §10 plan.json holds the single structured Plan (was planset.json).
+        Implementation: root / 'plan.json'.
+        Example: lay.plan_json.name == 'plan.json'.
         """
-        return self.root / "planset.json"
+        return self.root / "plan.json"
 
-    # ── per-plan files ────────────────────────────────────────────────────
+    @property
+    def plan_md(self) -> Path:
+        """Return path to the human-readable plan body document.
 
-    def plan_md(self, plan_id: str) -> Path:
-        """Return path to the human-readable plan document for plan_id.
-
-        Design: §11 plan-<id>.md lives at the run root alongside planset.json.
-        Implementation: root / f'plan-{plan_id}.md'.
-        Example: lay.plan_md('abc').name == 'plan-abc.md'.
+        Design: §10 plan.md holds the single plan's body (was plan-<id>.md);
+            with one plan there is no id to disambiguate.
+        Implementation: root / 'plan.md'.
+        Example: lay.plan_md.name == 'plan.md'.
         """
-        return self.root / f"plan-{plan_id}.md"
+        return self.root / "plan.md"
 
-    def plan_dir(self, plan_id: str) -> Path:
-        """Return path to the per-plan working directory for plan_id.
+    @property
+    def plan_state_json(self) -> Path:
+        """Return path to the single run-level plan state file.
 
-        Design: §11 plans/<id>/ holds sandbox, state, manifest, and iterations.
-        Implementation: root / 'plans' / plan_id.
-        Example: lay.plan_dir('abc') == run_dir / 'plans' / 'abc'.
+        Design: §10 plan_state.json is the plan-level PlanState checkpoint (was
+            plans/<id>/state.json), now flattened to the run root.
+        Implementation: root / 'plan_state.json'.
+        Example: lay.plan_state_json.name == 'plan_state.json'.
         """
-        return self.root / "plans" / plan_id
+        return self.root / "plan_state.json"
 
-    def plan_state(self, plan_id: str) -> Path:
-        """Return path to the per-plan state.json for plan_id.
+    # ── per-iteration files (keyed on n) ──────────────────────────
 
-        Design: §11 each plan tracks its own checkpoint separately from the run.
-        Implementation: plan_dir(plan_id) / 'state.json'.
-        Example: lay.plan_state('abc').name == 'state.json'.
+    def iteration_dir(self, n: int) -> Path:
+        """Return path to iteration directory n at the run root.
+
+        Design: §10 iterations are numbered subdirs directly under the run root
+            (no plans/<id>/ nesting); the dir name keeps the 'iteration-<n>' form.
+        Implementation: root / f'iteration-{n}'.
+        Example: lay.iteration_dir(3).name == 'iteration-3'.
         """
-        return self.plan_dir(plan_id) / "state.json"
+        return self.root / f"iteration-{n}"
 
-    def plan_manifest(self, plan_id: str) -> Path:
-        """Return path to the per-plan sandbox manifest for plan_id.
-
-        Design: §11 manifest.json records files written by the sandbox agent.
-        Implementation: plan_dir(plan_id) / 'manifest.json'.
-        Example: lay.plan_manifest('abc').name == 'manifest.json'.
-        """
-        return self.plan_dir(plan_id) / "manifest.json"
-
-    def plan_merge(self, plan_id: str) -> Path:
-        """Return path to the per-plan merge descriptor for plan_id.
-
-        Design: §11 merge.json captures merge strategy and result metadata.
-        Implementation: plan_dir(plan_id) / 'merge.json'.
-        Example: lay.plan_merge('abc').name == 'merge.json'.
-        """
-        return self.plan_dir(plan_id) / "merge.json"
-
-    # ── per-iteration files ───────────────────────────────────────────────
-
-    def iteration_dir(self, plan_id: str, n: int) -> Path:
-        """Return path to iteration directory n for plan_id.
-
-        Design: §11 iterations are numbered subdirs under the plan dir.
-        Implementation: plan_dir(plan_id) / f'iteration-{n}'.
-        Example: lay.iteration_dir('abc', 3).name == 'iteration-3'.
-        """
-        return self.plan_dir(plan_id) / f"iteration-{n}"
-
-    def contract(self, plan_id: str, n: int) -> Path:
+    def contract(self, n: int) -> Path:
         """Return path to the iteration contract document.
 
-        Design: §11 contract.md records what the sandbox agent must implement.
-        Implementation: iteration_dir(plan_id, n) / 'contract.md'.
-        Example: lay.contract('abc', 1).name == 'contract.md'.
+        Design: §10 contract.md records what the Generator must implement.
+        Implementation: iteration_dir(n) / 'contract.md'.
+        Example: lay.contract(1).name == 'contract.md'.
         """
-        return self.iteration_dir(plan_id, n) / "contract.md"
+        return self.iteration_dir(n) / "contract.md"
 
-    def summary(self, plan_id: str, n: int) -> Path:
+    def summary(self, n: int) -> Path:
         """Return path to the iteration summary document.
 
-        Design: §11 summary.md is the sandbox agent's self-reported outcome.
-        Implementation: iteration_dir(plan_id, n) / 'summary.md'.
-        Example: lay.summary('abc', 1).name == 'summary.md'.
+        Design: §10 summary.md is the Generator's self-reported outcome.
+        Implementation: iteration_dir(n) / 'summary.md'.
+        Example: lay.summary(1).name == 'summary.md'.
         """
-        return self.iteration_dir(plan_id, n) / "summary.md"
+        return self.iteration_dir(n) / "summary.md"
 
-    def eval(self, plan_id: str, n: int) -> Path:
+    def eval(self, n: int) -> Path:
         """Return path to the iteration eval JSON.
 
-        Design: §11 eval.json holds the verifier's structured evaluation result.
-        Implementation: iteration_dir(plan_id, n) / 'eval.json'.
-        Example: lay.eval('abc', 1).name == 'eval.json'.
+        Design: §10 eval.json holds the Evaluator's structured result.
+        Implementation: iteration_dir(n) / 'eval.json'.
+        Example: lay.eval(1).name == 'eval.json'.
         """
-        return self.iteration_dir(plan_id, n) / "eval.json"
+        return self.iteration_dir(n) / "eval.json"
 
-    def triage(self, plan_id: str, n: int) -> Path:
+    def triage(self, n: int) -> Path:
         """Return path to the iteration triage JSON.
 
-        Design: §11 triage.json records the orchestrator's triage decision.
-        Implementation: iteration_dir(plan_id, n) / 'triage.json'.
-        Example: lay.triage('abc', 1).name == 'triage.json'.
+        Design: §10 triage.json records the orchestrator's triage decision.
+        Implementation: iteration_dir(n) / 'triage.json'.
+        Example: lay.triage(1).name == 'triage.json'.
         """
-        return self.iteration_dir(plan_id, n) / "triage.json"
+        return self.iteration_dir(n) / "triage.json"
 
-    def gap_fingerprint(self, plan_id: str, n: int) -> Path:
+    def gap_fingerprint(self, n: int) -> Path:
         """Return path to the iteration gap-fingerprint JSON.
 
-        Design: §11 gap_fingerprint.json fingerprints open gaps to detect loops.
-        Implementation: iteration_dir(plan_id, n) / 'gap_fingerprint.json'.
-        Example: lay.gap_fingerprint('abc', 1).name == 'gap_fingerprint.json'.
+        Design: §10 gap_fingerprint.json fingerprints open gaps to detect loops.
+        Implementation: iteration_dir(n) / 'gap_fingerprint.json'.
+        Example: lay.gap_fingerprint(1).name == 'gap_fingerprint.json'.
         """
-        return self.iteration_dir(plan_id, n) / "gap_fingerprint.json"
+        return self.iteration_dir(n) / "gap_fingerprint.json"
 
-    def verify_txt(self, plan_id: str, n: int) -> Path:
+    def verify_txt(self, n: int) -> Path:
         """Return path to the iteration verify output text file.
 
-        Design: §11 verify.txt captures raw verifier stdout for diagnostics.
-        Implementation: iteration_dir(plan_id, n) / 'verify.txt'.
-        Example: lay.verify_txt('abc', 1).name == 'verify.txt'.
+        Design: §10 verify.txt captures raw verification stdout for diagnostics.
+        Implementation: iteration_dir(n) / 'verify.txt'.
+        Example: lay.verify_txt(1).name == 'verify.txt'.
         """
-        return self.iteration_dir(plan_id, n) / "verify.txt"
-
-    def git_violation(self, plan_id: str, n: int) -> Path:
-        """Return path to the iteration git-violation text file.
-
-        Design: §11 git-violation.txt records any gitguard violations found.
-        Implementation: iteration_dir(plan_id, n) / 'git-violation.txt'.
-        Example: lay.git_violation('abc', 1).name == 'git-violation.txt'.
-        """
-        return self.iteration_dir(plan_id, n) / "git-violation.txt"
+        return self.iteration_dir(n) / "verify.txt"
 
 
 def init_run_layout(
@@ -272,7 +231,7 @@ def init_run_layout(
 ) -> RunLayout:
     """Create the run directory structure and write immutable design + seeded spec.
 
-    Design: §11/§3.1 design.md is frozen at run creation; spec.md starts as a
+    Design: §10/§3.1 design.md is frozen at run creation; spec.md starts as a
         copy of design and may evolve; spec_amendments.md is created empty as an
         append-only log.
     Implementation: make inputs/ with mode 0o700; write design.md and spec.md
@@ -299,16 +258,17 @@ def init_run_layout(
     return lay
 
 
-def ensure_iteration_dir(layout: RunLayout, plan_id: str, n: int) -> Path:
-    """Create and return the iteration directory for plan_id/n with mode 0o700.
+def ensure_iteration_dir(layout: RunLayout, n: int) -> Path:
+    """Create and return the iteration directory for n with mode 0o700.
 
-    Design: §11 iteration dirs are created on demand so the orchestrator does
-        not pre-allocate all N directories at run start.
+    Design: §10 iteration dirs are created on demand so the orchestrator does
+        not pre-allocate all directories at run start; keyed only on n now that
+        there is a single plan.
     Implementation: os.makedirs with exist_ok=True so repeated calls are safe;
         mode 0o700 restricts access to the owner only.
-    Example: ensure_iteration_dir(lay, 'abc', 1) returns lay.iteration_dir('abc', 1)
-        and guarantees the directory exists on disk.
+    Example: ensure_iteration_dir(lay, 1) returns lay.iteration_dir(1) and
+        guarantees the directory exists on disk.
     """
-    path = layout.iteration_dir(plan_id, n)
+    path = layout.iteration_dir(n)
     os.makedirs(path, mode=0o700, exist_ok=True)
     return path

@@ -20,10 +20,17 @@ _DESIGN = Path(__file__).resolve().parents[1] / "examples" / "tiny-feature.md"
     not (shutil.which("claude") and shutil.which("codex")),
     reason="real claude/codex binaries required",
 )
-async def test_tiny_feature_end_to_end(tmp_path: Path) -> None:
-    """Design: §17 one live end-to-end run against real CLIs, excluded from default CI.
-    Implementation: drive Orchestrator.run with real drivers over a tiny design.
-    Example: returns a terminal RunResult under a .harness run dir.
+async def test_tiny_feature_single_plan_direct_edit(tmp_path: Path) -> None:
+    """Design: §13/§3 one live single-plan, direct-edit run against the real CLIs,
+        excluded from default CI (slow + skip unless both binaries are on PATH).
+        The Generator edits target_dir IN PLACE (no copy-sandbox), so a successful
+        tiny-feature run leaves out.txt directly in target_dir.
+    Implementation: drive Orchestrator.run with real ClaudeDriver/CodexDriver over
+        the tiny-feature design (one plan: write out.txt). Assert the terminal
+        status set, the run dir lives under .harness, and — when the run completed —
+        that out.txt landed directly in target_dir (the direct-edit proof).
+    Example: a completed run returns RunResult(status='completed') with
+        (target_dir / 'out.txt') present and a run_dir containing '.harness'.
     """
     target = tmp_path / "scratch-app"
     target.mkdir()
@@ -40,3 +47,7 @@ async def test_tiny_feature_end_to_end(tmp_path: Path) -> None:
     )
     assert result.status in {"completed", "incomplete", "failed"}
     assert ".harness" in result.run_dir
+    # Direct-edit proof: there is no copy-sandbox, so a completed tiny-feature run
+    # must have written out.txt straight into target_dir.
+    if result.status == "completed":
+        assert (target / "out.txt").is_file()

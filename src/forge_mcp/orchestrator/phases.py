@@ -1,9 +1,10 @@
-"""Per-plan iteration loop driving the §3.2 phase order and §6.5 gate.
+"""Single-plan iteration loop driving the §4 phase order and §6.5 verify gate.
 
-run_plan_loop runs ONE plan's iteration loop, isolated in its sandbox, against
-the wave's frozen spec.md. It is consumed by the scheduler (Task 27) and the
-engine (Task 28). The loop is wrapped in failure isolation (I8) so an unhandled
-error in one plan never aborts a sibling plan's loop.
+run_plan_loop runs the one plan's iteration loop directly on target_dir against
+the current spec.md, applying validated design-fault amendments in-loop. It is
+consumed by the single-plan engine (§8). The loop is wrapped in failure
+isolation so an unhandled error returns a `failed` report rather than
+propagating into the orchestrator.
 """
 
 from __future__ import annotations
@@ -17,10 +18,9 @@ from forge_mcp.artifacts import RunLayout, ensure_iteration_dir
 from forge_mcp.convergence import detect_non_progress, fingerprint
 from forge_mcp.drivers.evaluator import run_evaluator, run_triage
 from forge_mcp.drivers.generator import run_generator
-from forge_mcp.gitguard import capture_state, diff_state
 from forge_mcp.models import EvalGap, GapSummary, GapTriage, Plan
+from forge_mcp.orchestrator.amend import apply_amendments
 from forge_mcp.orchestrator.plan_state import PlanState
-from forge_mcp.sandbox import Change, capture_manifest, detect_changes
 from forge_mcp.state import light_replace, write_json
 from forge_mcp.triage import effective_code_bug_titles, passes_citation_gate
 from forge_mcp.verifier import VerifyOutcome, run_verification
@@ -29,38 +29,36 @@ if TYPE_CHECKING:
     from forge_mcp.drivers._claude import ClaudeRunner
     from forge_mcp.drivers._codex import CodexRunner
 
-# Sentinel design_doc_section values for non-demotable synthesized gaps (§9/§6.5).
-_GIT_SENTINEL_SECTION = "§9"
+# Sentinel design_doc_section value for the non-demotable synthesized verify gap (§6.5).
 _VERIFY_SENTINEL_SECTION = "§6.5"
 
 
 @dataclass
 class PlanLoopResult:
-    """Terminal report from one plan's §3.2 iteration loop.
+    """Terminal report from the single plan's §4 iteration loop.
 
-    Design: §6.4/§6.5 the loop reports a single terminal state plus the freshest
-        full post-synthesize gap set so the orchestrator can project honest
-        unresolved gaps, apply any merge (change_set), or stop the wave for a
-        validated design-fault amendment.
-    Implementation: plain dataclass; proposed_amendment carries (plan_id, row)
-        only for awaiting_amendment; change_set is populated only for done.
-    Example: PlanLoopResult('done', 1, [], [], None, None, [Change(...)]).
+    Design: §4 the loop reports a single terminal state plus the freshest full
+        post-synthesize gap set so the engine can project honest unresolved
+        gaps; with direct edits there is no change_set and amendments are
+        applied in-loop, so the proposed_amendment hand-off field is gone too.
+    Implementation: plain dataclass; terminal_state is one of done / incomplete
+        / failed (no awaiting_amendment); last_gaps and synthesized carry the
+        freshest gap set; stop_reason explains a non-done stop.
+    Example: PlanLoopResult(terminal_state='done', iterations=1).
     """
 
-    terminal_state: Literal["done", "incomplete", "failed", "awaiting_amendment"]
+    terminal_state: Literal["done", "incomplete", "failed"]
     iterations: int
     last_gaps: list[EvalGap] = field(default_factory=list)
     synthesized: list[GapSummary] = field(default_factory=list)
-    proposed_amendment: tuple[str, GapTriage] | None = None
     stop_reason: str | None = None
-    change_set: list[Change] | None = None
 
 
 def _now() -> str:
     """Return the current UTC time as an ISO-8601 string for state checkpoints.
 
-    Design: §3.3 PlanState mutations record a last_updated_at timestamp; the loop
-        is the sole writer of per-plan state so it supplies the clock.
+    Design: §4 PlanState mutations record a last_updated_at timestamp; the loop
+        is the sole writer of plan state so it supplies the clock.
     Implementation: datetime.now in UTC, serialised with isoformat().
     Example: _now() returns a string like '2026-06-24T00:00:00+00:00'.
     """
@@ -70,15 +68,15 @@ def _now() -> str:
 def _seed_contract(plan: Plan, layout: RunLayout, n: int) -> str:
     """Write iteration 1's contract.md from the plan body and return its text.
 
-    Design: §3.2 the first iteration's contract is the plan body itself; later
-        iterations use a remediation contract written at the end of the prior
-        iteration (see _write_remediation_contract).
-    Implementation: ensure the iteration dir, write plan.body to contract.md via
-        light_replace (durability not required for derived artifacts), return it.
+    Design: §4 the first iteration's contract is the plan body itself; later
+        iterations use a remediation contract written from the still-open gaps.
+    Implementation: ensure the (flat, run-level) iteration dir, write plan.body
+        to contract.md via light_replace (durability not required for derived
+        artifacts), return it.
     Example: _seed_contract(plan, layout, 1) writes plan.body to iteration-1/contract.md.
     """
-    ensure_iteration_dir(layout, plan.id, n)
-    light_replace(layout.contract(plan.id, n), plan.body)
+    ensure_iteration_dir(layout, n)
+    light_replace(layout.contract(n), plan.body)
     return plan.body
 
 
@@ -93,13 +91,13 @@ def _write_remediation_contract(
 ) -> str:
     """Write the next iteration's remediation contract incorporating open gaps.
 
-    Design: §3.2 a non-completing iteration produces a remediation contract that
-        instructs the next Generator turn to close the still-open gaps; synthesized
-        git/verify blockers are surfaced too (a plan whose only open issue is a
-        failing verification would otherwise see no signal); a NUDGE signal appends
-        an anti-oscillation note so the agent varies its approach.
-    Implementation: render each eval gap as a title/severity/fix bullet, prefix the
-        plan body for context, append a brief plain-text note per synthesized
+    Design: §4 a non-completing iteration produces a remediation contract that
+        instructs the next Generator turn to close the still-open gaps; the
+        synthesized verify blocker is surfaced too (a plan whose only open issue
+        is a failing verification would otherwise see no signal); a NUDGE signal
+        appends an anti-oscillation note so the agent varies its approach.
+    Implementation: render each eval gap as a title/severity/fix bullet, prefix
+        the plan body for context, append a brief plain-text note per synthesized
         blocker (GapSummary carries only the title), append the nudge note when
         nudge is True, then write to iteration-(n)/contract.md and return the text.
     Example: _write_remediation_contract(plan, layout, 2, gaps=[g], synthesized=[],
@@ -117,37 +115,29 @@ def _write_remediation_contract(
             "try a different approach."
         )
     text = "\n".join(lines)
-    ensure_iteration_dir(layout, plan.id, n)
-    light_replace(layout.contract(plan.id, n), text)
+    ensure_iteration_dir(layout, n)
+    light_replace(layout.contract(n), text)
     return text
 
 
 def _synthesize_blocking_gaps(
     *,
-    git_diff: str,
     last_verification: VerifyOutcome | None,
     verification_command: str | None,
 ) -> list[GapSummary]:
-    """Build the non-demotable git and verification gaps for this iteration (§6.5/§9).
+    """Build the non-demotable verification gap for this iteration (§6.5).
 
-    Design: §6.5 a verification failure and §9 a git-state mutation are both
-        hard, non-demotable blockers; they are synthesized as high-severity gaps
-        BEFORE the gap fingerprint so they enter the convergence signal and block
-        completion exactly like an unresolved code bug.
-    Implementation: append a §9 gap when git_diff is non-empty; append a §6.5 gap
-        when a verification command exists and the cached outcome did not pass.
-    Example: _synthesize_blocking_gaps(git_diff='', last_verification=failed,
+    Design: §6.5 a verification failure is a hard, non-demotable blocker; it is
+        synthesized as a high-severity gap BEFORE the gap fingerprint so it
+        enters the convergence signal and blocks completion exactly like an
+        unresolved code bug. The §9 git backstop gap is removed — git state does
+        not gate completion under the direct-edit model.
+    Implementation: append a §6.5 gap only when a verification command exists and
+        the cached outcome did not pass; otherwise return the empty list.
+    Example: _synthesize_blocking_gaps(last_verification=failed,
         verification_command='false') returns one §6.5 verification gap.
     """
     synthesized: list[GapSummary] = []
-    if git_diff:
-        synthesized.append(
-            GapSummary(
-                title="git state mutated during iteration",
-                severity="high",
-                design_doc_section=_GIT_SENTINEL_SECTION,
-            )
-        )
     if (
         verification_command is not None
         and last_verification is not None
@@ -166,12 +156,11 @@ def _synthesize_blocking_gaps(
 def _validated_amendment_row(triages: list[GapTriage], spec_text: str) -> GapTriage | None:
     """Return the first triage row that is a validated design-fault amendment, or None.
 
-    Design: §3.2 step 9 / §5.3 a triage row stops the wave only when it proposes
-        a concrete amendment AND passes the citation gate against the frozen spec;
-        such a row needs human-or-orchestrator amendment before the plan can make
-        further progress.
-    Implementation: scan triages for the first row whose proposed_amendment is set
-        and that passes_citation_gate against spec_text.
+    Design: §4 step 8 a triage row is applied in-loop only when it proposes a
+        concrete amendment AND passes the citation gate against the current spec;
+        such a row durably rewrites spec.md before the next iteration evaluates.
+    Implementation: scan triages for the first row whose proposed_amendment is
+        set and that passes_citation_gate against spec_text.
     Example: _validated_amendment_row([row], spec) returns row when it is a cited
         design fault carrying a proposed_amendment.
     """
@@ -185,52 +174,49 @@ async def run_plan_loop(
     *,
     layout: RunLayout,
     plan: Plan,
-    sandbox: Path,
+    target_dir: Path,
     spec_text: str,
+    spec_fingerprint: str,
     claude_runner: ClaudeRunner,
     codex_runner: CodexRunner,
     schemas: dict,
     max_iterations: int,
-    base_git_state: str | None,
-    git_surface: Path | None = None,
 ) -> PlanLoopResult:
-    """Run one plan's §3.2 iteration loop and return its §6.5 terminal report.
+    """Iterate one plan directly on target_dir to an honest terminal report (§4).
 
-    Design: §3.2 drives the phase order per iteration (generating → verifying →
-        evaluating → triaging → synthesize → fingerprint → done → amendment? →
-        completion? → non-progress? → cap? → remediating); §6.5 the four-conjunct
-        completion gate (no remaining code bugs incl. synthesized, verify passed,
-        no git violation, no pending amendment) decides `done`. Synthesize runs
-        BEFORE the fingerprint so git/verify blockers feed convergence and block
-        completion. I8 wraps the whole loop so an unhandled error returns `failed`
-        rather than propagating into a sibling plan's loop.
-    Implementation: capture a baseline manifest for the change_set; per iteration
-        run the generator, optional verification, git diff, evaluator, optional
-        triage; synthesize blocking gaps; write gap_fingerprint.json over the full
-        post-synthesize set and append to the per-plan history; record completion;
-        return on validated amendment, completion, EARLY_STOP non-progress, or the
-        iteration cap, else write a (possibly nudged) remediation contract and
-        continue. On done, return detect_changes(sandbox, baseline) as change_set.
-        The §9 git backstop snapshots git_surface (the real repo, e.g. target_dir)
-        at each iteration end and diffs it against base_git_state — both captured
-        from the SAME surface; when git_surface is None both ends are None (empty
-        diff, no false violation).
-    Example: a clean plan with no verify command and no eval gaps returns
-        PlanLoopResult(terminal_state='done', iterations=1, ...).
+    Design: §4 drives generate→verify→evaluate→triage→synthesize→converge each
+        iteration; a validated design-fault triage is applied to spec.md IN-LOOP
+        (spec_text/fingerprint rebound, churn appended to the amendment history)
+        and the loop continues; completion is the two-conjunct gate (no remaining
+        code bugs incl. the synthesized verify gap, AND verify passed). There is
+        no sandbox, no manifest/change_set, and no git backstop — the edits ARE
+        the output, left in target_dir. The iteration cap is the hard termination
+        bound. An unhandled error returns `failed` rather than propagating.
+    Implementation: per iteration write the contract, run_generator on
+        target_dir, optional run_verification(target_dir), run_evaluator and
+        run_triage with cwd=target_dir against the CURRENT spec_text, synthesize
+        the verify gap only, fingerprint over eval ∪ synthesized, record the
+        iteration; if a validated amendment exists apply_amendments([row]),
+        rebind spec_text/spec_fingerprint, append churn to amendment_history,
+        EARLY_STOP→incomplete 'amendment thrash' else honor the cap and continue;
+        otherwise test completion / gap-non-progress / cap and either return or
+        write a (possibly nudged) remediation contract and continue.
+    Example: a clean plan with no verify command and no gaps returns
+        PlanLoopResult(terminal_state='done', iterations=1).
     """
-    plan_state = PlanState(layout, plan_id=plan.id, sandbox_path=str(sandbox))
+    plan_state = PlanState(layout)
     try:
-        baseline = capture_manifest(sandbox)
         history: list[frozenset[str]] = []
+        amendment_history: list[frozenset[str]] = []
         last_gaps: list[EvalGap] = []
         last_synthesized: list[GapSummary] = []
         nudge_next = False
 
         for n in range(1, max_iterations + 1):
             plan_state.bump_iteration(_now())
-            ensure_iteration_dir(layout, plan.id, n)
+            ensure_iteration_dir(layout, n)
 
-            # 1. generating
+            # 1. generate — Codex edits target_dir directly.
             plan_state.set_state("generating", now=_now())
             contract_text = (
                 _seed_contract(plan, layout, n)
@@ -248,40 +234,31 @@ async def run_plan_loop(
             await run_generator(
                 codex_runner,
                 contract_text=contract_text,
-                sandbox=sandbox,
+                target_dir=target_dir,
                 surface=plan.surface,
                 run_log_path=layout.run_log,
             )
-            light_replace(
-                layout.summary(plan.id, n), f"Iteration {n} generated for plan {plan.id}."
-            )
+            light_replace(layout.summary(n), f"Iteration {n} generated.")
 
-            # 2. verifying (only when a command is declared)
+            # 2. verify (only when a command is declared) in target_dir.
             last_verification: VerifyOutcome | None = None
             if plan.verification_command is not None:
                 plan_state.set_state("verifying", now=_now())
-                last_verification = run_verification(plan.verification_command, sandbox)
-                light_replace(layout.verify_txt(plan.id, n), last_verification.output)
+                last_verification = run_verification(plan.verification_command, target_dir)
+                light_replace(layout.verify_txt(n), last_verification.output)
 
-            # 3. git backstop — diff the SAME real git surface (base vs end).
-            end_git_state = capture_state(git_surface) if git_surface is not None else None
-            git_diff = diff_state(base_git_state, end_git_state)
-            if git_diff:
-                light_replace(layout.git_violation(plan.id, n), git_diff)
-
-            # 4. evaluating
+            # 3. evaluate against the CURRENT (possibly amended) spec.
             plan_state.set_state("evaluating", now=_now())
             eval_result = await run_evaluator(
                 claude_runner,
                 spec_text=spec_text,
-                sandbox=sandbox,
                 eval_schema=schemas["eval"],
-                cwd=sandbox,
+                cwd=target_dir,
                 run_log_path=layout.run_log,
             )
-            write_json(layout.eval(plan.id, n), eval_result, durable=False)
+            write_json(layout.eval(n), eval_result, durable=False)
 
-            # 5. triaging (only when the eval found gaps)
+            # 4. triage (only when the eval found gaps).
             triages: list[GapTriage] = []
             triage_ran = False
             if eval_result.gaps:
@@ -291,46 +268,69 @@ async def run_plan_loop(
                     spec_text=spec_text,
                     eval_result=eval_result,
                     triage_schema=schemas["triage"],
-                    cwd=sandbox,
+                    cwd=target_dir,
                     run_log_path=layout.run_log,
                 )
-                write_json(layout.triage(plan.id, n), triage_result, durable=False)
+                write_json(layout.triage(n), triage_result, durable=False)
                 triages = triage_result.triages
                 triage_ran = True
 
-            # 6. synthesize (BEFORE fingerprint): non-demotable git + verify gaps.
+            # 5. synthesize (BEFORE fingerprint): the §6.5 verify gap only.
             synthesized = _synthesize_blocking_gaps(
-                git_diff=git_diff,
                 last_verification=last_verification,
                 verification_command=plan.verification_command,
             )
             last_gaps = eval_result.gaps
             last_synthesized = synthesized
 
-            # 7. fingerprint over the FULL post-synthesize set (eval ∪ synthesized).
+            # 6. fingerprint over the FULL post-synthesize set (eval ∪ synthesized).
             fp_items = sorted(
                 [f"{g.title}|{g.severity}" for g in eval_result.gaps]
                 + [f"{g.title}|{g.severity}" for g in synthesized]
             )
-            write_json(layout.gap_fingerprint(plan.id, n), fp_items, durable=False)
+            write_json(layout.gap_fingerprint(n), fp_items, durable=False)
             history.append(fingerprint(fp_items))
 
-            # 8. done(record): mark this iteration completed.
+            # 7. record this iteration completed.
             plan_state.record_completed(n, _now())
 
-            # 9. amendment-needed? a validated design-fault row STOPS the wave.
+            # 8. amendment? (in-loop) — apply a validated design-fault row to spec.md.
             amendment_row = _validated_amendment_row(triages, spec_text)
             if amendment_row is not None:
-                plan_state.set_state("awaiting_amendment", now=_now())
-                return PlanLoopResult(
-                    terminal_state="awaiting_amendment",
-                    iterations=n,
-                    last_gaps=last_gaps,
-                    synthesized=last_synthesized,
-                    proposed_amendment=(plan.id, amendment_row),
+                outcome = apply_amendments(
+                    layout,
+                    spec_text=spec_text,
+                    spec_fingerprint=spec_fingerprint,
+                    proposed=[amendment_row],
+                    now=_now(),
                 )
+                spec_text = outcome.new_spec
+                spec_fingerprint = outcome.new_fingerprint
+                amendment_history.append(outcome.churn_fingerprint)
+                if detect_non_progress(amendment_history) == "EARLY_STOP":
+                    plan_state.set_state("incomplete", now=_now())
+                    return PlanLoopResult(
+                        terminal_state="incomplete",
+                        iterations=n,
+                        last_gaps=last_gaps,
+                        synthesized=last_synthesized,
+                        stop_reason="amendment thrash",
+                    )
+                if n == max_iterations:
+                    plan_state.set_state("incomplete", now=_now())
+                    return PlanLoopResult(
+                        terminal_state="incomplete",
+                        iterations=n,
+                        last_gaps=last_gaps,
+                        synthesized=last_synthesized,
+                        stop_reason="iteration cap",
+                    )
+                # The gap cannot close until the generator builds to the amended
+                # spec; carry the open gaps forward and continue.
+                plan_state.set_state("remediating", now=_now())
+                continue
 
-            # 10. completion? §6.5 four-conjunct gate.
+            # 9. completion? §4 two-conjunct gate (effective_no_gaps ∧ verify_passed).
             code_bug_titles = effective_code_bug_titles(eval_result.gaps, triages, spec_text)
             # Synthesized gaps are non-demotable code-bugs: the set of remaining
             # code bugs is empty iff there are no eval code-bugs AND none synthesized.
@@ -339,20 +339,17 @@ async def run_plan_loop(
             verify_passed = plan.verification_command is None or (
                 last_verification is not None and last_verification.passed
             )
-            no_git_violation = not git_diff
-            no_pending_amend = True  # handled in step 9
 
-            if effective_no_gaps and verify_passed and no_git_violation and no_pending_amend:
+            if effective_no_gaps and verify_passed:
                 plan_state.set_state("done", now=_now())
                 return PlanLoopResult(
                     terminal_state="done",
                     iterations=n,
                     last_gaps=last_gaps,
                     synthesized=last_synthesized,
-                    change_set=detect_changes(sandbox, baseline),
                 )
 
-            # 11. non-progress?
+            # 10. non-progress (gap history)?
             signal = detect_non_progress(history)
             if signal == "EARLY_STOP":
                 plan_state.set_state("incomplete", now=_now())
@@ -366,7 +363,7 @@ async def run_plan_loop(
             if signal == "NUDGE":
                 nudge_next = True
 
-            # 12. cap?
+            # 11. cap?
             if n == max_iterations:
                 plan_state.set_state("incomplete", now=_now())
                 return PlanLoopResult(
@@ -377,7 +374,7 @@ async def run_plan_loop(
                     stop_reason="iteration cap",
                 )
 
-            # 13. remediating — fall through to the next iteration (contract
+            # 12. remediate — fall through to the next iteration (contract
             # written at the top of iteration n+1 via _write_remediation_contract).
             plan_state.set_state("remediating", now=_now())
 
@@ -389,7 +386,7 @@ async def run_plan_loop(
             synthesized=last_synthesized,
             stop_reason="iteration cap",
         )
-    except Exception as exc:  # noqa: BLE001 — I8: isolate per-plan failure.
+    except Exception as exc:  # noqa: BLE001 — isolate the loop failure.
         try:
             plan_state.set_state("failed", now=_now())
         except Exception:  # noqa: BLE001 — best-effort checkpoint on failure path.

@@ -15,9 +15,9 @@ from forge_mcp.triage import amendment_target_present, is_valid_citation
 class AmendOutcome:
     """Result of apply_amendments — applied/rejected lists plus derived artifacts.
 
-    Design: §5.3 the orchestrator commits amendments at the wave boundary;
-        this dataclass carries the final spec state and churn signal for the
-        caller to act on.
+    Design: §4 the per-plan loop applies amendments in-loop; this dataclass
+        carries the final spec state and churn signal for the caller to rebind
+        spec_text/spec_fingerprint and feed the amendment-churn detector.
     Implementation: plain mutable dataclass; caller reads fields after the
         function returns.
     Example: AmendOutcome(applied=[...], rejected=[], new_spec='...', ...).
@@ -48,26 +48,27 @@ def apply_amendments(
     *,
     spec_text: str,
     spec_fingerprint: str,
-    proposed: list[tuple[str, GapTriage]],
+    proposed: list[GapTriage],
     now: str,
 ) -> AmendOutcome:
-    """Apply validated design-fault amendments to spec.md at a wave boundary.
+    """Apply validated design-fault amendments to spec.md in-loop (§4).
 
-    Design: §5.3 amendments are applied serially so each subsequent amendment
-        sees the updated spec from earlier ones; the citation gate is re-run
-        against the then-current spec to guard against stale text; rejected
-        proposals still contribute to the churn fingerprint (§6.7).
-    Implementation: iterate proposed in order; for each triage that carries a
+    Design: §4 the per-plan loop calls this with the validated row(s) for the
+        current iteration; each amendment is re-validated against the then-current
+        spec and applied serially, durably rewriting spec.md so the next iteration
+        evaluates against it. Rejected proposals still feed the churn fingerprint.
+    Implementation: iterate proposed in order; for each triage carrying a
         proposed_amendment, re-validate all cited_sections via is_valid_citation
-        against the current spec AND verify the 'before' text is still present
-        via amendment_target_present; on pass, replace the first occurrence of
-        'before' with 'after', recompute SHA-256 fingerprint, durably write the
-        updated spec and fingerprint, and append a structured entry to
-        spec_amendments.md via durable_append; on failure, add to rejected only.
-        All proposals (applied or rejected) feed churn_fingerprint.
-        inputs/design.md is never touched (I4).
-    Example: apply_amendments(lay, spec_text='old', ..., proposed=[('p1', t)])
-        returns AmendOutcome with new_spec containing the amended text.
+        against the current spec AND verify the 'before' text is still present via
+        amendment_target_present; on pass, replace the first occurrence of 'before'
+        with 'after', recompute the SHA-256 fingerprint, durably write the updated
+        spec (durable_replace) and fingerprint (light_replace), and append a
+        structured entry (no plan_id field) to spec_amendments.md via durable_append;
+        on failure, add to rejected only. All proposals (applied or rejected) feed
+        churn_fingerprint. inputs/design.md is never touched (I4).
+    Example: apply_amendments(lay, spec_text='old', spec_fingerprint='fp',
+        proposed=[row], now=t) returns AmendOutcome whose new_spec contains the
+        amended text.
     """
     current_spec = spec_text
     current_fp = spec_fingerprint
@@ -75,7 +76,7 @@ def apply_amendments(
     rejected: list[ProposedAmendment] = []
     churn_keys: list[str] = []
 
-    for plan_id, triage in proposed:
+    for triage in proposed:
         pa = triage.proposed_amendment
         if pa is None:
             continue
@@ -94,7 +95,6 @@ def apply_amendments(
 
             entry = json.dumps(
                 {
-                    "plan_id": plan_id,
                     "now": now,
                     "fault_kind": triage.fault_kind,
                     "cited_sections": pa.cited_sections,

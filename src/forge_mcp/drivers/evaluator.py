@@ -15,22 +15,23 @@ async def run_evaluator(
     runner: ClaudeRunner,
     *,
     spec_text: str,
-    sandbox: Path,
     eval_schema: dict,
     cwd: Path,
     run_log_path: Path | None = None,
 ) -> EvalResult:
-    """Run the Evaluator stage and return a validated EvalResult (§5.3).
+    """Run the Evaluator stage and return a validated EvalResult (§6).
 
-    Design: §5.3 the Evaluator diffs the sandbox code against the frozen
-        spec_text and emits a structured list of gaps; it uses the code-review
-        skill and is constrained by git-deny hooks so it cannot mutate the
-        repository.
-    Implementation: build options with the evaluator_system prompt, the eval
-        JSON schema as output_format, git-deny hooks, and the provided cwd;
-        compose a prompt that names both the sandbox path and the frozen spec;
-        call runner.run; validate the structured_output into an EvalResult.
-    Example: ``await run_evaluator(runner, spec_text="# spec", sandbox=p,
+    Design: §6 the Evaluator diffs the code under *cwd* against the frozen
+        spec_text and emits a structured list of gaps; it is git-mutation-denied
+        (PreToolUse git-deny hook) under bypassPermissions so it can read the
+        repo but cannot commit. With the single-plan direct-edit harness the
+        evaluated tree IS *cwd* (target_dir), so the now-unused sandbox parameter
+        is gone — *cwd* alone names the directory.
+    Implementation: build options with the evaluator_system prompt, the eval JSON
+        schema as output_format, git-deny hooks, and the provided cwd; compose a
+        prompt that names *cwd* and the frozen spec; call runner.run; validate the
+        structured_output into an EvalResult.
+    Example: ``await run_evaluator(runner, spec_text="# spec",
         eval_schema={...}, cwd=Path("/r"))`` returns an EvalResult.
     """
     options = build_options(
@@ -43,8 +44,8 @@ async def run_evaluator(
     )
     prompt = (
         f"## Frozen design spec\n\n{spec_text}\n\n"
-        f"## Sandbox path\n\n{sandbox}\n\n"
-        "Diff the code in the sandbox against the frozen design spec above and "
+        f"## Project path\n\n{cwd}\n\n"
+        "Diff the code in the project above against the frozen design spec above and "
         "report all gaps."
     )
     result = await runner.run(prompt=prompt, options=options)

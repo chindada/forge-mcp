@@ -9,8 +9,6 @@ from pathlib import Path
 
 from forge_mcp.ids import format_run_id
 
-CONCURRENCY_CAP: int = 4
-
 
 def _env_path(name: str) -> Path | None:
     """Return the env var as a Path, or None if not set.

@@ -12,8 +12,8 @@ from tests.fakes import FakeClaudeRunner, structured
 
 @pytest.mark.driver
 async def test_evaluator_parses_gaps(tmp_path: Path):
-    """Design: §5.3 the Evaluator emits EvalResult diffing code vs spec.
-    Implementation: fake returns one gap; run_evaluator parses it.
+    """Design: §6 the Evaluator emits EvalResult diffing code in cwd vs the spec.
+    Implementation: fake returns one gap; run_evaluator (no sandbox param) parses it.
     Example: no_gaps False, one EvalGap.
     """
     payload = {
@@ -31,15 +31,28 @@ async def test_evaluator_parses_gaps(tmp_path: Path):
         ],
     }
     runner = FakeClaudeRunner([structured(payload)])
-    res = await run_evaluator(
-        runner, spec_text="s", sandbox=tmp_path, eval_schema={"type": "object"}, cwd=tmp_path
-    )
+    res = await run_evaluator(runner, spec_text="s", eval_schema={"type": "object"}, cwd=tmp_path)
     assert not res.no_gaps and res.gaps[0].title == "missing X"
 
 
 @pytest.mark.driver
+async def test_evaluator_has_no_sandbox_param():
+    """Design: §6 run_evaluator drops the now-unused sandbox parameter; cwd alone
+        names the directory the evaluator diffs against the spec.
+    Implementation: introspect the signature and assert 'sandbox' is absent and
+        'cwd' is present.
+    Example: 'sandbox' not in signature(run_evaluator).parameters.
+    """
+    import inspect
+
+    params = inspect.signature(run_evaluator).parameters
+    assert "sandbox" not in params
+    assert "cwd" in params
+
+
+@pytest.mark.driver
 async def test_triage_demotes_uncited_design_fault(tmp_path: Path):
-    """Design: §5.3 a design_fault with an invalid citation demotes to a code-bug.
+    """Design: §6 a design_fault with an invalid citation demotes to a code-bug.
     Implementation: fake triage claims a design fault citing absent text.
     Example: the row no longer passes the citation gate.
     """

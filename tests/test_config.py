@@ -38,3 +38,11 @@ def test_same_second_rerun_uniquifies(tmp_path):
     a = config.create_run_dir(tmp_path, when)
     b = config.create_run_dir(tmp_path, when)
     assert a.name != b.name and b.name.endswith("-01")
+
+
+def test_concurrency_cap_removed():
+    """Design: §11 the single-plan harness has no concurrency, so CONCURRENCY_CAP is gone.
+    Implementation: the module no longer defines the constant.
+    Example: hasattr(config, 'CONCURRENCY_CAP') is False.
+    """
+    assert not hasattr(config, "CONCURRENCY_CAP")

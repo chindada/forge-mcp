@@ -252,8 +252,9 @@ class CodexDriver:
     """Codex agent runner implementing the CodexRunner Protocol (§8.2).
 
     Design: §8.2 wraps AsyncCodex; installs a fail-soft stderr tee before
-        __aenter__; starts a thread with full_access sandbox and deny_all
-        approval mode; streams turn notifications as CodexEvents.
+        __aenter__; starts a thread with workspace_write sandbox and deny_all
+        approval mode (network access on via the sandbox_workspace_write
+        config override); streams turn notifications as CodexEvents.
         Transient errors: ConnectionError | BrokenPipeError |
         TransportClosedError | is_retryable_error(exc).
         TimeoutError and CancelledError are ALWAYS re-raised (never transient).
@@ -366,7 +367,7 @@ class CodexDriver:
             notification internals; transient errors propagate so callers
             can retry at their discretion.
         Implementation: lazy imports; stderr tee installed before __aenter__
-            (D4 fail-soft); thread_start with full_access/deny_all; turn
+            (D4 fail-soft); thread_start with workspace_write/deny_all + network config; turn
             streamed via AsyncTurnHandle.stream(); notification method/payload
             emitted as CodexEvent via _dump.  TimeoutError and CancelledError
             are NEVER caught (always re-raised).
@@ -381,9 +382,10 @@ class CodexDriver:
             async with codex as codex_ctx:
                 self._codex = codex_ctx
                 thread = await codex_ctx.thread_start(
-                    sandbox=Sandbox.full_access,
+                    sandbox=Sandbox.workspace_write,
                     approval_mode=ApprovalMode.deny_all,
                     cwd=str(config.cwd) if config.cwd is not None else None,
+                    config={"sandbox_workspace_write": {"network_access": True}},
                 )
                 self._last_thread_id = thread.id
                 turn_handle = await thread.turn(

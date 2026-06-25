@@ -36,7 +36,8 @@ def test_codex_symbols_exist():
     import openai_codex as o
     from openai_codex import ApprovalMode, Sandbox
 
-    assert hasattr(Sandbox, "full_access")
+    assert hasattr(Sandbox, "workspace_write")
+    assert hasattr(Sandbox, "full_access")  # still a member; driver no longer uses it
     assert hasattr(ApprovalMode, "deny_all")
     params = inspect.signature(o.AsyncCodex.thread_start).parameters
     assert "sandbox" in params and "approval_mode" in params

@@ -75,21 +75,23 @@ class RunResult(BaseModel, extra="forbid"):
 
 
 class Plan(BaseModel, extra="forbid"):
-    """One actionable unit of work produced by the Planner."""
+    """One actionable unit of work produced by the Planner (single-plan model).
 
-    id: str
-    depends_on: list[str] = []
+    Design: §1/§3 the run executes exactly one plan, so the model carries only what
+        the Generator and the completion gate need — the work contract, the surface
+        that selects the Generator's capability preface, and the optional command
+        that gates completion. The id/depends_on/file_scope fields of the multi-plan
+        DAG are gone because there is no DAG and no cross-plan conflict.
+    Implementation: a frozen-by-convention Pydantic model with extra='forbid' so the
+        Planner's structured output cannot smuggle extra keys; surface is a closed
+        Literal; verification_command is optional (None ⇒ no gate, verified stays an
+        honest False).
+    Example: Plan(surface='backend', verification_command='pytest -q', body='# contract').
+    """
+
     surface: Literal["backend", "frontend"]
-    file_scope: list[str] = []
     verification_command: str | None = None
     body: str
-
-
-class PlanSet(BaseModel, extra="forbid"):
-    """Collection of plans from one Planner turn."""
-
-    plans: list[Plan]
-    run_verification_command: str | None = None
 
 
 class EvalGap(BaseModel, extra="forbid"):

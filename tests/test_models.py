@@ -4,10 +4,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+import forge_mcp.models as models
 from forge_mcp.models import (
     EvalGap,
     GapSummary,
     GapTriage,
+    Plan,
     RunForgeInput,
     RunResult,
 )
@@ -138,3 +140,56 @@ def test_gap_summary_forbids_extra():
     """
     with pytest.raises(ValidationError):
         GapSummary(title="t", severity="high", design_doc_section="§7.4", foo=1)  # type: ignore[call-arg]
+
+
+def test_plan_collapsed_to_three_fields():
+    """Design: §3/§15 Plan collapses to {surface, verification_command, body}.
+    Implementation: construct with only the three surviving fields; read each back;
+        verification_command defaults to None when omitted.
+    Example: Plan(surface='backend', body='# contract').verification_command is None.
+    """
+    p = Plan(surface="backend", verification_command="pytest -q", body="# contract")
+    assert p.surface == "backend"
+    assert p.verification_command == "pytest -q"
+    assert p.body == "# contract"
+    p2 = Plan(surface="frontend", body="# c")
+    assert p2.verification_command is None
+
+
+def test_plan_drops_id_depends_on_file_scope():
+    """Design: §3 the DAG fields id/depends_on/file_scope are removed.
+    Implementation: extra='forbid' rejects each dropped field; the model also has no
+        such attributes in its field set.
+    Example: Plan(surface='backend', body='b', id='x') -> ValidationError.
+    """
+    assert set(Plan.model_fields) == {"surface", "verification_command", "body"}
+    for stray in ({"id": "x"}, {"depends_on": []}, {"file_scope": []}):
+        with pytest.raises(ValidationError):
+            Plan(surface="backend", body="b", **stray)  # type: ignore[arg-type]
+
+
+def test_plan_surface_is_closed_literal():
+    """Design: §3/§15 surface is a closed Literal['backend','frontend'].
+    Implementation: an out-of-set surface value raises ValidationError.
+    Example: Plan(surface='mobile', body='b') -> ValidationError.
+    """
+    with pytest.raises(ValidationError):
+        Plan(surface="mobile", body="b")  # type: ignore[arg-type]
+
+
+def test_plan_json_schema_has_no_planset_keys():
+    """Design: §3 Plan.model_json_schema() is the new Planner output contract.
+    Implementation: the schema's properties are exactly the three surviving fields.
+    Example: set(Plan.model_json_schema()['properties'])
+        == {'surface', 'verification_command', 'body'}.
+    """
+    props = set(Plan.model_json_schema()["properties"])
+    assert props == {"surface", "verification_command", "body"}
+
+
+def test_planset_is_deleted():
+    """Design: §3 PlanSet is deleted entirely (one plan, no collection).
+    Implementation: the symbol must no longer be importable from forge_mcp.models.
+    Example: hasattr(forge_mcp.models, 'PlanSet') is False.
+    """
+    assert not hasattr(models, "PlanSet")
