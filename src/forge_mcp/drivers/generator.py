@@ -24,7 +24,7 @@ async def run_generator(
     surface: str,
     run_log_path: Path | None = None,
 ) -> list[CodexEvent]:
-    """Run one autonomous Codex turn that edits *target_dir* directly (§5.2 superseded).
+    """Run one autonomous Codex turn that edits *target_dir* directly (§5).
 
     Design: §5 the Generator edits the repository in place under workspace-write
         with network access and no human approval, bounded to *target_dir* (writes

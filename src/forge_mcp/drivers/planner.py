@@ -1,4 +1,4 @@
-"""Planner stage (§5.1 superseded by §3): convert a spec into a single structured Plan."""
+"""Planner stage (§6): convert a spec into a single structured Plan."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ async def run_planner(
     cwd: Path,
     run_log_path: Path | None = None,
 ) -> Plan:
-    """Run the Planner stage and return a single validated Plan (§5.1 superseded).
+    """Run the Planner stage and return a single validated Plan (§6).
 
     Design: §3 the Planner reads the frozen spec and returns exactly one Plan; it
         is git-mutation-denied (PreToolUse git-deny hook) and runs under

@@ -1,4 +1,4 @@
-"""Evaluator stage (§5.3): gap-finding eval pass and triage pass."""
+"""Evaluator stage (§6): gap-finding eval pass and triage pass."""
 
 from __future__ import annotations
 
@@ -61,9 +61,9 @@ async def run_triage(
     cwd: Path,
     run_log_path: Path | None = None,
 ) -> TriageResult:
-    """Run the Triage stage and return a validated TriageResult (§5.3).
+    """Run the Triage stage and return a validated TriageResult (§6).
 
-    Design: §5.3 the Triage stage classifies each gap from the eval pass as
+    Design: §6 the Triage stage classifies each gap from the eval pass as
         either a code bug or a design fault; a design fault requires verbatim
         citations from the frozen spec_text to pass the citation gate; the
         orchestrator (not this function) applies any amendments to spec.md.

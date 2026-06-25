@@ -13,7 +13,6 @@ from forge_mcp.prompts import PROMPT_NAMES, load_prompt
         "generator_system",
         "evaluator_system",
         "evaluator_triage",
-        "remediation",
     ],
 )
 def test_each_prompt_loads_nonempty(name: str):
