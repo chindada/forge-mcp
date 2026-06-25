@@ -38,28 +38,57 @@ class SkillProbe:
     detail: str
 
 
+def _find_codex_skill_dir(codex_home: Path, skill_id: str) -> Path | None:
+    """Locate a discoverable Codex skill directory for *skill_id* (§10.3).
+
+    Design: §10.3 says to inspect both ``~/.codex/skills/`` and the ``~/.codex``
+        plugin cache; plugin-provided skills (e.g. superpowers' ``executing-plans``)
+        live only under the cache, so checking ``skills/`` alone yields a false
+        negative for a skill that is genuinely installed.
+    Implementation: prefer the direct ``codex_home/skills/<id>`` path; otherwise
+        glob the plugin cache layout
+        ``plugins/cache/<marketplace>/<plugin>/<hash>/skills/<id>`` and return the
+        first directory match, else None.
+    Example: with the superpowers plugin installed,
+        ``_find_codex_skill_dir(home, "executing-plans")`` returns the cache path.
+    """
+    direct = codex_home / "skills" / skill_id
+    if direct.is_dir():
+        return direct
+    for candidate in codex_home.glob(f"plugins/cache/*/*/*/skills/{skill_id}"):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def probe_codex_skills(*, codex_home: Path) -> list[SkillProbe]:
-    """Inspect ``codex_home/skills/<id>`` for each required Codex skill id (§10.3).
+    """Inspect ``codex_home`` for each required Codex skill id (§10.3).
 
     Design: §10.3 this probe is pure filesystem — no live binary is needed;
         it legitimately FAILs until the operator installs the required skills,
-        and that FAIL surfaces correctly to the doctor/health-check output.
-    Implementation: for each id in ``_REQUIRED_CODEX_SKILLS`` check whether
-        ``codex_home / "skills" / id`` is an existing directory; return OK if
-        present, FAIL otherwise.
-    Example: an empty ``codex_home/skills/`` directory yields two FAIL probes.
+        and that FAIL surfaces correctly to the doctor/health-check output. It
+        inspects both ``~/.codex/skills/`` and the plugin cache so a
+        plugin-provided skill is not reported as missing.
+    Implementation: for each id in ``_REQUIRED_CODEX_SKILLS`` resolve a
+        discoverable directory via ``_find_codex_skill_dir``; return OK with the
+        resolved path if found, FAIL otherwise.
+    Example: an empty ``codex_home`` (no skills/ entry, no plugin cache) yields
+        two FAIL probes.
     """
     results: list[SkillProbe] = []
     for skill_id in _REQUIRED_CODEX_SKILLS:
-        skill_dir = codex_home / "skills" / skill_id
-        if skill_dir.is_dir():
-            results.append(SkillProbe(label=skill_id, status="OK", detail=str(skill_dir)))
+        found = _find_codex_skill_dir(codex_home, skill_id)
+        if found is not None:
+            results.append(SkillProbe(label=skill_id, status="OK", detail=str(found)))
         else:
             results.append(
                 SkillProbe(
                     label=skill_id,
                     status="FAIL",
-                    detail=f"skill directory not found: {skill_dir}",
+                    detail=(
+                        f"skill not found under {codex_home / 'skills'} or "
+                        f"{codex_home / 'plugins' / 'cache'}"
+                    ),
                 )
             )
     return results
@@ -103,7 +132,9 @@ async def probe_claude_skills(
 
     results: list[SkillProbe] = []
     for skill_id in required:
-        if skill_id in available:
+        # Plugin skills are advertised namespaced (e.g. "superpowers:writing-plans"),
+        # so a required bare id matches either the bare form or any "<ns>:<id>" form.
+        if any(s == skill_id or s.endswith(f":{skill_id}") for s in available):
             results.append(SkillProbe(label=skill_id, status="OK", detail="skill available"))
         else:
             results.append(
