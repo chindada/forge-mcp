@@ -291,8 +291,10 @@ gap set when it did not complete.
 `run_verification` (verifier — its sole use is the removed `_run_level_verify`); all six
 scheduler symbols; all six sandbox symbols (`Change`, `Conflict`, `WriterMap`, `apply_merge`,
 `detect_conflicts`, `resolve_conflict_winner`); from the `engine.py:30` models import drop
-`EvalResult`, `TriageResult`, **and `PlanSet`** (the latter replaced by `Plan` for the new
-`run_planner` return / `plan_schema`), keeping `RunResult`; and separately drop the
+**`PlanSet`** only (replaced by `Plan` for the new `run_planner` return / `plan_schema`), while
+**keeping `RunResult`, `EvalResult`, and `TriageResult`** — the latter two are NOT F401-removable:
+they are still consumed at runtime to build the `schemas` dict passed into `run_plan_loop`
+(`engine.py:160-161`); and separately drop the
 `TYPE_CHECKING` `GapTriage` import at `engine.py:57` (its sole use is `engine.py:625` in the
 deleted `_amend_wave`). **Keep** `write_json`, `light_replace`. Rewrite the
 stale module/`Orchestrator`/`run` docstrings (`:1-11`, `:222-234`, `:249-269`) to the
