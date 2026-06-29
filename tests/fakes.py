@@ -66,6 +66,7 @@ class FakeClaudeRunner:
         """
         self._scripted = list(scripted)
         self.last_session_id: str | None = None
+        self.prompts: list[str] = []
 
     async def run(self, *, prompt: str, options: object) -> StructuredResult:
         """Return the next scripted result and update last_session_id.
@@ -77,6 +78,7 @@ class FakeClaudeRunner:
         Example: after one call, last_session_id equals the returned result's
             session_id.
         """
+        self.prompts.append(prompt)
         result = self._scripted.pop(0)
         self.last_session_id = result.session_id
         return result

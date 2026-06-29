@@ -49,3 +49,19 @@ def test_write_json_durable_and_light(tmp_path: Path):
     assert json.loads(p.read_text()) == {"k": 1}
     write_json(p, {"k": 2}, durable=False)
     assert json.loads(p.read_text()) == {"k": 2}
+
+
+def test_write_json_indent_pretty_prints_for_humans(tmp_path: Path):
+    """Design: §13 indent is presentation-only — indent=2 pretty-prints the
+        human-read artifacts (eval.json/triage.json); the default stays compact.
+    Implementation: a nested dict with indent=2 is multi-line and indented yet
+        round-trips; the default has no newlines.
+    Example: indented output contains a newline; compact output does not.
+    """
+    p = tmp_path / "x.json"
+    write_json(p, {"a": 1, "b": [2, 3]}, durable=False, indent=2)
+    pretty = p.read_text()
+    assert "\n  " in pretty  # multi-line and indented
+    assert json.loads(pretty) == {"a": 1, "b": [2, 3]}
+    write_json(p, {"a": 1, "b": [2, 3]}, durable=False)
+    assert "\n" not in p.read_text()  # default stays compact single-line

@@ -224,6 +224,7 @@ async def test_in_loop_amendment_rewrites_spec_and_continues(tmp_path: Path):
         [
             structured(_eval(False, [_gap()])),
             structured(_amend_triage()),
+            structured({"contract": "# Remediation plan for iteration 2"}),
             structured(_eval(True)),
         ]
     )
@@ -241,6 +242,8 @@ async def test_in_loop_amendment_rewrites_spec_and_continues(tmp_path: Path):
     )
     assert res.terminal_state == "done"
     assert res.iterations == 2
+    # The Claude-authored remediation contract for iteration 2 was written to disk.
+    assert layout.contract(2).read_text() == "# Remediation plan for iteration 2"
     # The amendment durably rewrote spec.md against the current spec_text.
     assert "fsync" in layout.spec_md.read_text()
     # The amendments log entry carries no plan_id field (single-plan).
@@ -266,6 +269,7 @@ async def test_unresolved_code_bug_hits_iteration_cap(tmp_path: Path):
         [
             structured(_eval(False, [_gap()])),
             structured({"triages": []}),
+            structured({"contract": "# Remediation plan for iteration 2"}),
             structured(_eval(False, [_gap()])),
             structured({"triages": []}),
         ]
@@ -323,3 +327,62 @@ async def test_generator_failure_isolated_as_failed(tmp_path: Path):
     )
     assert res.terminal_state == "failed"
     assert "codex exploded" in (res.stop_reason or "")
+
+
+@pytest.mark.driver
+async def test_remediation_gaps_are_triage_filtered(tmp_path: Path):
+    """Design: §4 the remediation contract targets only effective code bugs — a
+        validly-demoted design fault (the spec's problem) is excluded from what the
+        Generator is told to fix, while last_gaps stays RAW for the engine report.
+    Implementation: iter1 reports a code bug + a design-fault gap; triage demotes
+        the design fault with a valid spec citation and no amendment. Capture
+        iter2's remediation prompt and assert it lists the code bug but not the
+        demoted gap; assert res.last_gaps still carries both (raw).
+    Example: 'real bug' is in the remediation prompt; 'spec issue' is not.
+    """
+    layout = init_run_layout(tmp_path / "run", SPEC, design_fingerprint="fp0")
+    target = tmp_path / "target"
+    target.mkdir()
+    # A design-fault triage with a VALID verbatim citation but NO amendment, so the
+    # gap is demoted (excluded from code bugs) yet nothing rewrites the spec.
+    demote = {
+        "triages": [
+            {
+                "gap_title": "spec issue",
+                "design_fault": True,
+                "fault_kind": "contradiction",
+                "cited_sections": ["The widget must flush before close"],
+                "explanation": "spec contradicts itself",
+            }
+        ]
+    }
+    two_gaps = _eval(False, [_gap("real bug"), _gap("spec issue")])
+    claude = FakeClaudeRunner(
+        [
+            structured(two_gaps),  # iter1 eval
+            structured(demote),  # iter1 triage
+            structured({"contract": "# remediation"}),  # iter2 remediation (prompt captured)
+            structured(two_gaps),  # iter2 eval
+            structured(demote),  # iter2 triage
+        ]
+    )
+    codex = FakeCodexRunner([CodexEvent(kind="turn.completed", payload={})] * 2)
+    res = await run_plan_loop(
+        layout=layout,
+        plan=_plan(),
+        target_dir=target,
+        spec_text=SPEC,
+        spec_fingerprint="fp0",
+        claude_runner=claude,
+        codex_runner=codex,
+        schemas={"eval": {"type": "object"}, "triage": {"type": "object"}},
+        max_iterations=2,
+    )
+    # The remediation prompt (the only one carrying the gaps-to-close section) lists
+    # the effective code bug, not the validly-demoted design fault.
+    rem_prompts = [p for p in claude.prompts if "Still-open gaps to close" in p]
+    assert len(rem_prompts) == 1
+    assert "real bug" in rem_prompts[0]
+    assert "spec issue" not in rem_prompts[0]
+    # last_gaps (the engine's honest report) stays RAW — both gaps survive.
+    assert {g.title for g in res.last_gaps} == {"real bug", "spec issue"}

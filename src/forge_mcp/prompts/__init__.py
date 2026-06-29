@@ -9,6 +9,7 @@ PROMPT_NAMES = (
     "generator_system",
     "evaluator_system",
     "evaluator_triage",
+    "remediation",
 )
 
 

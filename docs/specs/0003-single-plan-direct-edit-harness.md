@@ -112,7 +112,9 @@ gone). Added: `spec_fingerprint` (in-loop amendment advances it).
 
 1. **generate** — `run_generator(codex_runner, contract_text, target_dir, surface, …)`. Codex
    edits files in `target_dir` (§5). Iteration 1's contract is `plan.body`; later iterations
-   use a remediation contract listing the still-open gaps (+ a NUDGE note when signalled).
+   use a remediation contract — a Claude-authored, repo-grounded plan that targets only the
+   still-open code-bug gaps (`run_remediation`, §6; triage-filtered; + a NUDGE note when
+   signalled), not a restatement of the full plan body.
 2. **verify** — when `plan.verification_command` is set, `run_verification(command,
    target_dir)`; cache the outcome; write `verify.txt`.
 3. **evaluate** — `run_evaluator(claude_runner, spec_text=<current>, cwd=target_dir, …)`
@@ -206,7 +208,7 @@ human to approve an escalation. The Codex SDK exposes no public Python-callback 
 `HookMatcher`), so a git-deny callback is not available; this is the same posture as 0001 and is
 acceptable because git-state does not gate completion (§7).
 
-## §6. The Claude stages (`drivers/planner.py`, `drivers/evaluator.py`)
+## §6. The Claude stages (`drivers/planner.py`, `drivers/evaluator.py`, `drivers/remediator.py`)
 
 The Planner and Evaluator are **unchanged in permission posture**: `build_options` still uses
 `permission_mode="bypassPermissions"` with `git_deny_hooks()` (a PreToolUse Bash matcher that
@@ -229,6 +231,26 @@ unchanged. `run_evaluator` drops the now-unused `sandbox: Path` parameter (its s
 both `sandbox` and `cwd` today; `run_triage` already takes only `cwd`, so it is unchanged); the
 two call sites — `run_evaluator` at `phases.py:274-281` and `run_triage` at `phases.py:289-296`,
 each passing `cwd=sandbox` today — pass `cwd=target_dir`.
+
+**The remediation stage (`run_remediation`, `drivers/remediator.py`)** is a third Claude stage,
+invoked by the iteration loop (§4 step 1) when an iteration does not complete: it authors the
+*next* iteration's contract as a focused, repo-grounded plan over the still-open gaps, rather
+than re-emitting the plan body with a gaps footnote. The gaps it receives are **triage-filtered**
+to the effective code bugs (`effective_code_bug_titles`): a validly-demoted design fault is the
+spec's problem, not a code fix, so it is excluded from what remediation tells the Generator to
+close — and when it carries a cited `proposed_amendment`, the §4 step 8 amendment resolves it
+(rather than the Generator). That triage-filtered set stays identical to the completion gate's
+code-bug set; `last_gaps` stays raw for the engine's honest unresolved-gaps report. It shares the Planner/Evaluator permission
+posture — `bypassPermissions` + `git_deny_hooks()`, rooted at `target_dir` so it reads the repo
+but cannot commit. Critically it returns **structured** output —
+`output_format=envelope(RemediationResult.model_json_schema())` and
+`RemediationResult(**structured_output).contract` — **not** the raw turn `result.text`. A
+remediation turn inspects the repo across many tool calls and narrates between them;
+`result.text` concatenates that interstitial narration, which would leak into the contract handed
+to the Generator. The structured `contract` field isolates the clean plan, exactly as `Plan.body`
+does for the Planner. The composed prompt carries the frozen spec, the project path, the
+still-open gaps (`title (severity): suggested_fix`), any synthesized verify blockers, the
+original plan as reference-only, and a NUDGE note when the convergence detector signals a stall.
 
 ## §7. Git & safety model
 
@@ -368,6 +390,11 @@ reference dangles.
 (remove `CONCURRENCY_CAP` and its three `engine.py` uses at `:25,409,427`),
 `orchestrator/lifecycle.py` (single-plan projection).
 
+**Create (new files):** `src/forge_mcp/drivers/remediator.py` — the `run_remediation` Claude
+stage that authors each non-completing iteration's contract as a structured `RemediationResult`
+(§6/§15). `models.py` (in the Rewrite list above) additionally gains the `RemediationResult`
+model, and the matching new test is `tests/test_remediator.py` (§13).
+
 **`amend.py`** — `apply_amendments` is called only in-loop now; change `proposed:
 list[tuple[str, GapTriage]]` → `proposed: list[GapTriage]` and drop the `plan_id` field from
 the `spec_amendments.md` entry (there is no plan id). Behavior (serial citation re-validation,
@@ -419,6 +446,9 @@ Success gate (`scripts/ci.sh`): `ruff check` + `ruff format --check` + `pyright`
   (only `git_deny_matches` survives), `test_codex_seam.py` + `test_sdk_contract.py`
   (`workspace_write` + `deny_all`), `test_artifacts.py` (flat layout), `test_generator.py`
   (`target_dir`), `test_evaluator.py` (cwd), `test_e2e_real_clis.py` (single-plan run).
+- **New:** `test_remediator.py` — the `run_remediation` stage: asserts the structured
+  `contract` field is parsed (not `result.text`, so turn narration cannot leak) and that the
+  prompt carries the open gaps + synthesized blockers + NUDGE.
 - **Unchanged (verify still green):** `test_convergence.py`, `test_verifier.py`,
   `test_triage.py`, `test_ids.py`, `test_lockfile.py`, `test_state.py`, `test_check.py`,
   `test_skills.py`, `test_cli.py`, `test_server.py`, `test_claude_seam.py`, `test_config.py`,
@@ -460,6 +490,20 @@ class Plan(BaseModel, extra="forbid"):
     body: str
 
 
+class RemediationResult(BaseModel, extra="forbid"):
+    """The remediation contract authored by one Remediation turn (§6).
+
+    Design: §6 a non-completing iteration's contract is a focused plan over the
+        still-open gaps; the stage returns it as structured output (this single
+        field), not the raw turn text, so the agent's interstitial narration never
+        leaks into the contract handed to the Generator.
+    Implementation: a one-field Pydantic model, extra='forbid'; contract holds the
+        Markdown plan; run_remediation returns RemediationResult(**structured_output).contract.
+    Example: RemediationResult(contract='# Remediation plan for gap X').
+    """
+    contract: str
+
+
 # drivers/planner.py
 async def run_planner(runner, *, spec_text, plan_schema, cwd, run_log_path=None) -> Plan:
     """Run the Planner stage and return a single validated Plan (§5.1 superseded).
@@ -473,6 +517,25 @@ async def run_planner(runner, *, spec_text, plan_schema, cwd, run_log_path=None)
         into a Plan.
     Example: await run_planner(r, spec_text='# spec', plan_schema=Plan.model_json_schema(),
         cwd=target_dir) returns one Plan.
+    """
+
+
+# drivers/remediator.py
+async def run_remediation(runner, *, spec_text, plan_body, gaps, synthesized, nudge,
+                          cwd, run_log_path=None) -> str:
+    """Author the next iteration's remediation contract as a Claude plan (§6).
+
+    Design: §4/§6 a non-completing iteration produces a focused, repo-grounded plan
+        over the still-open gaps; git-mutation-denied under bypassPermissions, rooted
+        at cwd=target_dir so it reads the repo but cannot commit.
+    Implementation: build_options(system=remediation, output_format=
+        envelope(RemediationResult.model_json_schema()), hooks=git_deny_hooks(), cwd,
+        cli_path); compose a prompt from the frozen spec, project path, open gaps,
+        synthesized blockers, the original plan (reference only), and a NUDGE note when
+        set; runner.run; return RemediationResult(**structured_output).contract — the
+        structured field, NOT result.text, so turn narration cannot leak in.
+    Example: await run_remediation(r, spec_text='# spec', plan_body='# plan', gaps=[g],
+        synthesized=[], nudge=False, cwd=target_dir) returns the contract Markdown.
     """
 
 

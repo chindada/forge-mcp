@@ -178,3 +178,9 @@ class TriageResult(BaseModel, extra="forbid"):
     """Collection of triage verdicts for all gaps in one Evaluator turn."""
 
     triages: list[GapTriage] = []
+
+
+class RemediationResult(BaseModel, extra="forbid"):
+    """The remediation contract (Markdown plan) produced by one Remediation turn."""
+
+    contract: str

@@ -111,20 +111,23 @@ def durable_append(path: Path, text: str) -> None:
         os.fsync(f.fileno())
 
 
-def write_json(path: Path, obj: Any, *, durable: bool) -> None:
+def write_json(path: Path, obj: Any, *, durable: bool, indent: int | None = None) -> None:
     """Serialise obj to JSON and write it to path via the chosen durability tier.
 
     Design: §13 provides a single entry-point for JSON state files so callers
-        do not choose between json.dumps and model_dump_json directly.
+        do not choose between json.dumps and model_dump_json directly. indent is
+        a presentation-only option (default compact); callers pass indent=2 for
+        human-read artifacts (eval.json/triage.json), since indentation only aids
+        a human reader — no stage consumes these files.
     Implementation: if obj has model_dump_json (a Pydantic BaseModel) call that;
-        otherwise use json.dumps with sort_keys=True. Route to durable_replace
-        when durable=True, else light_replace.
+        otherwise use json.dumps with sort_keys=True; both forward indent. Route
+        to durable_replace when durable=True, else light_replace.
     Example: write_json(p, {'k': 1}, durable=True) writes '{"k": 1}' durably.
     """
     if hasattr(obj, "model_dump_json"):
-        text: str = obj.model_dump_json()
+        text: str = obj.model_dump_json(indent=indent)
     else:
-        text = json.dumps(obj, sort_keys=True)
+        text = json.dumps(obj, sort_keys=True, indent=indent)
 
     if durable:
         durable_replace(path, text)

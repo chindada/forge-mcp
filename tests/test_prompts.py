@@ -13,6 +13,7 @@ from forge_mcp.prompts import PROMPT_NAMES, load_prompt
         "generator_system",
         "evaluator_system",
         "evaluator_triage",
+        "remediation",
     ],
 )
 def test_each_prompt_loads_nonempty(name: str):
@@ -47,3 +48,5 @@ def test_claude_prompts_name_their_skill_capability():
     assert "plan-writing capability" in planner or "writing-plans skill" in planner
     evaluator = load_prompt("evaluator_system").lower()
     assert "code-review capability" in evaluator or "code-review skill" in evaluator
+    remediation = load_prompt("remediation").lower()
+    assert "plan-writing capability" in remediation or "writing-plans skill" in remediation

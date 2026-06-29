@@ -18,6 +18,7 @@ from forge_mcp.artifacts import RunLayout, ensure_iteration_dir
 from forge_mcp.convergence import detect_non_progress, fingerprint
 from forge_mcp.drivers.evaluator import run_evaluator, run_triage
 from forge_mcp.drivers.generator import run_generator
+from forge_mcp.drivers.remediator import run_remediation
 from forge_mcp.models import EvalGap, GapSummary, GapTriage, Plan
 from forge_mcp.orchestrator.amend import apply_amendments
 from forge_mcp.orchestrator.plan_state import PlanState
@@ -80,42 +81,47 @@ def _seed_contract(plan: Plan, layout: RunLayout, n: int) -> str:
     return plan.body
 
 
-def _write_remediation_contract(
+async def _write_remediation_contract(
     plan: Plan,
     layout: RunLayout,
     n: int,
     *,
+    claude_runner: ClaudeRunner,
+    spec_text: str,
+    target_dir: Path,
     gaps: list[EvalGap],
     synthesized: list[GapSummary],
     nudge: bool,
+    run_log_path: Path | None = None,
 ) -> str:
-    """Write the next iteration's remediation contract incorporating open gaps.
+    """Write the next iteration's remediation contract as a Claude-authored plan.
 
     Design: §4 a non-completing iteration produces a remediation contract that
-        instructs the next Generator turn to close the still-open gaps; the
-        synthesized verify blocker is surfaced too (a plan whose only open issue
-        is a failing verification would otherwise see no signal); a NUDGE signal
-        appends an anti-oscillation note so the agent varies its approach.
-    Implementation: render each eval gap as a title/severity/fix bullet, prefix
-        the plan body for context, append a brief plain-text note per synthesized
-        blocker (GapSummary carries only the title), append the nudge note when
-        nudge is True, then write to iteration-(n)/contract.md and return the text.
-    Example: _write_remediation_contract(plan, layout, 2, gaps=[g], synthesized=[],
-        nudge=False) writes a contract listing g and returns it.
+        instructs the next Generator turn to close the still-open gaps. Claude
+        writes a focused, repo-grounded plan from the open gaps (via the
+        Remediation stage) rather than re-emitting the whole plan body with a
+        gaps footnote — so each iteration's contract is a genuine plan to fix the
+        previous gap. The synthesized verify blocker is surfaced too (a plan whose
+        only open issue is a failing verification would otherwise see no signal);
+        a NUDGE signal asks the agent to vary its approach.
+    Implementation: delegate to run_remediation (Claude, git-deny, rooted at
+        target_dir, returning the structured `contract` field), then write the
+        returned Markdown to iteration-(n)/contract.md and return it.
+    Example: await _write_remediation_contract(plan, layout, 2, claude_runner=r,
+        spec_text='# spec', target_dir=p, gaps=[g], synthesized=[], nudge=False)
+        writes a contract closing g and returns it.
     """
-    lines = [plan.body, "", "## Remaining gaps to close"]
-    for g in gaps:
-        lines.append(f"- {g.title} ({g.severity}): {g.suggested_fix}")
-    for s in synthesized:
-        lines.append(f"- Also: {s.title} — resolve this blocker.")
-    if nudge:
-        lines.append("")
-        lines.append(
-            "## Note: prior iterations did not make progress on these gaps — "
-            "try a different approach."
-        )
-    text = "\n".join(lines)
     ensure_iteration_dir(layout, n)
+    text = await run_remediation(
+        claude_runner,
+        spec_text=spec_text,
+        plan_body=plan.body,
+        gaps=gaps,
+        synthesized=synthesized,
+        nudge=nudge,
+        cwd=target_dir,
+        run_log_path=run_log_path,
+    )
     light_replace(layout.contract(n), text)
     return text
 
@@ -209,6 +215,7 @@ async def run_plan_loop(
         history: list[frozenset[str]] = []
         amendment_history: list[frozenset[str]] = []
         last_gaps: list[EvalGap] = []
+        last_remediation_gaps: list[EvalGap] = []
         last_synthesized: list[GapSummary] = []
         nudge_next = False
 
@@ -221,13 +228,17 @@ async def run_plan_loop(
             contract_text = (
                 _seed_contract(plan, layout, n)
                 if n == 1
-                else _write_remediation_contract(
+                else await _write_remediation_contract(
                     plan,
                     layout,
                     n,
-                    gaps=last_gaps,
+                    claude_runner=claude_runner,
+                    spec_text=spec_text,
+                    target_dir=target_dir,
+                    gaps=last_remediation_gaps,
                     synthesized=last_synthesized,
                     nudge=nudge_next,
+                    run_log_path=layout.run_log,
                 )
             )
             nudge_next = False
@@ -256,7 +267,7 @@ async def run_plan_loop(
                 cwd=target_dir,
                 run_log_path=layout.run_log,
             )
-            write_json(layout.eval(n), eval_result, durable=False)
+            write_json(layout.eval(n), eval_result, durable=False, indent=2)
 
             # 4. triage (only when the eval found gaps).
             triages: list[GapTriage] = []
@@ -271,7 +282,7 @@ async def run_plan_loop(
                     cwd=target_dir,
                     run_log_path=layout.run_log,
                 )
-                write_json(layout.triage(n), triage_result, durable=False)
+                write_json(layout.triage(n), triage_result, durable=False, indent=2)
                 triages = triage_result.triages
                 triage_ran = True
 
@@ -282,6 +293,16 @@ async def run_plan_loop(
             )
             last_gaps = eval_result.gaps
             last_synthesized = synthesized
+            # The triage-filtered code-bug set drives BOTH the completion gate
+            # (step 9) and the next iteration's remediation contract: a validly
+            # demoted design fault is the spec's problem, not a code fix, so it is
+            # excluded from what the Generator is told to close (the step 8
+            # amendment resolves it only when it carries a cited proposed_amendment;
+            # otherwise it persists and the run stops honestly via non-progress).
+            # last_gaps stays RAW so the engine still gets an honest FULL
+            # unresolved-gaps report (PlanLoopResult.last_gaps).
+            code_bug_titles = effective_code_bug_titles(eval_result.gaps, triages, spec_text)
+            last_remediation_gaps = [g for g in eval_result.gaps if g.title in code_bug_titles]
 
             # 6. fingerprint over the FULL post-synthesize set (eval ∪ synthesized).
             fp_items = sorted(
@@ -331,7 +352,7 @@ async def run_plan_loop(
                 continue
 
             # 9. completion? §4 two-conjunct gate (effective_no_gaps ∧ verify_passed).
-            code_bug_titles = effective_code_bug_titles(eval_result.gaps, triages, spec_text)
+            # code_bug_titles was computed above (after triage) and is reused here.
             # Synthesized gaps are non-demotable code-bugs: the set of remaining
             # code bugs is empty iff there are no eval code-bugs AND none synthesized.
             no_remaining_code_bugs = not code_bug_titles and not synthesized

@@ -11,7 +11,7 @@ Apply your **plan-writing capability** (the writing-plans skill) to structure th
 1. **Plan only what the spec requires.** Do not add work for "nice to have" features, defensive edge-cases the spec does not mention, or general engineering improvements unrelated to the spec.
 2. **Surface confusion in the plan body.** If the spec is unclear, write the ambiguity into the `body` text as an explicit open question. Name the ambiguity rather than silently resolving it by picking one interpretation.
 3. **No premature implementation detail.** The body names *what* must be built and *why*, not *how* it is built. Describe interfaces and contracts, not code.
-4. **Forbidden: git mutations.** Do not issue any `git commit`, `git push`, `git add`, `git reset`, or any other git command that modifies repository state. Planning only — no writes to the repository.
+4. **Forbidden: git mutations.** Do not issue `git commit`, `git push`, `git add`, `git reset`, or any other git command that modifies repository state. Planning only — no writes to the repository.
 5. **Scope discipline.** Produce one plan for this spec. Keep unrelated cleanup or refactoring out of the body unless the spec explicitly asks for it.
 6. **Pick the dominant surface.** Set `surface` to exactly `"backend"` or `"frontend"`, matching the layer where most of the work lands. This selects the capability preface handed to the Generator.
 
@@ -28,7 +28,7 @@ Apply your **plan-writing capability** (the writing-plans skill) to structure th
 }
 ```
 
-**Weak plan (do not produce):** a `body` that prescribes implementation mechanics ("use subprocess.Popen with a Timer that calls .kill() after N seconds; set the exit code to -9"). The planner does not own those choices — name the contract, not the code.
+**Weak plan (do not produce):** a `body` that prescribes implementation mechanics ("use subprocess.Popen with a Timer that calls .kill() after N seconds; set the exit code to -9"). The Planner does not own those choices — name the contract, not the code.
 
 ## Input
 
