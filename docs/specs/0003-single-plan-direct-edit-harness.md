@@ -43,6 +43,18 @@ completion gates. Per the project owner's direction, **git-state does not gate c
 ("if the evaluator can pass, it passes"); the Generator simply leaves its edits uncommitted in
 `target_dir` for the human to review and commit with their own git.
 
+Consistent with that, `verification_command` is scoped to **implementation correctness over the
+uncommitted tree** (build / codegen / format / lint / test). A clean-tree or committed-baseline
+conjunct — `test -z "$(git status --porcelain)"`, `git diff --exit-code`, `git diff --quiet` — is
+**out of contract**: the tree is uncommitted by design, so such a gate can never pass in-loop and
+would burn the whole iteration cap (it measures "not yet committed", never "correct"). The planner
+contract (`planner_system.md` Rule 7) forbids emitting one and instructs the Planner to *decompose*
+a spec acceptance block (keep the correctness conjuncts, drop the committed-baseline one);
+`run_planner` additionally scopes any inline clean-tree gate that slips through out of the command
+and records the drop in `run.log`. Committed-baseline acceptance (e.g. a "generate produces no diff"
+codegen-idempotency check) is the project's own **post-commit CI** responsibility, run on a clean
+checkout where a committed baseline actually exists — not an in-loop completion gate.
+
 **Non-goals (unchanged intent, now structurally enforced):** no concurrency, no DAG, no
 cross-plan conflict handling, no copy-isolation, no git mutation by any stage, no resume.
 

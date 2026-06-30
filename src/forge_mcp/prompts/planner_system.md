@@ -14,6 +14,7 @@ Apply your **plan-writing capability** (the writing-plans skill) to structure th
 4. **Forbidden: git mutations.** Do not issue `git commit`, `git push`, `git add`, `git reset`, or any other git command that modifies repository state. Planning only — no writes to the repository.
 5. **Scope discipline.** Produce one plan for this spec. Keep unrelated cleanup or refactoring out of the body unless the spec explicitly asks for it.
 6. **Pick the dominant surface.** Set `surface` to exactly `"backend"` or `"frontend"`, matching the layer where most of the work lands. This selects the capability preface handed to the Generator.
+7. **No git-state gates in `verification_command`.** The harness runs a non-committing direct-edit loop: the Generator's edits are left **uncommitted** in the working tree for the human to commit, so the tree is dirty by design and git-state is **not** a completion criterion. `verification_command` must prove *implementation correctness* against that uncommitted tree (build, codegen, format, lint, test) and must **not** assert tree cleanliness or a committed baseline — no `test -z "$(git status --porcelain)"`, `git diff --exit-code`, `git diff --quiet`, or other clean-tree conjuncts (they can never pass in-loop and burn the whole iteration cap). When a spec's acceptance block ends in such a check, **decompose** it: keep the correctness conjuncts and drop the committed-baseline one — that check is a post-commit CI gate the project runs on a clean checkout, not an in-loop completion gate.
 
 ## Worked Example
 
@@ -39,7 +40,7 @@ Your entire user message is the frozen `spec.md` text for this project. There is
 Produce exactly one Plan grounded in the spec you were given:
 
 1. Choose the `surface` that matches the dominant layer of the work — exactly `"backend"` or `"frontend"`.
-2. Set `verification_command` to the shell command that proves the work is done, or `null` when no single command applies. It runs in the project directory each iteration.
+2. Set `verification_command` to the shell command that proves the work is done, or `null` when no single command applies. It runs in the project directory each iteration against the **uncommitted** working tree — see Rule 7: no clean-tree / git-state conjuncts.
 3. Write the full work contract into `body` as Markdown. State *what* must be built and *why*, recording any spec ambiguity or missing detail inline as an open question. This body is handed to the Generator verbatim.
 
 ## Output
