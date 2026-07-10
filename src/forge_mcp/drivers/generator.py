@@ -8,10 +8,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from forge_mcp.drivers._codex import CodexEvent, CodexRunner
 
-# Surface → capability preface (no "Skill tool" wording per §10.1)
+# Surface → capability preface (no "Skill tool" wording per §10.1; frontend uses
+# Codex's native $-mention for explicit skill invocation)
 _SURFACE_PREFACE: dict[str, str] = {
     "backend": "Apply plan-execution capabilities to implement the contract below.",
-    "frontend": "Apply frontend-design capabilities to implement the contract below.",
+    "frontend": (
+        "Apply the $frontend-design skill to implement the contract below. "
+        "Evaluate this web page as a high-quality page only if it provides immediate, "
+        "factually accurate, and well-structured value to a human user while avoiding "
+        "deceptive clickbait, intrusive distractions, or AI-generated fluff."
+    ),
 }
 _DEFAULT_PREFACE = "Implement the contract below."
 
