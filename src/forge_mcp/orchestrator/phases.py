@@ -1,746 +1,419 @@
-"""§9 phase orchestration helpers over injected dependencies."""
+"""Single-plan iteration loop driving the §4 phase order and §6.5 verify gate.
+
+run_plan_loop runs the one plan's iteration loop directly on target_dir against
+the current spec.md, applying validated design-fault amendments in-loop. It is
+consumed by the single-plan engine (§8). The loop is wrapped in failure
+isolation so an unhandled error returns a `failed` report rather than
+propagating into the orchestrator.
+"""
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Literal
+
+from forge_mcp.artifacts import RunLayout, ensure_iteration_dir
+from forge_mcp.convergence import detect_non_progress, fingerprint
+from forge_mcp.drivers.evaluator import run_evaluator, run_triage
+from forge_mcp.drivers.generator import run_generator
+from forge_mcp.drivers.remediator import run_remediation
+from forge_mcp.models import EvalGap, GapSummary, GapTriage, Plan
+from forge_mcp.orchestrator.amend import apply_amendments
+from forge_mcp.orchestrator.plan_state import PlanState
+from forge_mcp.state import light_replace, write_json
+from forge_mcp.triage import effective_code_bug_titles, passes_citation_gate
+from forge_mcp.verifier import VerifyOutcome, run_verification
 
 if TYPE_CHECKING:
-    from mcp.server.experimental.task_context import ServerTaskContext
+    from forge_mcp.drivers._claude import ClaudeRunner
+    from forge_mcp.drivers._codex import CodexRunner
 
-from ..artifacts import atomic_write_json, atomic_write_text, write_sessions_json
-from ..config import RunConfig
-from ..drivers._claude import is_transient_error as is_transient_claude
-from ..drivers._codex import is_transient_error as is_transient_codex
-from ..errors import PlannerNoOutputError
-from ..gitguard import capture_state, changed_files, diff_state
-from ..models import EvalGap, EvalResult, RunForgeInput
-from ..runcontext import RunContext
-from ..verifier import render as render_verification
-from ..verifier import run_verification
-from . import lifecycle
-from .convergence import NON_PROGRESS_WINDOW, detect_non_progress, fingerprint_gaps
-from .emitter import _Emitter, _NullNotifier
-from .handoff import validate_contract, validate_plan
-from .ledger import RunLedger
-from .retry import with_schema_retry, with_transient_retry
-from .statemachine import RunStateMachine
-from .triage import classify_gaps
-from .watchdog import with_phase_watchdog
+# Sentinel design_doc_section value for the non-demotable synthesized verify gap (§6.5).
+_VERIFY_SENTINEL_SECTION = "§6.5"
 
 
-@dataclass(frozen=True, slots=True)
-class PhaseDeps:
-    """Frozen dependency bundle passed to phase helpers.
+@dataclass
+class PlanLoopResult:
+    """Terminal report from the single plan's §4 iteration loop.
 
-    Design: §8.3/§9 keep the engine a thin conductor and make phase helpers
-        explicit about drivers, status, config, and artifact roots.
-    Implementation: frozen slots dataclass, no behavior beyond grouping.
-    Example: deps = PhaseDeps(drivers=d, status=s, logger=l, ...).
+    Design: §4 the loop reports a single terminal state plus the freshest full
+        post-synthesize gap set so the engine can project honest unresolved
+        gaps; with direct edits there is no change_set and amendments are
+        applied in-loop, so the proposed_amendment hand-off field is gone too.
+    Implementation: plain dataclass; terminal_state is one of done / incomplete
+        / failed (no awaiting_amendment); last_gaps and synthesized carry the
+        freshest gap set; stop_reason explains a non-done stop.
+    Example: PlanLoopResult(terminal_state='done', iterations=1).
     """
 
-    drivers: Any
-    status: Any
-    logger: Any
-    run_dir: Path
-    target_dir: Path
-    inputs: RunForgeInput
-    config: RunConfig
-    emitter: _Emitter = field(default_factory=lambda: _Emitter(_NullNotifier(), None, "00000000"))
+    terminal_state: Literal["done", "incomplete", "failed"]
+    iterations: int
+    last_gaps: list[EvalGap] = field(default_factory=list)
+    synthesized: list[GapSummary] = field(default_factory=list)
+    stop_reason: str | None = None
 
 
-def _ctx(deps: PhaseDeps, iteration_n: int | None = None) -> RunContext:
-    """Build a fresh RunContext for one driver call.
+def _now() -> str:
+    """Return the current UTC time as an ISO-8601 string for state checkpoints.
 
-    Design: Invariant 3 forbids mutable shared driver context; each phase gets
-        a new value object.
-    Implementation: copy stable paths/config and optional iteration number.
-    Example: ctx = _ctx(deps, iteration_n=1).
+    Design: §4 PlanState mutations record a last_updated_at timestamp; the loop
+        is the sole writer of plan state so it supplies the clock.
+    Implementation: datetime.now in UTC, serialised with isoformat().
+    Example: _now() returns a string like '2026-06-24T00:00:00+00:00'.
     """
-    return RunContext(
-        run_dir=deps.run_dir,
-        target_dir=deps.target_dir,
-        claude_config_dir=deps.config.claude_config_dir,
-        claude_cli_path=deps.config.claude_cli_path,
-        iteration_n=iteration_n,
-    )
+    return datetime.now(UTC).isoformat()
 
 
-def _utcnow_iso() -> str:
-    """Return a UTC timestamp for sessions.json records (§C2.4).
+def _seed_contract(plan: Plan, layout: RunLayout, n: int) -> str:
+    """Write iteration 1's contract.md from the plan body and return its text.
 
-    Design: sessions.json is append-free forensic data, so stable sortable UTC
-        strings make phase ordering easy to inspect.
-    Implementation: use timezone-aware datetime and replace the UTC offset with
-        Z for concise JSON artifacts.
-    Example: ts = _utcnow_iso().
+    Design: §4 the first iteration's contract is the plan body itself; later
+        iterations use a remediation contract written from the still-open gaps.
+    Implementation: ensure the (flat, run-level) iteration dir, write plan.body
+        to contract.md via light_replace (durability not required for derived
+        artifacts), return it.
+    Example: _seed_contract(plan, layout, 1) writes plan.body to iteration-1/contract.md.
     """
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    ensure_iteration_dir(layout, n)
+    light_replace(layout.contract(n), plan.body)
+    return plan.body
 
 
-def _session_id_from(driver: Any) -> str | None:
-    """Return a JSON-safe driver session id or None (§C2.5).
-
-    Design: sessions.json is fail-soft forensic data, so test doubles or SDK
-        drift must not make artifact writing fail.
-    Implementation: read last_session_id and keep only non-empty strings.
-    Example: sid = _session_id_from(deps.drivers.evaluator).
-    """
-    sid = getattr(driver, "last_session_id", None)
-    return sid if isinstance(sid, str) and sid else None
-
-
-async def run_plan_phase(
-    deps: PhaseDeps,
-    sm: RunStateMachine,
-    ledger: RunLedger,
+async def _write_remediation_contract(
+    plan: Plan,
+    layout: RunLayout,
+    n: int,
     *,
-    task: ServerTaskContext | None = None,
-) -> None:
-    """Run the planner phase and record warnings/completion (§C2.5, §C1.6).
+    claude_runner: ClaudeRunner,
+    spec_text: str,
+    target_dir: Path,
+    gaps: list[EvalGap],
+    synthesized: list[GapSummary],
+    nudge: bool,
+    run_log_path: Path | None = None,
+) -> str:
+    """Write the next iteration's remediation contract as a Claude-authored plan.
 
-    Design: §9.1 — planner predates the loop, so its RunContext carries
-        run_dir + Claude config only (no target_dir, no iteration_n). §C2.5
-        writes plan/sessions.json before planned; §C1.6 polls task cancellation.
-    Implementation: build the planner ctx with keyword args to avoid the §8.4
-        field-order pitfall; append the literal 'plan' to completed_phases for
-        §7/§9.1 parity and record the planner session id fail-soft.
-    Example: await run_plan_phase(deps, sm, ledger, task=None).
+    Design: §4 a non-completing iteration produces a remediation contract that
+        instructs the next Generator turn to close the still-open gaps. Claude
+        writes a focused, repo-grounded plan from the open gaps (via the
+        Remediation stage) rather than re-emitting the whole plan body with a
+        gaps footnote — so each iteration's contract is a genuine plan to fix the
+        previous gap. The synthesized verify blocker is surfaced too (a plan whose
+        only open issue is a failing verification would otherwise see no signal);
+        a NUDGE signal asks the agent to vary its approach.
+    Implementation: delegate to run_remediation (Claude, git-deny, rooted at
+        target_dir, returning the structured `contract` field), then write the
+        returned Markdown to iteration-(n)/contract.md and return it.
+    Example: await _write_remediation_contract(plan, layout, 2, claude_runner=r,
+        spec_text='# spec', target_dir=p, gaps=[g], synthesized=[], nudge=False)
+        writes a contract closing g and returns it.
     """
-    sm.transition("planning")
-    lifecycle.poll_task_cancellation(task)
-    await deps.status.update(phase="planning", agent="planner", message="writing plan")
-    planner_ctx = RunContext(
-        run_dir=deps.run_dir,
-        claude_config_dir=deps.config.claude_config_dir,
-        claude_cli_path=deps.config.claude_cli_path,
+    ensure_iteration_dir(layout, n)
+    text = await run_remediation(
+        claude_runner,
+        spec_text=spec_text,
+        plan_body=plan.body,
+        gaps=gaps,
+        synthesized=synthesized,
+        nudge=nudge,
+        cwd=target_dir,
+        run_log_path=run_log_path,
     )
-    started = _utcnow_iso()
-    warning = await with_transient_retry(
-        lambda: deps.drivers.planner.write_plan(planner_ctx), is_transient=is_transient_claude
-    )
-    completed = _utcnow_iso()
-    if warning:
-        ledger.warnings.append(warning)
-    plan_path = deps.run_dir / "plan" / "plan.md"
-    problems = validate_plan(plan_path.read_text()) if plan_path.exists() else ["plan.md missing"]
-    if not plan_path.exists() or problems:
-        warning = await with_transient_retry(
-            lambda: deps.drivers.planner.write_plan(planner_ctx),
-            is_transient=is_transient_claude,
-        )
-        if warning:
-            ledger.warnings.append(warning)
-        if not plan_path.exists():
-            raise PlannerNoOutputError(
-                "planner produced no plan.md and Write tool_use recovery failed after two attempts"
-            )
-        problems = validate_plan(plan_path.read_text())
-        if problems:
-            ledger.warnings.append(f"plan.md degenerate after re-author: {problems}")
-    await deps.emitter.emit_path("plan/plan.md")  # §S5.2
-    ledger.completed_phases.append("plan")  # §7 / §9.1
-    write_sessions_json(
-        deps.run_dir / "plan" / "sessions.json",
-        iteration=0,
-        entries=[
-            {
-                "phase": "planning",
-                "sdk": "claude",
-                "session_id": _session_id_from(deps.drivers.planner),
-                "started_at": started,
-                "completed_at": completed,
-            }
-        ],
-    )
-    await deps.emitter.emit_path("plan/sessions.json")  # §S5.2
-    sm.transition("planned")
-    lifecycle.poll_task_cancellation(task)
+    light_replace(layout.contract(n), text)
+    return text
 
 
-async def _status_cb(deps: PhaseDeps, phase: str, iteration_n: int, **kwargs: Any) -> None:
-    """Forward generator stream updates to Status with phase context.
-
-    Design: §12 stream and phase events share one status sink.
-    Implementation: fill phase/iteration defaults around driver-supplied fields.
-    Example: await _status_cb(deps, 'iter_generating', 1, message='x').
-    """
-    await deps.status.update(phase=phase, iteration=iteration_n, **kwargs)
-
-
-def _make_status_cb(deps: PhaseDeps, phase: str, iteration_n: int) -> Any:
-    """Create a status callback bound to one iteration.
-
-    Design: §9.2 generator stream events need iteration context without late
-        binding loop variables in lambdas.
-    Implementation: close over copied arguments in an async nested function.
-    Example: cb = _make_status_cb(deps, 'iter_generating', 1).
-    """
-
-    async def callback(**kwargs: Any) -> None:
-        """Forward one driver status event.
-
-        Design: driver callbacks use keyword-only event fields.
-        Implementation: delegate to _status_cb with bound phase/iteration.
-        Example: await callback(agent='generator', message='x').
-        """
-        await _status_cb(deps, phase, iteration_n, **kwargs)
-
-    return callback
-
-
-async def _run_generator(deps: PhaseDeps, iteration_n: int) -> None:
-    """Invoke generator.implement for one iteration (§F2.4).
-
-    Design: §F2.4 deletes the §H7 signature-inspection branch along with the
-        network knob; the generator seam takes codex_bin and status_cb only.
-    Implementation: build the bound status callback and call implement
-        directly with the production arguments.
-    Example: await _run_generator(deps, 1).
-    """
-    await deps.drivers.generator.implement(
-        _ctx(deps, iteration_n),
-        codex_bin=deps.config.codex_bin,
-        status_cb=_make_status_cb(deps, "iter_generating", iteration_n),
-    )
-
-
-async def _evaluate(
-    deps: PhaseDeps, iteration_n: int, retry: bool, changed: list[str] | None
-) -> EvalResult:
-    """Invoke evaluator.evaluate with backward-compatible fake support (§H8).
-
-    Design: production evaluation accepts changed_files, but older focused fakes
-        should continue to exercise the same loop behavior without that keyword.
-    Implementation: inspect the bound method and pass changed_files only when
-        accepted; retry is part of the original schema-retry seam.
-    Example: er = await _evaluate(deps, 1, False, ['x.py']).
-    """
-    evaluate = deps.drivers.evaluator.evaluate
-    kwargs: dict[str, Any] = {"retry": retry}
-    if "changed_files" in inspect.signature(evaluate).parameters:
-        kwargs["changed_files"] = changed
-    return await evaluate(_ctx(deps, iteration_n), **kwargs)
-
-
-async def _write_remediation(
-    deps: PhaseDeps,
-    iteration_n: int,
+def _synthesize_blocking_gaps(
     *,
-    next_iteration_n: int,
-    eval_result: EvalResult,
-    pivot: bool,
-) -> str | None:
-    """Invoke write_remediation with backward-compatible fake support (§H3).
+    last_verification: VerifyOutcome | None,
+    verification_command: str | None,
+) -> list[GapSummary]:
+    """Build the non-demotable verification gap for this iteration (§6.5).
 
-    Design: production remediation accepts pivot, but legacy tests may override
-        the method without that keyword while still validating loop behavior.
-    Implementation: inspect the bound method and pass pivot only when accepted.
-    Example: await _write_remediation(deps, 1, next_iteration_n=2, eval_result=er, pivot=False).
+    Design: §6.5 a verification failure is a hard, non-demotable blocker; it is
+        synthesized as a high-severity gap BEFORE the gap fingerprint so it
+        enters the convergence signal and blocks completion exactly like an
+        unresolved code bug. The §9 git backstop gap is removed — git state does
+        not gate completion under the direct-edit model.
+    Implementation: append a §6.5 gap only when a verification command exists and
+        the cached outcome did not pass; otherwise return the empty list.
+    Example: _synthesize_blocking_gaps(last_verification=failed,
+        verification_command='false') returns one §6.5 verification gap.
     """
-    write_remediation = deps.drivers.evaluator.write_remediation
-    kwargs: dict[str, Any] = {"next_iteration_n": next_iteration_n, "eval_result": eval_result}
-    if "pivot" in inspect.signature(write_remediation).parameters:
-        kwargs["pivot"] = pivot
-    return await write_remediation(_ctx(deps, iteration_n), **kwargs)
-
-
-def _supports_hardened_remediation(deps: PhaseDeps) -> bool:
-    """Return True when the evaluator exposes the hardened remediation seam (§H6).
-
-    Design: §H6 validation is wired to the new pivot-capable remediation seam;
-        legacy focused fakes remain inert so old behavior tests still isolate
-        unrelated loop semantics.
-    Implementation: inspect the bound write_remediation signature for pivot.
-    Example: _supports_hardened_remediation(deps) is True for EvaluatorDriver.
-    """
-    return "pivot" in inspect.signature(deps.drivers.evaluator.write_remediation).parameters
-
-
-def _make_remediation_call(
-    deps: PhaseDeps,
-    iteration_n: int,
-    next_iteration_n: int,
-    eval_result: EvalResult,
-    pivot: bool,
-) -> Any:
-    """Bind remediation arguments for transient retry (§H3, §H5).
-
-    Design: retry must re-invoke the same remediation request without Python
-        loop-variable late binding hazards.
-    Implementation: copy arguments into an async zero-argument callback.
-    Example: await with_transient_retry(_make_remediation_call(...), is_transient=p).
-    """
-
-    async def call() -> str | None:
-        """Run one bound remediation attempt.
-
-        Design: each transient retry uses the same fresh RunContext values.
-        Implementation: delegate to _write_remediation with copied arguments.
-        Example: warning = await call().
-        """
-        return await _write_remediation(
-            deps,
-            iteration_n,
-            next_iteration_n=next_iteration_n,
-            eval_result=eval_result,
-            pivot=pivot,
-        )
-
-    return call
-
-
-async def _seed_start_contract(deps: PhaseDeps, ledger: RunLedger, start_iteration: int) -> None:
-    """Seed iteration-{start}/contract.md, branching on resume (§H13, §H2.5).
-
-    Design: §H13 seeds plan.md for start==1, but a resumed iteration (start>1)
-        must re-author from the prior remediation/eval reconstructed from
-        iteration-(start-1)/eval.json so accumulated direction is not lost;
-        seeding must never crash a resume, so unreadable artifacts fall back.
-    Implementation: skip if a contract already exists; for start==1 copy plan.md;
-        for start>1 first reuse the newest iteration-<start>.interrupted-*/contract.md
-        when it passes §H6 validate_contract, else reconstruct EvalResult from the
-        prior eval.json and call write_remediation, validating once via §H6 with a
-        single re-author, then fall back to plan.md (with a ledger warning) if still
-        degenerate.
-    Example: await _seed_start_contract(deps, ledger, 2).
-    """
-    contract = deps.run_dir / f"iteration-{start_iteration}" / "contract.md"
-    if contract.exists():
-        return
-    contract.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    plan_text = (deps.run_dir / "plan" / "plan.md").read_text()
-    if start_iteration == 1:
-        atomic_write_text(contract, plan_text)
-        await deps.emitter.emit_iteration(start_iteration, "contract.md")  # §S5.2
-        return
-    # §H2.2 reuse durable contract: prepare_resume archived the in-flight
-    # iteration to iteration-<start>.interrupted-<ts>/; recover the prior run's
-    # remediation contract from the newest such archive before re-authoring.
-    archives = sorted(
-        deps.run_dir.glob(f"iteration-{start_iteration}.interrupted-*"),
-        key=lambda p: p.name,
-    )
-    if archives:
-        archived_contract = archives[-1] / "contract.md"
-        try:
-            archived_text = archived_contract.read_text()
-        except OSError:
-            archived_text = None
-        # §H2.5 reuse only a well-formed (§H6) durable contract; otherwise fall
-        # through to the re-author path below.
-        if archived_text is not None and not validate_contract(archived_text):
-            atomic_write_text(contract, archived_text)
-            await deps.emitter.emit_iteration(start_iteration, "contract.md")
-            ledger.warnings.append(
-                f"Resume reused durable contract for iteration-{start_iteration} from archive"
+    synthesized: list[GapSummary] = []
+    if (
+        verification_command is not None
+        and last_verification is not None
+        and not last_verification.passed
+    ):
+        synthesized.append(
+            GapSummary(
+                title="verification command failed",
+                severity="high",
+                design_doc_section=_VERIFY_SENTINEL_SECTION,
             )
-            return
-    prior_eval_path = deps.run_dir / f"iteration-{start_iteration - 1}" / "eval.json"
+        )
+    return synthesized
+
+
+def _validated_amendment_row(triages: list[GapTriage], spec_text: str) -> GapTriage | None:
+    """Return the first triage row that is a validated design-fault amendment, or None.
+
+    Design: §4 step 8 a triage row is applied in-loop only when it proposes a
+        concrete amendment AND passes the citation gate against the current spec;
+        such a row durably rewrites spec.md before the next iteration evaluates.
+    Implementation: scan triages for the first row whose proposed_amendment is
+        set and that passes_citation_gate against spec_text.
+    Example: _validated_amendment_row([row], spec) returns row when it is a cited
+        design fault carrying a proposed_amendment.
+    """
+    for row in triages:
+        if row.proposed_amendment is not None and passes_citation_gate(row, spec_text):
+            return row
+    return None
+
+
+async def run_plan_loop(
+    *,
+    layout: RunLayout,
+    plan: Plan,
+    target_dir: Path,
+    spec_text: str,
+    spec_fingerprint: str,
+    claude_runner: ClaudeRunner,
+    codex_runner: CodexRunner,
+    schemas: dict,
+    max_iterations: int,
+) -> PlanLoopResult:
+    """Iterate one plan directly on target_dir to an honest terminal report (§4).
+
+    Design: §4 drives generate→verify→evaluate→triage→synthesize→converge each
+        iteration; a validated design-fault triage is applied to spec.md IN-LOOP
+        (spec_text/fingerprint rebound, churn appended to the amendment history)
+        and the loop continues; completion is the two-conjunct gate (no remaining
+        code bugs incl. the synthesized verify gap, AND verify passed). There is
+        no sandbox, no manifest/change_set, and no git backstop — the edits ARE
+        the output, left in target_dir. The iteration cap is the hard termination
+        bound. An unhandled error returns `failed` rather than propagating.
+    Implementation: per iteration write the contract, run_generator on
+        target_dir, optional run_verification(target_dir), run_evaluator and
+        run_triage with cwd=target_dir against the CURRENT spec_text, synthesize
+        the verify gap only, fingerprint over eval ∪ synthesized, record the
+        iteration; if a validated amendment exists apply_amendments([row]),
+        rebind spec_text/spec_fingerprint, append churn to amendment_history,
+        EARLY_STOP→incomplete 'amendment thrash' else honor the cap and continue;
+        otherwise test completion / gap-non-progress / cap and either return or
+        write a (possibly nudged) remediation contract and continue.
+    Example: a clean plan with no verify command and no gaps returns
+        PlanLoopResult(terminal_state='done', iterations=1).
+    """
+    plan_state = PlanState(layout)
     try:
-        eval_result = EvalResult.model_validate_json(prior_eval_path.read_text())
-    except Exception:
-        # §H2.5: prior eval missing/corrupt — degrade to plan.md so resume proceeds.
-        atomic_write_text(contract, plan_text)
-        await deps.emitter.emit_iteration(start_iteration, "contract.md")
-        ledger.warnings.append(
-            f"Resume could not reconstruct eval for iteration-{start_iteration}; "
-            "seeded contract from plan.md"
-        )
-        return
-    await _write_remediation(
-        deps,
-        start_iteration - 1,
-        next_iteration_n=start_iteration,
-        eval_result=eval_result,
-        pivot=False,
-    )
-    if not _supports_hardened_remediation(deps):
-        await deps.emitter.emit_iteration(start_iteration, "contract.md")
-        return
-    problems = (
-        validate_contract(contract.read_text()) if contract.exists() else ["contract.md missing"]
-    )
-    if problems:
-        await _write_remediation(
-            deps,
-            start_iteration - 1,
-            next_iteration_n=start_iteration,
-            eval_result=eval_result,
-            pivot=False,
-        )
-        problems = (
-            validate_contract(contract.read_text())
-            if contract.exists()
-            else ["contract.md missing"]
-        )
-    if problems:
-        atomic_write_text(contract, plan_text)
-        await deps.emitter.emit_iteration(start_iteration, "contract.md")
-        ledger.warnings.append(
-            f"Resume re-author for iteration-{start_iteration} stayed degenerate "
-            f"({problems}); seeded contract from plan.md"
-        )
-    else:
-        await deps.emitter.emit_iteration(start_iteration, "contract.md")
+        history: list[frozenset[str]] = []
+        amendment_history: list[frozenset[str]] = []
+        last_gaps: list[EvalGap] = []
+        last_remediation_gaps: list[EvalGap] = []
+        last_synthesized: list[GapSummary] = []
+        nudge_next = False
 
+        for n in range(1, max_iterations + 1):
+            plan_state.bump_iteration(_now())
+            ensure_iteration_dir(layout, n)
 
-def _make_eval_call(deps: PhaseDeps, iteration_n: int, changed: list[str] | None) -> Any:
-    """Create a schema-retry callback for evaluation (§11.6, §H8).
-
-    Design: §11.6 expects a retry-flag callback without loop late binding, and
-        §H8 adds a changed-files manifest as starting context.
-    Implementation: bind iteration_n and changed paths, then call evaluator.
-    Example: await with_schema_retry(_make_eval_call(deps, 1)).
-    """
-
-    async def call(retry: bool) -> EvalResult:
-        """Run evaluator.evaluate with retry flag and changed-files manifest.
-
-        Design: each retry uses the same iteration context and manifest.
-        Implementation: build a fresh RunContext and pass retry/changed files.
-        Example: await call(False).
-        """
-        return await _evaluate(deps, iteration_n, retry, changed)
-
-    return call
-
-
-def _make_triage_call(deps: PhaseDeps, iteration_n: int, er: EvalResult) -> Any:
-    """Create a schema-retry callback for triage.
-
-    Design: §11.6 triage retry needs stable EvalResult and iteration context.
-    Implementation: bind both values in this helper and call the evaluator.
-    Example: await with_schema_retry(_make_triage_call(deps, 1, er)).
-    """
-
-    async def call(retry: bool) -> Any:
-        """Run evaluator.triage_design_flaws with a retry flag.
-
-        Design: retry attempts classify the same evaluator gaps.
-        Implementation: build a fresh RunContext and pass eval_result/retry.
-        Example: await call(True).
-        """
-        return await deps.drivers.evaluator.triage_design_flaws(
-            _ctx(deps, iteration_n), eval_result=er, retry=retry
-        )
-
-    return call
-
-
-async def run_iteration_loop(
-    deps: PhaseDeps,
-    sm: RunStateMachine,
-    ledger: RunLedger,
-    base_git: str | None,
-    *,
-    start_iteration: int = 1,
-    task: ServerTaskContext | None = None,
-) -> tuple[str, int]:
-    """Run generator/evaluator/remediation iterations (§9.2, §C2.5).
-
-    Design: preserves load-bearing ordering: triage before git-violation
-        synthesis, two-conjunct completion, and iter_remediating transition
-        before remediation writing. §C2.5 writes sessions.json before iter_done
-        and after remediation; §C1.6 polls cancellation at phase boundaries.
-    Implementation: for each iteration create contract if needed, run Codex,
-        evaluate with schema retry, triage gaps, check git diff, and either
-        complete or write next contract while collecting phase session entries.
-    Example: status, used = await run_iteration_loop(deps, sm, ledger, base_git, task=None).
-    """
-    design_text = (deps.run_dir / "inputs" / "design.md").read_text()
-    # §H13/§H2.5: start==1 seeds plan.md; resume (start>1) re-authors from the
-    # prior remediation/eval so accumulated direction survives the restart.
-    await _seed_start_contract(deps, ledger, start_iteration)
-    for iteration_n in range(start_iteration, deps.inputs.max_iterations + 1):
-        iteration_dir = deps.run_dir / f"iteration-{iteration_n}"
-        iteration_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        phase_sessions: list[dict[str, Any]] = []
-        sm.transition("iter_generating", iteration=iteration_n)
-        await deps.status.update(
-            phase="iter_generating",
-            agent="generator",
-            message="implementing",
-            iteration=iteration_n,
-        )
-        gen_iteration = iteration_n
-        gen_started = _utcnow_iso()
-        await with_phase_watchdog(
-            with_transient_retry(
-                lambda gen_iteration=gen_iteration: _run_generator(deps, gen_iteration),
-                is_transient=is_transient_codex,
-            ),
-            status=deps.status,
-            phase="iter_generating",
-            iteration=iteration_n,
-        )
-        phase_sessions.append(
-            {
-                "phase": "iter_generating",
-                "sdk": "codex",
-                "session_id": _session_id_from(deps.drivers.generator),
-                "started_at": gen_started,
-                "completed_at": _utcnow_iso(),
-            }
-        )
-        # §S5.2 — generator phase fsync lands iteration-N/summary.md; emit so
-        # forge://<t>/<r>/iteration-N/summary.md subscribers get resources/updated.
-        await deps.emitter.emit_iteration(iteration_n, "summary.md")
-        lifecycle.poll_task_cancellation(task)
-        if deps.inputs.verify_command:
-            sm.transition("iter_verifying", iteration=iteration_n)
-            await deps.status.update(
-                phase="iter_verifying",
-                agent="orchestrator",
-                message="running verification command",
-                iteration=iteration_n,
-            )
-            verify_started = _utcnow_iso()
-            outcome = run_verification(
-                deps.target_dir,
-                deps.inputs.verify_command,
-                timeout_seconds=deps.inputs.verify_timeout_seconds,
-            )
-            atomic_write_text(iteration_dir / "verify.txt", render_verification(outcome))
-            await deps.emitter.emit_iteration(iteration_n, "verify.txt")  # §S5.2
-            ledger.last_verification = outcome
-            phase_sessions.append(
-                {
-                    "phase": "iter_verifying",
-                    "sdk": None,
-                    "session_id": None,
-                    "started_at": verify_started,
-                    "completed_at": _utcnow_iso(),
-                }
-            )
-            lifecycle.poll_task_cancellation(task)
-        sm.transition("iter_evaluating", iteration=iteration_n)
-        changed = changed_files(deps.target_dir)
-        eval_iteration = iteration_n
-        eval_changed = changed
-        eval_started = _utcnow_iso()
-        er = await with_transient_retry(
-            lambda eval_iteration=eval_iteration, eval_changed=eval_changed: with_schema_retry(
-                _make_eval_call(deps, eval_iteration, eval_changed)
-            ),
-            is_transient=is_transient_claude,
-        )
-        # §S5.2 — evaluator phase fsync lands both eval.md and eval.json; each is
-        # independently subscribable, so emit both so neither subscriber set is starved.
-        await deps.emitter.emit_iteration(iteration_n, "eval.md")
-        await deps.emitter.emit_iteration(iteration_n, "eval.json")
-        phase_sessions.append(
-            {
-                "phase": "iter_evaluating",
-                "sdk": "claude",
-                "session_id": _session_id_from(deps.drivers.evaluator),
-                "started_at": eval_started,
-                "completed_at": _utcnow_iso(),
-            }
-        )
-        lifecycle.poll_task_cancellation(task)
-        triage_ran = False
-        eval_for_loop = er
-        if er.gaps:
-            sm.transition("iter_triaging", iteration=iteration_n)
-            triage_iteration = iteration_n
-            triage_er = er
-            triage_started = _utcnow_iso()
-            triage_result = await with_transient_retry(
-                lambda triage_iteration=triage_iteration, triage_er=triage_er: with_schema_retry(
-                    _make_triage_call(deps, triage_iteration, triage_er)
-                ),
-                is_transient=is_transient_claude,
-            )
-            await deps.emitter.emit_iteration(iteration_n, "triage.json")  # §S5.2
-            triage_ran = True
-            phase_sessions.append(
-                {
-                    "phase": "iter_triaging",
-                    "sdk": "claude",
-                    "session_id": _session_id_from(deps.drivers.evaluator),
-                    "started_at": triage_started,
-                    "completed_at": _utcnow_iso(),
-                }
-            )
-            lifecycle.poll_task_cancellation(task)
-            outcome = classify_gaps(er, triage_result, design_text, iteration_n)
-            ledger.design_flaw_gaps.extend(outcome.design_flaws)
-            ledger.warnings.extend(outcome.warnings)
-            eval_for_loop = EvalResult(
-                no_gaps=False, gaps=outcome.code_bug_gaps, summary=er.summary
-            )
-        # §H6.3: drain gaps carried from the prior iteration (e.g. a degenerate
-        # remediation contract detected after that iteration's fingerprint ran)
-        # into this iteration's eval_for_loop, so they are fingerprinted, block a
-        # false "completed", land in unresolved_gaps, and feed the next contract —
-        # mirroring the git-violation / verify-fail synthesis placement below.
-        if ledger.carried_gaps:
-            eval_for_loop.gaps.extend(ledger.carried_gaps)
-            ledger.carried_gaps = []
-        git_diff = diff_state(base_git, capture_state(deps.target_dir))
-        if git_diff:
-            violation_path = iteration_dir / "git-violation.txt"  # §13 artifact tree
-            atomic_write_text(violation_path, git_diff)
-            await deps.emitter.emit_iteration(iteration_n, "git-violation.txt")  # §S5.2
-            eval_for_loop.gaps.append(
-                EvalGap(
-                    title="Rule 11 git mutation detected",
-                    severity="high",
-                    design_doc_section="§11.3",
-                    current_state="git refs changed during generator iteration",
-                    expected_state="generator does not mutate git refs",
-                    suggested_fix="undo git mutations and rerun without prohibited git commands",
+            # 1. generate — Codex edits target_dir directly.
+            plan_state.set_state("generating", now=_now())
+            contract_text = (
+                _seed_contract(plan, layout, n)
+                if n == 1
+                else await _write_remediation_contract(
+                    plan,
+                    layout,
+                    n,
+                    claude_runner=claude_runner,
+                    spec_text=spec_text,
+                    target_dir=target_dir,
+                    gaps=last_remediation_gaps,
+                    synthesized=last_synthesized,
+                    nudge=nudge_next,
+                    run_log_path=layout.run_log,
                 )
             )
-        if (
-            deps.inputs.verify_command
-            and ledger.last_verification is not None
-            and not ledger.last_verification.passed
-        ):
-            v = ledger.last_verification
-            eval_for_loop.gaps.append(
-                EvalGap(
-                    title="Verification command failed",
-                    severity="high",
-                    design_doc_section="§H1",
-                    current_state=(
-                        f"`{deps.inputs.verify_command}` exited {v.exit_code} "
-                        f"(timed_out={v.timed_out})"
-                    ),
-                    expected_state="verification command exits 0",
-                    suggested_fix="make the verification command pass; see iteration-N/verify.txt",
+            nudge_next = False
+            await run_generator(
+                codex_runner,
+                contract_text=contract_text,
+                target_dir=target_dir,
+                surface=plan.surface,
+                run_log_path=layout.run_log,
+            )
+            light_replace(layout.summary(n), f"Iteration {n} generated.")
+
+            # 2. verify (only when a command is declared) in target_dir.
+            last_verification: VerifyOutcome | None = None
+            if plan.verification_command is not None:
+                plan_state.set_state("verifying", now=_now())
+                last_verification = run_verification(plan.verification_command, target_dir)
+                light_replace(layout.verify_txt(n), last_verification.output)
+
+            # 3. evaluate against the CURRENT (possibly amended) spec.
+            plan_state.set_state("evaluating", now=_now())
+            eval_result = await run_evaluator(
+                claude_runner,
+                spec_text=spec_text,
+                eval_schema=schemas["eval"],
+                cwd=target_dir,
+                run_log_path=layout.run_log,
+            )
+            write_json(layout.eval(n), eval_result, durable=False, indent=2)
+
+            # 4. triage (only when the eval found gaps).
+            triages: list[GapTriage] = []
+            triage_ran = False
+            if eval_result.gaps:
+                plan_state.set_state("triaging", now=_now())
+                triage_result = await run_triage(
+                    claude_runner,
+                    spec_text=spec_text,
+                    eval_result=eval_result,
+                    triage_schema=schemas["triage"],
+                    cwd=target_dir,
+                    run_log_path=layout.run_log,
                 )
+                write_json(layout.triage(n), triage_result, durable=False, indent=2)
+                triages = triage_result.triages
+                triage_ran = True
+
+            # 5. synthesize (BEFORE fingerprint): the §6.5 verify gap only.
+            synthesized = _synthesize_blocking_gaps(
+                last_verification=last_verification,
+                verification_command=plan.verification_command,
             )
-        write_sessions_json(
-            iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
-        )
-        await deps.emitter.emit_iteration(iteration_n, "sessions.json")  # §S5.2
-        fingerprint = fingerprint_gaps(eval_for_loop.gaps)
-        atomic_write_json(iteration_dir / "gap_fingerprint.json", sorted(fingerprint))
-        await deps.emitter.emit_iteration(iteration_n, "gap_fingerprint.json")  # §S5.2
-        sm.transition("iter_done", iteration=iteration_n, last_completed_iteration=iteration_n)
-        lifecycle.poll_task_cancellation(task)
-        ledger.completed_phases.append(f"iter-{iteration_n}")  # §7 / §9.2 step 6
-        ledger.gap_fingerprints.append(fingerprint)
-        signal = detect_non_progress(ledger.gap_fingerprints, window=NON_PROGRESS_WINDOW)
-        effective_no_gaps = (not eval_for_loop.gaps) and (er.no_gaps or triage_ran)
-        verify_passed = deps.inputs.verify_command is None or bool(
-            ledger.last_verification and ledger.last_verification.passed
-        )
-        if effective_no_gaps and verify_passed:
-            ledger.decided_at = None
-            return ("completed", iteration_n)
-        if signal.kind == "break":  # §H13 step 7: break before the cap (H-Inv 4)
-            ledger.stop_reason = signal.reason
-            return ("incomplete", iteration_n)
-        if iteration_n == deps.inputs.max_iterations:
-            # §8.3: unresolved_gaps is filled by the engine from the latest
-            # eval.json via collect_unresolved_gaps — not by the loop.
-            return ("incomplete", iteration_n)
-        sm.transition("iter_remediating", iteration=iteration_n)
-        next_n = iteration_n + 1
-        remediation_started = _utcnow_iso()
-        warning = await with_transient_retry(
-            _make_remediation_call(
-                deps,
-                iteration_n,
-                next_n,
-                eval_for_loop,
-                signal.kind == "pivot",
-            ),
-            is_transient=is_transient_claude,
-        )
-        if warning:
-            ledger.warnings.append(warning)
-        next_contract = deps.run_dir / f"iteration-{next_n}" / "contract.md"
-        problems: list[str] = []
-        if _supports_hardened_remediation(deps):
-            problems = (
-                validate_contract(next_contract.read_text())
-                if next_contract.exists()
-                else ["contract.md missing"]
+            last_gaps = eval_result.gaps
+            last_synthesized = synthesized
+            # The triage-filtered code-bug set drives BOTH the completion gate
+            # (step 9) and the next iteration's remediation contract: a validly
+            # demoted design fault is the spec's problem, not a code fix, so it is
+            # excluded from what the Generator is told to close (the step 8
+            # amendment resolves it only when it carries a cited proposed_amendment;
+            # otherwise it persists and the run stops honestly via non-progress).
+            # last_gaps stays RAW so the engine still gets an honest FULL
+            # unresolved-gaps report (PlanLoopResult.last_gaps).
+            code_bug_titles = effective_code_bug_titles(eval_result.gaps, triages, spec_text)
+            last_remediation_gaps = [g for g in eval_result.gaps if g.title in code_bug_titles]
+
+            # 6. fingerprint over the FULL post-synthesize set (eval ∪ synthesized).
+            fp_items = sorted(
+                [f"{g.title}|{g.severity}" for g in eval_result.gaps]
+                + [f"{g.title}|{g.severity}" for g in synthesized]
             )
-        if problems:
-            warning = await with_transient_retry(
-                _make_remediation_call(
-                    deps,
-                    iteration_n,
-                    next_n,
-                    eval_for_loop,
-                    signal.kind == "pivot",
-                ),
-                is_transient=is_transient_claude,
-            )
-            if warning:
-                ledger.warnings.append(warning)
-            problems = (
-                validate_contract(next_contract.read_text())
-                if next_contract.exists()
-                else ["contract.md missing"]
-            )
-            if problems:
-                ledger.warnings.append(
-                    f"Degenerate remediation contract for iteration-{next_n}: {problems}"
+            write_json(layout.gap_fingerprint(n), fp_items, durable=False)
+            history.append(fingerprint(fp_items))
+
+            # 7. record this iteration completed.
+            plan_state.record_completed(n, _now())
+
+            # 8. amendment? (in-loop) — apply a validated design-fault row to spec.md.
+            amendment_row = _validated_amendment_row(triages, spec_text)
+            if amendment_row is not None:
+                outcome = apply_amendments(
+                    layout,
+                    spec_text=spec_text,
+                    spec_fingerprint=spec_fingerprint,
+                    proposed=[amendment_row],
+                    now=_now(),
                 )
-                # §H6.3: park the synthesized gap on the ledger so it reaches the
-                # NEXT iteration's eval_for_loop (drained at the top of the loop) —
-                # appending to eval_for_loop here would be dead, since the fingerprint
-                # and remediation for this iteration already consumed it.
-                ledger.carried_gaps.append(
-                    EvalGap(
-                        title="Degenerate remediation contract",
-                        severity="high",
-                        design_doc_section="§H6",
-                        current_state=(
-                            f"contract.md for iteration-{next_n} failed validation: {problems}"
-                        ),
-                        expected_state="a well-formed remediation contract",
-                        suggested_fix=(
-                            "re-author a contract with a heading and actionable acceptance criteria"
-                        ),
+                spec_text = outcome.new_spec
+                spec_fingerprint = outcome.new_fingerprint
+                amendment_history.append(outcome.churn_fingerprint)
+                if detect_non_progress(amendment_history) == "EARLY_STOP":
+                    plan_state.set_state("incomplete", now=_now())
+                    return PlanLoopResult(
+                        terminal_state="incomplete",
+                        iterations=n,
+                        last_gaps=last_gaps,
+                        synthesized=last_synthesized,
+                        stop_reason="amendment thrash",
                     )
+                if n == max_iterations:
+                    plan_state.set_state("incomplete", now=_now())
+                    return PlanLoopResult(
+                        terminal_state="incomplete",
+                        iterations=n,
+                        last_gaps=last_gaps,
+                        synthesized=last_synthesized,
+                        stop_reason="iteration cap",
+                    )
+                # The gap cannot close until the generator builds to the amended
+                # spec; carry the open gaps forward and continue.
+                plan_state.set_state("remediating", now=_now())
+                continue
+
+            # 9. completion? §4 two-conjunct gate (effective_no_gaps ∧ verify_passed).
+            # code_bug_titles was computed above (after triage) and is reused here.
+            # Synthesized gaps are non-demotable code-bugs: the set of remaining
+            # code bugs is empty iff there are no eval code-bugs AND none synthesized.
+            no_remaining_code_bugs = not code_bug_titles and not synthesized
+            effective_no_gaps = no_remaining_code_bugs and (eval_result.no_gaps or triage_ran)
+            verify_passed = plan.verification_command is None or (
+                last_verification is not None and last_verification.passed
+            )
+
+            if effective_no_gaps and verify_passed:
+                plan_state.set_state("done", now=_now())
+                return PlanLoopResult(
+                    terminal_state="done",
+                    iterations=n,
+                    last_gaps=last_gaps,
+                    synthesized=last_synthesized,
                 )
-        # §C2.2 — record AFTER any post-validation re-author so the captured
-        # session_id reflects the LAST successful remediation attempt, not the
-        # first. The runner overwrites last_session_id on each call; reading
-        # immediately before the final write captures the most recent id.
-        phase_sessions.append(
-            {
-                "phase": "iter_remediating",
-                "sdk": "claude",
-                "session_id": _session_id_from(deps.drivers.evaluator),
-                "started_at": remediation_started,
-                "completed_at": _utcnow_iso(),
-            }
+
+            # 10. non-progress (gap history)?
+            signal = detect_non_progress(history)
+            if signal == "EARLY_STOP":
+                plan_state.set_state("incomplete", now=_now())
+                return PlanLoopResult(
+                    terminal_state="incomplete",
+                    iterations=n,
+                    last_gaps=last_gaps,
+                    synthesized=last_synthesized,
+                    stop_reason="non-progress: gap-set stable",
+                )
+            if signal == "NUDGE":
+                nudge_next = True
+
+            # 11. cap?
+            if n == max_iterations:
+                plan_state.set_state("incomplete", now=_now())
+                return PlanLoopResult(
+                    terminal_state="incomplete",
+                    iterations=n,
+                    last_gaps=last_gaps,
+                    synthesized=last_synthesized,
+                    stop_reason="iteration cap",
+                )
+
+            # 12. remediate — fall through to the next iteration (contract
+            # written at the top of iteration n+1 via _write_remediation_contract).
+            plan_state.set_state("remediating", now=_now())
+
+        # Unreachable: the cap check at n == max_iterations always returns.
+        return PlanLoopResult(
+            terminal_state="incomplete",
+            iterations=max_iterations,
+            last_gaps=last_gaps,
+            synthesized=last_synthesized,
+            stop_reason="iteration cap",
         )
-        write_sessions_json(
-            iteration_dir / "sessions.json", iteration=iteration_n, entries=list(phase_sessions)
+    except Exception as exc:  # noqa: BLE001 — isolate the loop failure.
+        try:
+            plan_state.set_state("failed", now=_now())
+        except Exception:  # noqa: BLE001 — best-effort checkpoint on failure path.
+            pass
+        return PlanLoopResult(
+            terminal_state="failed",
+            iterations=0,
+            stop_reason=f"plan loop failed: {type(exc).__name__}: {exc}",
         )
-        await deps.emitter.emit_iteration(iteration_n, "sessions.json")  # §S5.2
-        lifecycle.poll_task_cancellation(task)
-    return ("incomplete", deps.inputs.max_iterations)
-
-
-async def run_phases(
-    deps: PhaseDeps,
-    sm: RunStateMachine,
-    ledger: RunLedger,
-    base_git: str | None,
-    *,
-    task: ServerTaskContext | None = None,
-) -> tuple[str, int]:
-    """Run plan phase followed by the iteration loop (§C1.6).
-
-    Design: §8 keeps engine thin by delegating normal phase order to this
-        helper while lifecycle owns terminal exceptional paths; §C1.6 threads
-        task cancellation polling into both sub-phases.
-    Implementation: call run_plan_phase then run_iteration_loop with the same
-        dependencies, ledger, and task value.
-    Example: status, n = await run_phases(deps, sm, ledger, base_git, task=None).
-    """
-    await run_plan_phase(deps, sm, ledger, task=task)
-    return await run_iteration_loop(deps, sm, ledger, base_git, task=task)

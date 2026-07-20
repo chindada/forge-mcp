@@ -1,25 +1,34 @@
-"""Canonical run-id matcher — the single source of truth for run-id shape.
-
-This module is a stdlib-only leaf: it imports only `re` so the pinned
-stdlib-only resources.py leaf (§R5.1 / §R9.1) can import it without violating
-its isolation guarantee. See finding 7 in the ultrareview remediation brief.
-"""
+"""Run-id / timestamp shape — the single source of the run-dir naming format (§12)."""
 
 from __future__ import annotations
 
 import re
+import time
 
-RUN_ID_PATTERN = r"^[0-9a-f]{8}$"
-RUN_ID_RE = re.compile(RUN_ID_PATTERN)
+RUN_ID_RE = re.compile(r"^\d{14}(-\d{2})?$")
 
 
 def is_run_id(name: str) -> bool:
-    """Return True iff name is an 8-char lowercase-hex run id.
+    """Return True if `name` is a valid second-precision run-id (§12).
 
-    Design: finding 7 — prune_old_runs, the lineage/resume/cross_design globs,
-        and the resource/server URI layers all share this one matcher instead
-        of N drifting copies (the prior len==8 check deleted any 8-char dir).
-    Implementation: full-anchored regex match against ^[0-9a-f]{8}$.
-    Example: is_run_id('abcd1234') is True; is_run_id('ABCD1234') is False.
+    Design: §12 every run-id consumer (matcher, run_dir field, lock payload,
+        prune filter) must share one shape; a mismatched filter silently never
+        prunes. This regex is that shape.
+    Implementation: full-match `^\\d{14}(-\\d{2})?$`.
+    Example: is_run_id('20260623183102') returns True.
     """
-    return RUN_ID_RE.match(name) is not None
+    return bool(RUN_ID_RE.match(name))
+
+
+def format_run_id(when: time.struct_time, *, uniquifier: int | None = None) -> str:
+    """Format a time value as `YYYYMMDDHHMMSS[-NN]` (§12).
+
+    Design: §12 second precision reduces collisions vs the example's minute
+        precision; the source time is injected (not read here) so the module
+        is pure and the matcher/formatter cannot drift.
+    Implementation: strftime the 14-digit stamp; append a zero-padded 2-digit
+        uniquifier on a same-second re-run.
+    Example: format_run_id(struct_time(...2,18,31,2...)) -> '20260623183102'.
+    """
+    base = time.strftime("%Y%m%d%H%M%S", when)
+    return f"{base}-{uniquifier:02d}" if uniquifier is not None else base

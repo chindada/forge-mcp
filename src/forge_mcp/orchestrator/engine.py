@@ -1,469 +1,330 @@
-"""§8.1 Orchestrator engine — thin conductor over collaborators."""
+"""The §8 run conductor: wire every module into a single-plan, direct-edit run.
+
+The Orchestrator.run coroutine is the integration capstone. It acquires the
+per-target lock, freezes the design into a run-local spec, plans ONCE, then runs
+that single plan's iteration loop directly on target_dir (generate → verify →
+evaluate → triage → converge, applying design-fault amendments in-loop) until the
+plan is `done` or stops honestly, and finalises an honest RunResult. The engine
+performs NO git mutation — the Generator's edits are left uncommitted in
+target_dir for the human's own git — and its terminal cleanup (mark state, close
+drivers, release lock, restore umask) runs in a `finally` and re-raises an
+injected CancelledError.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
-import logging
 import os
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from forge_mcp.artifacts import init_run_layout
+from forge_mcp.config import create_run_dir
+from forge_mcp.drivers.planner import run_planner
+from forge_mcp.lockfile import TargetLock
+from forge_mcp.models import EvalResult, Plan, RunResult, TriageResult
+from forge_mcp.orchestrator.lifecycle import PlanReport, build_run_result
+from forge_mcp.orchestrator.phases import PlanLoopResult, run_plan_loop
+from forge_mcp.orchestrator.statemachine import RunStateMachine
+from forge_mcp.state import light_replace, write_json
 
 if TYPE_CHECKING:
-    from mcp.server.experimental.task_context import ServerTaskContext
+    from forge_mcp.artifacts import RunLayout
+    from forge_mcp.drivers._claude import ClaudeRunner
+    from forge_mcp.drivers._codex import CodexRunner
 
-from ..artifacts import (
-    atomic_write_text,
-    create_run_dir,
-    prune_old_runs,
-    write_design_fingerprint,
-    write_prior_attempts,
-)
-from ..doctor import disk_space_warn_if_low
-from ..gitguard import capture_state, capture_uncommitted
-from ..models import EvalResult, RunForgeInput, RunResult
-from ..preflight import PreparedRun
-from ..state import RunState, read_state
-from ..status import Status
-from ..subscriptions import ResourceNotifier
-from . import lineage
-from .convergence import fingerprint_gaps
-from .cross_design import render_cross_design_digest
-from .emitter import _Emitter, _NullNotifier
-from .ledger import RunLedger
-from .lifecycle import (
-    _finalize_terminal,
-    collect_unresolved_gaps_safe,
-    handle_cancellation,
-    handle_failure,
-    handle_timeout,
-)
-from .phases import PhaseDeps, run_iteration_loop, run_phases
-from .result import build_result
-from .resume import ResumePoint, prepare_resume
-from .statemachine import RunStateMachine
-
-DESIGN_DOC_LARGE_BYTES = 1024 * 1024  # §8.1 — warn over 1 MB without truncating
+_RESTRICTIVE_UMASK = 0o077
 
 
-def _reconstruct_fingerprints(
-    run_dir: Path, point: ResumePoint, ledger: RunLedger
-) -> list[frozenset[str]]:
-    """Rebuild oscillation history from durable eval.json files (§H2.5, §H3).
+@dataclass
+class _RunState:
+    """Mutable bookkeeping carried across the §8 single-plan run.
 
-    Design: non-progress detection must survive resume without live context;
-        §C sidecars preserve exact live fingerprints while legacy eval.json is lossy.
-    Implementation: prefer gap_fingerprint.json per iteration, fall back to
-        eval.json reconstruction, and emit one warning when any fallback occurs.
-    Example: history = _reconstruct_fingerprints(run_dir, point, ledger).
+    Design: §8 with one plan and one tree there is no cross-wave state to
+        accumulate — only the loop's total iteration count, an optional
+        orchestrator-level stop_reason, and the single PlanLoopResult that
+        finalisation reads for honest gap projection and the verified verdict.
+    Implementation: plain mutable dataclass; `report` holds the loop's terminal
+        PlanLoopResult (None until the loop runs); `stop_reason` stays None unless
+        the engine itself records a reason; `iterations` mirrors the loop count.
+    Example: _RunState() starts a run; after the loop iterations and report are set.
     """
-    history: list[frozenset[str]] = []
-    legacy_fallback = False
-    for iteration_n in range(1, point.last_completed_iteration + 1):
-        iteration_dir = run_dir / f"iteration-{iteration_n}"
-        sidecar_path = iteration_dir / "gap_fingerprint.json"
-        if sidecar_path.exists():
-            try:
-                loaded = json.loads(sidecar_path.read_text())
-                if isinstance(loaded, list) and all(isinstance(item, str) for item in loaded):
-                    history.append(frozenset(loaded))
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-        legacy_fallback = True
-        eval_path = iteration_dir / "eval.json"
-        if not eval_path.exists():
-            continue
-        try:
-            gaps = EvalResult.model_validate_json(eval_path.read_text()).gaps
-        except Exception:  # noqa: BLE001
-            continue
-        history.append(fingerprint_gaps(gaps))
-    if legacy_fallback:
-        ledger.warnings.append(
-            "resume reconstructed approximate gap history from legacy eval.json; "
-            "gap_fingerprint.json sidecars were missing or unreadable"
-        )
-    return history
+
+    iterations: int = 0
+    stop_reason: str | None = None
+    report: PlanLoopResult | None = None
 
 
-def _accepts_task_kw(func: Any) -> bool:
-    """Return True when a callable accepts the task keyword (§C5).
+def _now() -> str:
+    """Return the current UTC time as an ISO-8601 string for state checkpoints.
 
-    Design: production phase helpers accept task, but focused tests monkeypatch
-        older helper fakes; this shim preserves test isolation without changing
-        runtime behavior.
-    Implementation: inspect the callable signature and treat **kwargs as
-        accepting task.
-    Example: if _accepts_task_kw(run_phases): pass task=self._task.
+    Design: §9 the run-level state machine records a last_updated_at on every
+        transition; the engine is the caller so it supplies the wall clock. This
+        is the checkpoint clock only — the run-dir freshness clock (`when`) is
+        injected by the caller (I12), never read here.
+    Implementation: datetime.now in UTC serialised with isoformat().
+    Example: _now() returns a string like '2026-06-24T00:00:00+00:00'.
     """
-    try:
-        parameters = inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return True
-    return "task" in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-    )
-
-
-def canonicalize_design(inputs: RunForgeInput, run_dir: Path, ledger: RunLedger) -> None:
-    """Resolve the design doc source and write it to inputs/design.md.
-
-    Design: §8.1 — preflight only validated the design inputs; this step
-        reads/resolves them into the canonical copy every later phase reads.
-        Empty/whitespace is rejected; oversized docs warn but are NOT truncated.
-    Implementation: read path or inline content, raise on empty, warn when
-        >1 MB, atomic_write_text into inputs/design.md.
-    Example: canonicalize_design(inputs, run_dir, ledger).
-    """
-    if inputs.design_doc_path is not None:
-        text = Path(inputs.design_doc_path).read_text()
-    else:
-        text = inputs.design_doc_content or ""
-    if not text.strip():
-        raise ValueError("design document is empty")
-    if len(text.encode("utf-8")) > DESIGN_DOC_LARGE_BYTES:
-        ledger.warnings.append(
-            f"design document exceeds 1 MB ({len(text)} chars); written without truncation"
-        )
-    atomic_write_text(run_dir / "inputs" / "design.md", text)
-
-
-async def warn_if_missing_target_agents_md(
-    target_dir: Path, ledger: RunLedger, status: Status
-) -> None:
-    """Warn when target_dir lacks AGENTS.md and AGENTS.override.md.
-
-    Design: §8.1 — Codex auto-loads AGENTS.md from cwd upward; absence
-        silently strips project guidance from the Generator. Surface this as a
-        non-fatal warning; if CLAUDE.md is present, add a hint that it does not
-        substitute.
-    Implementation: probe both AGENTS files; if neither exists, build a
-        message (with a CLAUDE.md hint when applicable), append to
-        ledger.warnings, await one status.update(kind='warning').
-    Example: await warn_if_missing_target_agents_md(target_dir, ledger, status).
-    """
-    if (target_dir / "AGENTS.md").exists() or (target_dir / "AGENTS.override.md").exists():
-        return
-    msg = f"target_dir has no AGENTS.md or AGENTS.override.md: {target_dir}"
-    if (target_dir / "CLAUDE.md").exists():
-        msg += (
-            " (CLAUDE.md is present but Codex does not read it; create AGENTS.md or "
-            "AGENTS.override.md to thread project guidance into the Generator)"
-        )
-    ledger.warnings.append(msg)
-    await status.update(
-        phase="init",
-        agent="orchestrator",
-        message=msg,
-        kind="warning",
-    )
+    return datetime.now(UTC).isoformat()
 
 
 class Orchestrator:
-    """Thin conductor for one forge-mcp run (§8.1).
+    """The §8 run conductor wiring every module into a single-plan, direct-edit run.
 
-    Design: the engine wires collaborators but delegates state, lifecycle,
-        phase sequencing, policy, and SDK work to focused modules.
-    Implementation: prepare run dirs/logging/status, execute phases under
-        timeout handling, build RunResult, and always release resources.
-    Example: result = await Orchestrator(prepared, inputs, config, ctx, drivers).run().
+    Design: §8 a forge run is a single async lifecycle — lock the target, freeze
+        design→spec, PLAN ONCE, run that one plan's iteration loop directly on
+        target_dir until it is `done` or stops honestly, then finalise an honest
+        RunResult. The engine performs NO git mutation (the Generator leaves its
+        edits uncommitted for the human's git) and its terminal cleanup runs in a
+        `finally` that re-raises CancelledError.
+    Implementation: a stateless class whose `run` coroutine owns all per-run state
+        locally; the SDK runners are injected so the engine never imports the SDK
+        at module scope, and `when` is injected so each call gets a fresh
+        timestamped run dir (I12) without reading the wall clock for the dir name.
+    Example: ``await Orchestrator().run(target_dir=..., design_text=..., ...)``.
     """
 
-    def __init__(
+    async def run(
         self,
-        prepared: PreparedRun,
-        inputs: RunForgeInput,
-        config: Any,
-        ctx: Any,
-        drivers: Any,
         *,
-        task: ServerTaskContext | None = None,
-        task_id: str | None = None,
-        harness_token: str | None = None,
-        notifier: ResourceNotifier | None = None,
-    ) -> None:
-        """Store constructor dependencies for run().
+        target_dir: Path,
+        design_text: str,
+        design_fingerprint: str,
+        max_iterations: int,
+        max_runtime_minutes: int,
+        claude_runner: ClaudeRunner,
+        codex_runner: CodexRunner,
+        when: time.struct_time,
+    ) -> RunResult:
+        """Drive one single-plan, direct-edit forge run end-to-end (§3.1 superseded).
 
-        Design: preflight owns validation/lock acquisition; orchestrator accepts
-            the PreparedRun handoff and injected drivers. §C5 adds optional task
-            context and id while preserving direct-call construction. §R3.2
-            adds optional harness_token for active-run resource discovery.
-        Implementation: plain attribute storage, no IO until run(). Store task
-            for Status/phase polling, task_id for terminal RunResult, and
-            harness_token for the §R3 active-run registry.
-        Example: Orchestrator(prepared, inputs, config, ctx, drivers,
-            task=task, harness_token='aBcDeFgHiJkL').
+        Design: §8 the conductor locks the target, freezes design→spec via
+            init_run_layout, plans ONCE (run_planner → one Plan), runs that plan's
+            iteration loop directly on target_dir, and finalises an honest
+            RunResult. status is 'completed' iff the plan is `done`, else
+            'incomplete' with a synthesized stop_reason; 'failed' only on an
+            orchestrator-internal error. `verified` is True only when the plan is
+            done AND a verification_command was declared — an honest False
+            otherwise. It performs NO git mutation; terminal cleanup runs in a
+            `finally` that re-raises an injected CancelledError.
+        Implementation: set a restrictive umask (restored in finally); acquire the
+            lock keyed on the run-dir name; build the layout and RunStateMachine;
+            transition planning→run_planner(→Plan)→_persist_plan→executing→
+            run_plan_loop(plan, target_dir, spec_text, spec_fingerprint, …)→
+            finalizing→_finalize. The whole body is wrapped so the `finally` marks
+            the terminal state, closes both drivers best-effort, and releases the
+            lock with NO git ops; an injected CancelledError runs that cleanup and
+            re-raises.
+        Example: a one-plan run that writes out.txt finalises status 'completed'
+            with out.txt present in target_dir and verified False (no command).
         """
-        self._prepared = prepared
-        self._inputs = inputs
-        self._config = config
-        self._ctx = ctx
-        self._drivers = drivers
-        self._task = task
-        self._task_id = task_id
-        self._harness_token = harness_token
-        self._notifier = notifier or _NullNotifier()
-
-    async def run(self) -> RunResult:
-        """Execute the run and return a terminal RunResult.
-
-        Design: §6.3 terminal completed/incomplete/failed states are normal
-            returns, with cancellation and timeout paths distinguished. §8.1
-            control-flow invariant: logger creation, disk-space warn, and
-            PhaseDeps construction occur BEFORE the outer try so their
-            failures cannot be funneled into handle_failure and deps is bound
-            for every except handler. previous_umask is captured immediately
-            before the try.
-        Implementation: build collaborators (run_dir, sm, status, logger,
-            deps, disk warn) before the try; enforce private umask just before
-            entering the try; await phase task under timeout, apply caps for
-            inline outcomes, release lock and restore umask in finally.
-        Example: result = await orchestrator.run().
-        """
-        started_at = datetime.now(UTC)
-        run_dir = create_run_dir(self._prepared.harness_dir, self._prepared.run_id)
-        ledger = RunLedger()
-        resume_point = self._prepared.resume_point
-        if resume_point is not None:
-            # §7 / §H2 / finding 6 — continue the durable record so started_at,
-            # iteration, and last_completed_iteration survive resume instead of
-            # being zeroed by a fresh RunState.
-            try:
-                initial = read_state(run_dir / "state.json")
-            except Exception:
-                # Defensive: durable state unreadable — seed from the resume
-                # anchor so resume still re-enters at the right iteration.
-                initial = RunState(
-                    state="init",
-                    run_id=self._prepared.run_id,
-                    iteration=resume_point.last_completed_iteration,
-                    target_dir=str(self._prepared.harness_dir.parent),
-                    started_at=started_at,
-                    last_updated_at=started_at,
-                    last_completed_iteration=resume_point.last_completed_iteration,
-                )
-        else:
-            initial = RunState(
-                state="init",
-                run_id=self._prepared.run_id,
-                iteration=0,
-                target_dir=str(self._prepared.harness_dir.parent),
-                started_at=started_at,
-                last_updated_at=started_at,
-            )
-        sm = RunStateMachine(run_dir / "state.json", initial)
-        status = Status(self._prepared.run_id, self._ctx, run_dir / "status.log", task=self._task)
-        emitter = _Emitter(self._notifier, self._harness_token, self._prepared.run_id)
-        status.set_max_iterations(self._inputs.max_iterations)
-        logger = logging.getLogger(f"forge_mcp.run.{self._prepared.run_id}")
-        logger.propagate = False
-        handler = logging.FileHandler(run_dir / "run.log")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        await disk_space_warn_if_low(run_dir, status, logger, ledger)  # §8.1
-        deps = PhaseDeps(
-            drivers=self._drivers,
-            status=status,
-            logger=logger,
-            run_dir=run_dir,
-            target_dir=self._prepared.harness_dir.parent,
-            inputs=self._inputs,
-            config=self._config,
-            emitter=emitter,
-        )
-        previous_umask = os.umask(0o077)  # §8.1 — captured just before the try
-        # §R3.2 — scope is built before the try so finally can see it; registry
-        # mutation itself stays inside the try that also releases the lock.
-        from ..resources import _ResourceScope, deregister_active_run, register_active_run
-
-        scope: _ResourceScope | None = None
-        if self._harness_token is not None:
-            scope = _ResourceScope(
-                run_id=self._prepared.run_id,
-                harness_dir=self._prepared.harness_dir,
-                harness_token=self._harness_token,
-            )
+        prev_umask = os.umask(_RESTRICTIVE_UMASK)
+        lock = TargetLock()
+        sm: RunStateMachine | None = None
+        run_dir: Path | None = None
+        status = "failed"
         try:
-            if scope is not None:
-                register_active_run(scope)  # §R3.2 — inside try
-            await emitter.emit_state()  # §S5.2 initial state.json already fsync'd.
-            try:
-                prune_old_runs(
-                    self._prepared.harness_dir,
-                    keep_last=self._config.keep_runs,
-                    current_run_id=self._prepared.run_id,
-                )
-            except Exception:
-                ledger.warnings.append("run retention pruning failed (non-fatal)")
-            terminal_status = "failed"
-            try:
-                inputs_dir = run_dir / "inputs"
-                if resume_point is None:
-                    sm.transition("canonicalizing")  # §8.1
-                    await emitter.emit_state()
-                    canonicalize_design(self._inputs, run_dir, ledger)
+            run_dir = create_run_dir(target_dir, when)
+            run_id = run_dir.name
+            lock.acquire(target_dir, run_id, _now())
+            layout = init_run_layout(run_dir, design_text, design_fingerprint=design_fingerprint)
+            sm = RunStateMachine(layout)
 
-                fp: str | None = None
-                try:
-                    design_text = (inputs_dir / "design.md").read_text(encoding="utf-8")
-                    fp = lineage.fingerprint_design(design_text)
-                    write_design_fingerprint(inputs_dir, fp)
-                except OSError as exc:
-                    fp = None  # §L10 — disables lineage block below; §L-Inv 2
-                    ledger.warnings.append(
-                        f"design.fingerprint write failed (cold start): {type(exc).__name__}: {exc}"
-                    )
-                    logger.warning("design.fingerprint write failed", exc_info=True)
+            state = _RunState()
 
-                if (
-                    fp is not None
-                    and not self._inputs.ignore_prior_attempts
-                    and self._config.lineage_top_k > 0
-                ):
-                    try:
-                        candidates = lineage.find_lineage_runs(
-                            self._prepared.harness_dir,
-                            fp,
-                            current_run_id=self._prepared.run_id,
-                            top_k=self._config.lineage_top_k,
-                        )
-                        summaries = [
-                            summary
-                            for summary in (
-                                lineage.summarize_prior_run(candidate.run_dir)
-                                for candidate in candidates
-                            )
-                            if summary is not None
-                        ]
-                        if summaries:
-                            digest = lineage.render_prior_attempts(summaries)
-                            overflow_path = write_prior_attempts(inputs_dir, digest)
-                            await emitter.emit_path("inputs/prior_attempts.md")
-                            ledger.linked_prior_runs = [summary.run_id for summary in summaries]
-                            ledger.lineage_overflow_path = overflow_path
-                            if overflow_path is not None:
-                                await emitter.emit_path("inputs/prior_attempts-overflow.md")
-                                ledger.warnings.append(
-                                    "lineage digest exceeded 32768 bytes; "
-                                    f"overflow at {overflow_path.name}"
-                                )
-                            await status.update(
-                                phase="canonicalizing",
-                                agent="orchestrator",
-                                message=f"lineage: {len(summaries)} prior runs feeding planner",
-                            )
-                    except Exception as exc:  # noqa: BLE001 — §L-Inv 1 best-effort.
-                        ledger.warnings.append(
-                            f"lineage discovery failed (cold start): {type(exc).__name__}: {exc}"
-                        )
-                        logger.warning("lineage discovery failed", exc_info=True)
-
-                # §X7 — the cross-design aggregator re-runs from scratch on BOTH
-                # cold-start and a §H2 resume; the digest must reflect harness
-                # state at planner-cold-start time, not at original-run-start time.
-                try:
-                    digest = render_cross_design_digest(self._prepared.harness_dir, logger)
-                    atomic_write_text(inputs_dir / "cross_design_patterns.md", digest)
-                    await emitter.emit_path("inputs/cross_design_patterns.md")  # §S5.2 / §X7
-                except OSError as exc:
-                    ledger.warnings.append(
-                        f"cross_design_patterns.md write failed: {type(exc).__name__}: {exc}"
-                    )
-                    logger.warning("cross_design_patterns.md write failed", exc_info=True)
-
-                if resume_point is None:
-                    git_state = capture_state(deps.target_dir)
-                    if git_state is not None:
-                        atomic_write_text(run_dir / "inputs" / "git-state.txt", git_state)
-                        await emitter.emit_path("inputs/git-state.txt")
-                    uncommitted = capture_uncommitted(deps.target_dir)
-                    if uncommitted:
-                        path = run_dir / "inputs" / "git-uncommitted.txt"
-                        atomic_write_text(path, uncommitted)
-                        await emitter.emit_path("inputs/git-uncommitted.txt")
-                        ledger.git_uncommitted_path = str(path)
-                    await warn_if_missing_target_agents_md(deps.target_dir, ledger, status)  # §8.1
-                    if _accepts_task_kw(run_phases):
-                        phase_task = run_phases(deps, sm, ledger, git_state, task=self._task)
-                    else:
-                        phase_task = run_phases(deps, sm, ledger, git_state)
-                else:
-                    ledger.resumed_from_iteration = resume_point.last_completed_iteration
-                    prepare_resume(run_dir, resume_point)
-                    git_state_path = run_dir / "inputs" / "git-state.txt"
-                    git_state = git_state_path.read_text() if git_state_path.exists() else None
-                    ledger.gap_fingerprints = _reconstruct_fingerprints(
-                        run_dir, resume_point, ledger
-                    )
-                    if _accepts_task_kw(run_iteration_loop):
-                        phase_task = run_iteration_loop(
-                            deps,
-                            sm,
-                            ledger,
-                            git_state,
-                            start_iteration=resume_point.start_iteration,
-                            task=self._task,
-                        )
-                    else:
-                        phase_task = run_iteration_loop(
-                            deps,
-                            sm,
-                            ledger,
-                            git_state,
-                            start_iteration=resume_point.start_iteration,
-                        )
-                terminal_status, _ = await asyncio.wait_for(
-                    phase_task, timeout=self._inputs.max_runtime_minutes * 60
-                )
-                if terminal_status == "incomplete":
-                    # §8.1 / §8.3 — iteration-cap branch reads latest eval.json
-                    # via the same helper handle_timeout uses.
-                    ledger.unresolved_gaps = collect_unresolved_gaps_safe(run_dir, logger, ledger)
-                sm.transition("finalizing")
-                await emitter.emit_state()
-                ledger.decided_at = datetime.now(UTC)
-                # finding 1 — one shared terminal tail; caps run once, before the
-                # terminal status event, matching handle_timeout/handle_failure.
-                reason = (
-                    ledger.stop_reason
-                    if (terminal_status == "incomplete" and ledger.stop_reason)
-                    else None
-                )
-                await _finalize_terminal(sm, ledger, deps, status=terminal_status, reason=reason)
-            except TimeoutError:
-                terminal_status = "incomplete"
-                await handle_timeout(sm, ledger, deps)
-            except asyncio.CancelledError:
-                # §8.1 / §8.5 step 5 — re-raises; no RunResult produced on this path.
-                await handle_cancellation(sm, ledger, deps, self._prepared.lock)
-                raise
-            except Exception as exc:  # §8.1 — KeyboardInterrupt/SystemExit must propagate
-                terminal_status = "failed"
-                await handle_failure(sm, ledger, deps, exc)
-            result = build_result(
-                run_id=self._prepared.run_id,
-                run_dir=run_dir,
-                status=terminal_status,
-                inputs=self._inputs,
-                sm=sm,
-                ledger=ledger,
-                started_at=started_at,
-                task_id=self._task_id,
-                harness_token=self._harness_token,
+            # --- PLAN (once) ---
+            sm.transition("planning", now=_now())
+            plan = await run_planner(
+                claude_runner,
+                spec_text=layout.spec_md.read_text(),
+                plan_schema=Plan.model_json_schema(),
+                cwd=target_dir,
+                run_log_path=layout.run_log,
             )
+            self._persist_plan(layout, plan)
+
+            # --- EXECUTE (one plan loop, directly on target_dir) ---
+            sm.transition("executing", now=_now())
+            report = await run_plan_loop(
+                layout=layout,
+                plan=plan,
+                target_dir=target_dir,
+                spec_text=layout.spec_md.read_text(),
+                spec_fingerprint=layout.spec_fingerprint.read_text(),
+                claude_runner=claude_runner,
+                codex_runner=codex_runner,
+                schemas={
+                    "eval": EvalResult.model_json_schema(),
+                    "triage": TriageResult.model_json_schema(),
+                },
+                max_iterations=max_iterations,
+            )
+            state.report = report
+            state.iterations = report.iterations
+
+            # --- FINALIZE ---
+            sm.transition("finalizing", now=_now())
+            status, result = self._finalize(run_dir=run_dir, plan=plan, state=state)
             return result
+        except asyncio.CancelledError:
+            # Host disconnect / runtime-cap wait_for: run terminal cleanup, re-raise.
+            status = "failed"
+            raise
+        except Exception as exc:  # noqa: BLE001 — orchestrator-internal error -> failed.
+            # §8 an orchestrator-internal/unhandled error finalises a `failed`
+            # RunResult with failure_kind (NOT a per-plan or convergence failure).
+            status = "failed"
+            return build_run_result(
+                status="failed",
+                run_dir=str(run_dir) if run_dir is not None else "",
+                iterations=0,
+                non_completed=[],
+                stop_reason=None,
+                verified=False,
+                summary=f"Orchestrator failed: {type(exc).__name__}: {exc}",
+                failure_kind=type(exc).__name__,
+            )
         finally:
-            if not ledger.lock_released:
-                self._prepared.lock.release()
-                ledger.lock_released = True
-            for handler in list(logger.handlers):
-                handler.close()
-                logger.removeHandler(handler)
-            os.umask(previous_umask)
-            if scope is not None:
-                # §R3.2 — idempotent and after lock release/umask restore.
-                deregister_active_run(scope.harness_token, scope.run_id)
+            await self._terminal_cleanup(
+                sm=sm,
+                status=status,
+                claude_runner=claude_runner,
+                codex_runner=codex_runner,
+                lock=lock,
+                prev_umask=prev_umask,
+            )
+
+    def _persist_plan(self, layout: RunLayout, plan: Plan) -> None:
+        """Write plan.json and plan.md after planning (§10).
+
+        Design: §10 the planner output is durably recorded so the run is
+            reconstructable: plan.json holds the structured single Plan and
+            plan.md carries its human-readable body. With one plan the artifacts
+            flatten to the run root (no plans/<id>/ nesting, no plan-<id>.md).
+        Implementation: write_json the Plan model durably to layout.plan_json,
+            then light_replace plan.body into layout.plan_md (derived artifact,
+            non-durable).
+        Example: _persist_plan(layout, plan) writes plan.json and plan.md.
+        """
+        write_json(layout.plan_json, plan, durable=True)
+        light_replace(layout.plan_md, plan.body)
+
+    def _finalize(
+        self,
+        *,
+        run_dir: Path,
+        plan: Plan,
+        state: _RunState,
+    ) -> tuple[str, RunResult]:
+        """Project the terminal RunResult and its status from the single plan (§8).
+
+        Design: §8 with one plan, status is 'completed' iff the plan is `done`
+            (no stop_reason); otherwise 'incomplete' with a stop_reason synthesized
+            from the plan's own reason. `verified` is True ONLY when the plan is
+            done AND a verification_command was declared (the done terminal_state IS
+            the per-iteration gate) — absent a command it is an honest False. A
+            non-completed plan contributes its freshest gap set.
+        Implementation: read the loop's PlanLoopResult; done = terminal_state ==
+            'done'; verified = done ∧ (plan.verification_command is not None);
+            status = 'completed' iff done; for a non-done plan build one PlanReport
+            from its last_gaps/synthesized/stop_reason and synthesize a run-level
+            stop_reason from the plan's reason when none is set; call
+            build_run_result.
+        Example: one done plan, no verification_command → status 'completed',
+            verified False, stop_reason None.
+        """
+        report = state.report
+        assert report is not None  # set before _finalize on every non-error path
+        done = report.terminal_state == "done"
+        verified = done and (plan.verification_command is not None)
+
+        if done:
+            status = "completed"
+            non_completed: list[PlanReport] = []
+            summary = "Plan completed."
+            stop_reason = None
+        else:
+            status = "incomplete"
+            non_completed = [
+                PlanReport(
+                    plan_id="plan",
+                    terminal_state=report.terminal_state,
+                    gaps=report.last_gaps,
+                    synthesized=report.synthesized,
+                    failure_reason=report.stop_reason,
+                )
+            ]
+            summary = "Run finished incomplete; see unresolved_gaps."
+            # I7/§8: an incomplete run MUST carry a stop_reason. Synthesize it from
+            # the plan's own reason (iteration cap, gap non-progress, amendment
+            # thrash, or a plan-loop failure) when the engine set none itself.
+            stop_reason = state.stop_reason or report.stop_reason or "plan did not complete"
+
+        result = build_run_result(
+            status=status,
+            run_dir=str(run_dir),
+            iterations=state.iterations,
+            non_completed=non_completed,
+            stop_reason=stop_reason,
+            verified=verified,
+            summary=summary,
+        )
+        return status, result
+
+    async def _terminal_cleanup(
+        self,
+        *,
+        sm: RunStateMachine | None,
+        status: str,
+        claude_runner: ClaudeRunner,
+        codex_runner: CodexRunner,
+        lock: TargetLock,
+        prev_umask: int,
+    ) -> None:
+        """Mark terminal state, close drivers, release the lock, restore umask — no git.
+
+        Design: §8 the run's `finally` must always converge: record the terminal
+            run state, close both SDK drivers best-effort, release the per-target
+            lock so a later run can acquire it, and restore the umask. It performs
+            NO git operations — the Generator's edits are left for the human's git —
+            and must never raise so it cannot mask an in-flight CancelledError being
+            re-raised.
+        Implementation: transition the state machine to the terminal `status` when
+            it is not already terminal (best-effort); await aclose() on each runner
+            inside a try/except; release the lock; os.umask(prev_umask). Every step
+            is guarded so cleanup never raises.
+        Example: after a completed run the lock file is gone and umask is restored.
+        """
+        if sm is not None:
+            try:
+                if sm.payload.state not in ("completed", "incomplete", "failed"):
+                    sm.transition(status, now=_now())
+            except Exception:  # noqa: BLE001 — best-effort terminal checkpoint.
+                pass
+        for runner in (claude_runner, codex_runner):
+            await self._close_runner(runner)
+        lock.release()
+        os.umask(prev_umask)
+
+    async def _close_runner(self, runner: object) -> None:
+        """Best-effort await one SDK driver's aclose, swallowing every error (§8).
+
+        Design: §8 terminal cleanup closes drivers but must never raise; a driver
+            whose aclose fails (or that is already closed) cannot be allowed to mask
+            the run's real outcome or a re-raised CancelledError.
+        Implementation: if the runner exposes an aclose, await it inside a
+            try/except that swallows Exception (NOT BaseException, so a propagating
+            CancelledError still unwinds). The fakes and real drivers both expose an
+            async aclose() no-op/coroutine.
+        Example: await _close_runner(FakeClaudeRunner([])) returns without raising.
+        """
+        aclose = getattr(runner, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            await aclose()
+        except Exception:  # noqa: BLE001 — best-effort driver close.
+            pass

@@ -1,118 +1,61 @@
-"""§H3 convergence: order-independent fingerprints and pivot/break detection."""
-
 from __future__ import annotations
 
-from forge_mcp.models import EvalGap
-from forge_mcp.orchestrator.convergence import (
-    NON_PROGRESS_WINDOW,
-    detect_non_progress,
-    fingerprint_gaps,
-)
+from forge_mcp.convergence import detect_non_progress, fingerprint
 
 
-def _gap(title: str, severity: str = "high") -> EvalGap:
-    """Build a minimal EvalGap for fingerprint/loop tests.
+def fp(*xs):
+    """Shorthand for fingerprint.
 
-    Design: convergence identity keys on title|severity, so other fields are
-        filler and need only satisfy the model's min_length=1 constraint.
-    Implementation: fill every required EvalGap field with a constant string.
-    Example: _gap('A', 'low').severity == 'low'.
+    Design: reduce test boilerplate.
+    Implementation: call fingerprint(*xs).
+    Example: fp('a', 'b') == fingerprint(['a', 'b']).
     """
-    return EvalGap(
-        title=title,
-        severity=severity,
-        design_doc_section="§H3",
-        current_state="x",
-        expected_state="y",
-        suggested_fix="z",
-    )
+    return fingerprint(xs)
 
 
-def test_fingerprint_is_order_independent() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_short_history_is_none():
+    """Design: §6.7 history shorter than window -> none.
+    Implementation: one entry, window 2.
+    Example: detect_non_progress([fp('a')]) == 'none'.
     """
-    a, b = _gap("A"), _gap("B")
-    assert fingerprint_gaps([a, b]) == fingerprint_gaps([b, a])
+    assert detect_non_progress([fp("a")]) == "none"
 
 
-def test_fingerprint_differs_on_changed_gap_set() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_empty_latest_is_none():
+    """Design: §6.7 an empty latest fingerprint never stops (no gaps = progress).
+    Implementation: latest is empty frozenset.
+    Example: returns 'none'.
     """
-    assert fingerprint_gaps([_gap("A")]) != fingerprint_gaps([_gap("A", "low")])
-    assert fingerprint_gaps([]) == frozenset()
+    assert detect_non_progress([fp("a"), fingerprint([])]) == "none"
 
 
-def test_detect_none_when_history_too_short() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_window_stable_is_nudge():
+    """Design: §6.7 last `window` identical (but < 2*window) -> NUDGE.
+    Implementation: 2 identical non-empty fingerprints, window 2.
+    Example: returns 'NUDGE'.
     """
-    fp = fingerprint_gaps([_gap("A")])
-    assert detect_non_progress([fp], window=2).kind == "none"
+    assert detect_non_progress([fp("a"), fp("a")]) == "NUDGE"
 
 
-def test_detect_pivot_after_one_stuck_window() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_double_window_stable_is_early_stop():
+    """Design: §6.7 last 2*window identical -> EARLY_STOP (honest stop).
+    Implementation: 4 identical fingerprints, window 2.
+    Example: returns 'EARLY_STOP'.
     """
-    fp = fingerprint_gaps([_gap("A")])
-    assert detect_non_progress([fp, fp], window=2).kind == "pivot"
+    assert detect_non_progress([fp("a")] * 4) == "EARLY_STOP"
 
 
-def test_detect_break_after_two_stuck_windows() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_changing_set_is_none():
+    """Design: §6.7 a shrinking/changing gap-set is progress.
+    Implementation: differing fingerprints -> none.
+    Example: returns 'none'.
     """
-    fp = fingerprint_gaps([_gap("A")])
-    sig = detect_non_progress([fp, fp, fp, fp], window=2)
-    assert sig.kind == "break"
-    assert "unchanged" in sig.reason
+    assert detect_non_progress([fp("a", "b"), fp("a")]) == "none"
 
 
-def test_detect_resets_to_none_on_progress() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_order_independent_fingerprint():
+    """Design: §6.7 fingerprint ignores order.
+    Implementation: same members different order compare equal.
+    Example: fp('a','b') == fp('b','a').
     """
-    a = fingerprint_gaps([_gap("A")])
-    b = fingerprint_gaps([_gap("B")])
-    assert detect_non_progress([a, a, b], window=2).kind == "none"
-
-
-def test_detect_none_when_latest_empty() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    empty = frozenset()
-    assert detect_non_progress([empty, empty, empty, empty], window=2).kind == "none"
-
-
-def test_window_constant_default_is_two() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    assert NON_PROGRESS_WINDOW == 2
+    assert fp("a", "b") == fp("b", "a")

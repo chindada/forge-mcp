@@ -1,107 +1,135 @@
-"""Run state model and atomic JSON persistence (§7, Invariant 1)."""
-
 from __future__ import annotations
 
+import json
 import os
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict, Field
-
-from .ids import RUN_ID_PATTERN
-
-StateLiteral = Literal[
-    "init",
-    "canonicalizing",
-    "planning",
-    "planned",
-    "iter_generating",
-    "iter_verifying",
-    "iter_evaluating",
-    "iter_triaging",
-    "iter_done",
-    "iter_remediating",
-    "finalizing",
-    "completed",
-    "incomplete",
-    "failed",
-    "cancelling",
-]
+from typing import Any
 
 
-class RunState(BaseModel):
-    """Durable state.json payload for a run.
+def _atomic_replace(path: Path, data: bytes | str, *, dir_fsync: bool) -> None:
+    """Write data to path via a same-dir tempfile, then atomically replace.
 
-    Design: §7 makes state.json the forensic single source for live phase,
-        iteration, cancellation flags, AND the run's target_dir + start
-        timestamp — auditors must be able to identify where and when the
-        run was rooted from state.json alone.
-    Implementation: Pydantic forbids extras; target_dir and started_at are
-        required and preserved across every transition via model_dump in
-        RunStateMachine.transition().
-    Example: RunState(state='init', run_id='abcd1234', iteration=0,
-        target_dir='/repo', started_at=now, last_updated_at=now).
+    Design: §13 crash durability requires that a partial write never leaves
+        the target file in a corrupted state; using a same-dir tempfile and
+        os.replace provides atomic rename semantics on POSIX.
+    Implementation: encode str to UTF-8 bytes; create a tempfile via
+        tempfile.mkstemp in path.parent; os.write all bytes; os.fsync the fd;
+        chmod 0o600; close; os.replace into place. If dir_fsync, also fsync
+        the parent directory (best-effort, swallows OSError). On any exception,
+        attempt to unlink the tempfile (best-effort).
+    Example: _atomic_replace(Path('/tmp/x'), 'hello', dir_fsync=False) writes
+        the string 'hello' to /tmp/x with mode 0o600.
     """
-
-    model_config = ConfigDict(extra="forbid")
-
-    state: StateLiteral
-    run_id: str = Field(min_length=8, max_length=8, pattern=RUN_ID_PATTERN)
-    target_dir: str
-    iteration: int = Field(ge=0)
-    started_at: datetime
-    last_updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    reason: str | None = None
-    cancelled: bool = False
-    last_completed_iteration: int = Field(default=0, ge=0)
-
-
-def write_state(path: Path, state: RunState) -> None:
-    """Atomically and durably persist RunState (§7, §H2 closing G5).
-
-    Design: resume (§H2) and crash-forensics (§8.2) require the resume point
-        to survive power-loss/OOM, so the write is fsync'd around os.replace;
-        transitions are rare enough that this cost is acceptable.
-    Implementation: write temp, flush + os.fsync(fd), chmod 0600, os.replace,
-        then best-effort fsync the parent directory on POSIX so rename is
-        durable; failures unlink the temp path.
-    Example: write_state(Path('state.json'), RunState(...)).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    tmp_path = Path(tmp_name)
+    raw: bytes = data.encode() if isinstance(data, str) else data
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(state.model_dump_json(indent=2))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.name == "posix":
-            os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
-        if os.name == "posix":
+        os.write(fd, raw)
+        os.fsync(fd)
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+        tmp = None  # type: ignore[assignment]
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
+
+    if dir_fsync:
+        try:
             dir_fd = os.open(str(path.parent), os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
-            except OSError:
-                pass
             finally:
                 os.close(dir_fd)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        finally:
-            raise
+        except OSError:
+            pass
 
 
-def read_state(path: Path) -> RunState:
-    """Read and validate a persisted RunState file.
+def durable_replace(path: Path, data: bytes | str) -> None:
+    """Atomically replace path with data and fsync both file and parent dir.
 
-    Design: all consumers re-enter through the model so corrupt state fails
-        loudly instead of drifting through orchestration.
-    Implementation: read text from disk and delegate JSON parsing to Pydantic.
-    Example: state = read_state(Path('state.json')).
+    Design: §13 this is the writer for state.json (run + per-plan) and
+        spec.md, where losing the last write on a crash is unacceptable.
+    Implementation: delegates to _atomic_replace with dir_fsync=True so the
+        directory entry pointing to the new inode is also flushed to disk.
+    Example: durable_replace(Path('/run/state.json'), '{}') writes '{}' and
+        fsyncs both the file and its parent directory.
     """
-    return RunState.model_validate_json(path.read_text())
+    _atomic_replace(path, data, dir_fsync=True)
+
+
+def light_replace(path: Path, data: bytes | str) -> None:
+    """Atomically replace path with data; skip parent-dir fsync.
+
+    Design: §13 lighter writer for fingerprints and ordinary artifacts where
+        a directory-entry fsync is not worth the latency cost.
+    Implementation: delegates to _atomic_replace with dir_fsync=False so only
+        the file fd is fsynced before the rename.
+    Example: light_replace(Path('/run/fp.json'), b'[]') writes bytes and
+        skips the parent-dir fsync.
+    """
+    _atomic_replace(path, data, dir_fsync=False)
+
+
+def durable_append(path: Path, text: str) -> None:
+    """Append text to path durably; create the file if it does not yet exist.
+
+    Design: §13/I3 spec_amendments.md is an append-only audit log — it must
+        NEVER be replaced wholesale (which would truncate prior entries).
+        First creation gets a parent-dir fsync to make the new inode visible.
+    Implementation: if path does not exist, open in exclusive-create mode
+        ('x') to avoid a race, then fsync the parent directory (best-effort).
+        Then open in append mode, write text, flush, and os.fsync the fd.
+    Example: two calls with 'entry-1\\n' and 'entry-2\\n' leave both lines in
+        the file with no truncation between them.
+    """
+    if not path.exists():
+        with open(path, "x"):
+            pass
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
+    with open(path, "a") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def write_json(path: Path, obj: Any, *, durable: bool, indent: int | None = None) -> None:
+    """Serialise obj to JSON and write it to path via the chosen durability tier.
+
+    Design: §13 provides a single entry-point for JSON state files so callers
+        do not choose between json.dumps and model_dump_json directly. indent is
+        a presentation-only option (default compact); callers pass indent=2 for
+        human-read artifacts (eval.json/triage.json), since indentation only aids
+        a human reader — no stage consumes these files.
+    Implementation: if obj has model_dump_json (a Pydantic BaseModel) call that;
+        otherwise use json.dumps with sort_keys=True; both forward indent. Route
+        to durable_replace when durable=True, else light_replace.
+    Example: write_json(p, {'k': 1}, durable=True) writes '{"k": 1}' durably.
+    """
+    if hasattr(obj, "model_dump_json"):
+        text: str = obj.model_dump_json(indent=indent)
+    else:
+        text = json.dumps(obj, sort_keys=True, indent=indent)
+
+    if durable:
+        durable_replace(path, text)
+    else:
+        light_replace(path, text)

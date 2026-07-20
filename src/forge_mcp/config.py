@@ -1,95 +1,119 @@
-"""Environment-derived run configuration (§6.5)."""
+"""Environment resolution, binary paths, and run-dir creation (§10.4/§12)."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import shutil
+import time
 from pathlib import Path
 
-from .resources import compute_harness_token
+from forge_mcp.ids import format_run_id
 
 
-def _parse_bounded_int_env(name: str, *, default: int, low: int, high: int) -> int:
-    """Parse an integer environment variable with an inclusive range (§E).
+def _env_path(name: str) -> Path | None:
+    """Return the env var as a Path, or None if not set.
 
-    Design: environment validation must be symmetric for every bounded integer
-        knob so bad operator input fails fast instead of drifting silently.
-    Implementation: read os.environ, int() with a wrapped ValueError, then
-        apply one inclusive range check with the same user-facing message.
-    Example: _parse_bounded_int_env('FORGE_KEEP_RUNS', default=10, low=0, high=1000).
+    Design: §10.4 env vars must take precedence over PATH lookups and
+        hard-coded defaults; a single helper centralises the lookup so each
+        public function stays concise.
+    Implementation: check os.environ for the key and return Path(value) when
+        present, None otherwise.
+    Example: with FORGE_CLAUDE_BIN=/usr/bin/myclaude, _env_path returns
+        Path('/usr/bin/myclaude').
     """
-    raw = os.environ.get(name, str(default))
+    val = os.environ.get(name)
+    return Path(val) if val is not None else None
+
+
+def claude_config_dir() -> Path:
+    """Return the Claude config directory (§10.4).
+
+    Design: §10.4 operators override the config root via env var so that
+        CI and dev environments can point at separate directories without
+        changing user home state.
+    Implementation: return $CLAUDE_CONFIG_DIR as a Path when set, else
+        ~/.claude.
+    Example: with CLAUDE_CONFIG_DIR=/tmp/cc, returns Path('/tmp/cc').
+    """
+    return _env_path("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
+
+
+def claude_bin() -> Path:
+    """Return the path to the claude binary (§10.4).
+
+    Design: §10.4 the binary location varies by install method; env var
+        overrides allow test harnesses and alternate installs to be used
+        without modifying PATH.
+    Implementation: check $FORGE_CLAUDE_BIN first, then shutil.which('claude'),
+        then fall back to ~/.local/bin/claude.
+    Example: with FORGE_CLAUDE_BIN=/opt/claude, returns Path('/opt/claude').
+    """
+    return (
+        _env_path("FORGE_CLAUDE_BIN")
+        or (Path(w) if (w := shutil.which("claude")) else None)
+        or Path.home() / ".local" / "bin" / "claude"
+    )
+
+
+def codex_bin() -> Path:
+    """Return the path to the codex binary (§10.4).
+
+    Design: §10.4 codex may be installed via npm-global rather than a
+        system path, so a dedicated fallback covers that common layout.
+    Implementation: check $FORGE_CODEX_BIN first, then shutil.which('codex'),
+        then fall back to ~/.npm-global/bin/codex.
+    Example: with FORGE_CODEX_BIN=/tmp/codex, returns Path('/tmp/codex').
+    """
+    return (
+        _env_path("FORGE_CODEX_BIN")
+        or (Path(w) if (w := shutil.which("codex")) else None)
+        or Path.home() / ".npm-global" / "bin" / "codex"
+    )
+
+
+def _ensure_harness_gitignore(harness: Path) -> None:
+    """Create harness dir and write a self-ignoring .gitignore if absent (§7.2).
+
+    Design: §7.2 the .harness directory must never appear in version control;
+        using O_EXCL ensures the file is written exactly once and subsequent
+        runs leave any existing content intact.
+    Implementation: mkdir harness with exist_ok; attempt os.open with
+        O_CREAT|O_EXCL|O_WRONLY; on success write b'*' and close; on
+        FileExistsError leave the file untouched.
+    Example: calling twice leaves .gitignore containing exactly '*'.
+    """
+    harness.mkdir(exist_ok=True)
     try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer in [{low}, {high}], got {raw!r}") from exc
-    if not low <= value <= high:
-        raise ValueError(f"{name} must be an integer in [{low}, {high}], got {raw!r}")
-    return value
+        fd = os.open(harness / ".gitignore", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return
+    try:
+        os.write(fd, b"*")
+    finally:
+        os.close(fd)
 
 
-@dataclass(frozen=True, slots=True)
-class RunConfig:
-    """Configuration resolved once before preparing a run.
+def create_run_dir(target_dir: Path, when: time.struct_time) -> Path:
+    """Create and return a timestamped run directory under target_dir/.harness (§12).
 
-    Design: §6.5 centralizes environment overrides for Codex and Claude so
-        preflight and runtime use the same values.
-    Implementation: `from_env` reads the documented environment variables and converts path-valued
-        settings to Path while leaving absent overrides as None.
-    Example: cfg = RunConfig.from_env(); cfg.codex_bin == 'codex'.
+    Design: §12 each run needs a unique, sortable directory name; same-second
+        re-runs receive a two-digit uniquifier suffix so multiple concurrent
+        or rapid sequential runs never collide.
+    Implementation: ensure .harness and its .gitignore; loop uniquifier from
+        None then 1, 2, … calling format_run_id; attempt os.makedirs at mode
+        0700 with exist_ok=False; return on success, bump uniquifier on
+        FileExistsError.
+    Example: two calls with the same struct_time yield dirs '20260623183102'
+        and '20260623183102-01'.
     """
-
-    codex_bin: str = "codex"
-    claude_config_dir: Path | None = None
-    claude_cli_path: Path | None = None
-    keep_runs: int = 10
-    harness_roots: tuple[Path, ...] = ()  # §R3.3
-    harness_root_tokens: dict[str, Path] = field(default_factory=dict)  # §R3.3 token -> root
-    lineage_top_k: int = 4  # §L8.6; K=0 disables cross-run learning.
-
-    @classmethod
-    def from_env(cls) -> RunConfig:
-        """Build configuration from documented environment variables.
-
-        Design: §6.5 names the environment contract used by both doctor and
-            preflight, including the Claude CLI runtime hatch.
-        Implementation: missing values use defaults; present path variables
-            are wrapped in Path without resolving symlinks.
-        Example: RunConfig.from_env().claude_cli_path may be Path('/bin/claude').
-        """
-        claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        claude_cli_path = os.environ.get("FORGE_CLAUDE_CLI_PATH")
-        roots_raw = os.environ.get("FORGE_HARNESS_ROOTS", "").strip()
-        roots: tuple[Path, ...] = ()
-        tokens: dict[str, Path] = {}
-        if roots_raw:
-            parsed: list[Path] = []
-            for entry in roots_raw.split(","):
-                raw_path = entry.strip()
-                if not raw_path:
-                    continue
-                root = Path(raw_path)
-                if not root.is_absolute():
-                    raise ValueError(
-                        f"FORGE_HARNESS_ROOTS entry must be an absolute path: {raw_path!r}"
-                    )
-                if not root.exists():
-                    raise ValueError(f"FORGE_HARNESS_ROOTS entry does not exist: {root}")
-                if not root.is_dir():
-                    raise ValueError(f"FORGE_HARNESS_ROOTS entry is not a directory: {root}")
-                if not os.access(root, os.R_OK):
-                    raise ValueError(f"FORGE_HARNESS_ROOTS entry is not readable: {root}")
-                parsed.append(root)
-                tokens[compute_harness_token(root)] = root
-            roots = tuple(parsed)
-        keep_runs = _parse_bounded_int_env("FORGE_KEEP_RUNS", default=10, low=0, high=1000)
-        lineage_top_k = _parse_bounded_int_env("FORGE_LINEAGE_TOP_K", default=4, low=0, high=10)
-        return cls(
-            codex_bin=os.environ.get("FORGE_CODEX_BIN", "codex"),
-            claude_config_dir=Path(claude_config_dir) if claude_config_dir else None,
-            claude_cli_path=Path(claude_cli_path) if claude_cli_path else None,
-            keep_runs=keep_runs,
-            harness_roots=roots,
-            harness_root_tokens=tokens,
-            lineage_top_k=lineage_top_k,
-        )
+    harness = target_dir / ".harness"
+    _ensure_harness_gitignore(harness)
+    u: int | None = None
+    while True:
+        run_id = format_run_id(when, uniquifier=u)
+        run_dir = harness / run_id
+        try:
+            os.makedirs(run_dir, mode=0o700, exist_ok=False)
+            return run_dir
+        except FileExistsError:
+            u = 1 if u is None else u + 1

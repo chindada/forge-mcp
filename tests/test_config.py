@@ -1,156 +1,48 @@
-from pathlib import Path
+# tests/test_config.py
+from __future__ import annotations
 
-import pytest
+import time
 
-from forge_mcp.config import RunConfig
+from forge_mcp import config
+from forge_mcp.ids import is_run_id
 
 
-def test_env_defaults(monkeypatch):
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_env_overrides(monkeypatch, tmp_path):
+    """Design: §10.4 env vars take precedence over PATH/default fallbacks.
+    Implementation: set FORGE_CODEX_BIN and CLAUDE_CONFIG_DIR.
+    Example: codex_bin() == the env path.
     """
-    monkeypatch.delenv("FORGE_CODEX_BIN", raising=False)
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("FORGE_CLAUDE_CLI_PATH", raising=False)
-    cfg = RunConfig.from_env()
-    assert cfg.codex_bin == "codex"
-    assert cfg.claude_config_dir is None
-    assert cfg.claude_cli_path is None
+    monkeypatch.setenv("FORGE_CODEX_BIN", str(tmp_path / "codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cc"))
+    assert config.codex_bin() == tmp_path / "codex"
+    assert config.claude_config_dir() == tmp_path / "cc"
 
 
-def test_env_overrides(monkeypatch):
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_create_run_dir_makes_gitignore_and_timestamp_dir(tmp_path):
+    """Design: §11/§12 .harness is self-ignored; run dir is a valid run-id.
+    Implementation: create_run_dir then inspect.
+    Example: .harness/.gitignore == '*'; run dir name is a run-id.
     """
-    monkeypatch.setenv("FORGE_CODEX_BIN", "codex-dev")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/claude")
-    monkeypatch.setenv("FORGE_CLAUDE_CLI_PATH", "/bin/claude")
-    cfg = RunConfig.from_env()
-    assert cfg.codex_bin == "codex-dev"
-    assert cfg.claude_config_dir == Path("/tmp/claude")
-    assert cfg.claude_cli_path == Path("/bin/claude")
+    when = time.struct_time((2026, 6, 23, 18, 31, 2, 0, 0, 0))
+    rd = config.create_run_dir(tmp_path, when)
+    assert (tmp_path / ".harness" / ".gitignore").read_text() == "*"
+    assert is_run_id(rd.name) and rd.is_dir()
 
 
-def test_lineage_top_k_default_4(monkeypatch) -> None:
-    """§L8.6 — default is 4.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
+def test_same_second_rerun_uniquifies(tmp_path):
+    """Design: §12 same-second re-run appends -NN.
+    Implementation: two create_run_dir with identical struct_time.
+    Example: second dir name ends with -01.
     """
-    from forge_mcp.config import RunConfig
+    when = time.struct_time((2026, 6, 23, 18, 31, 2, 0, 0, 0))
+    a = config.create_run_dir(tmp_path, when)
+    b = config.create_run_dir(tmp_path, when)
+    assert a.name != b.name and b.name.endswith("-01")
 
-    monkeypatch.delenv("FORGE_LINEAGE_TOP_K", raising=False)
-    assert RunConfig.from_env().lineage_top_k == 4
 
-
-def test_lineage_top_k_env_override(monkeypatch) -> None:
-    """§L8.6 — env override is parsed as an integer.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
+def test_concurrency_cap_removed():
+    """Design: §11 the single-plan harness has no concurrency, so CONCURRENCY_CAP is gone.
+    Implementation: the module no longer defines the constant.
+    Example: hasattr(config, 'CONCURRENCY_CAP') is False.
     """
-    from forge_mcp.config import RunConfig
-
-    monkeypatch.setenv("FORGE_LINEAGE_TOP_K", "7")
-    assert RunConfig.from_env().lineage_top_k == 7
-
-
-def test_lineage_top_k_zero_allowed(monkeypatch) -> None:
-    """§L3.2 — K=0 is the kill switch, allowed.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.config import RunConfig
-
-    monkeypatch.setenv("FORGE_LINEAGE_TOP_K", "0")
-    assert RunConfig.from_env().lineage_top_k == 0
-
-
-def test_lineage_top_k_invalid_rejected(monkeypatch) -> None:
-    """§L13.5 — invalid values raise ValueError fail-fast.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.config import RunConfig
-
-    for raw in ("-1", "11", "abc"):
-        monkeypatch.setenv("FORGE_LINEAGE_TOP_K", raw)
-        with pytest.raises(ValueError):
-            RunConfig.from_env()
-
-
-@pytest.mark.parametrize("raw", ["0", "10", "1000"])
-def test_keep_runs_bounded_int_accepts_range(monkeypatch, raw: str) -> None:
-    """FORGE_KEEP_RUNS accepts documented bounded integer values.
-
-    Design: §E requires FORGE_KEEP_RUNS validation parity with lineage top-k.
-    Implementation: set only FORGE_KEEP_RUNS and inspect the parsed config value.
-    Example: FORGE_KEEP_RUNS='1000' parses to integer 1000.
-    """
-    monkeypatch.setenv("FORGE_KEEP_RUNS", raw)
-    assert RunConfig.from_env().keep_runs == int(raw)
-
-
-@pytest.mark.parametrize(
-    ("raw", "message"),
-    [
-        ("abc", "FORGE_KEEP_RUNS must be an integer in [0, 1000], got 'abc'"),
-        ("-1", "FORGE_KEEP_RUNS must be an integer in [0, 1000], got '-1'"),
-    ],
-)
-def test_keep_runs_bounded_int_rejects_invalid(monkeypatch, raw: str, message: str) -> None:
-    """FORGE_KEEP_RUNS rejects non-integer and out-of-range values.
-
-    Design: §E makes invalid retention config fail fast instead of pruning oddly.
-    Implementation: assert the exact ValueError text for both parse and range paths.
-    Example: FORGE_KEEP_RUNS='abc' raises a bounded-int ValueError.
-    """
-    monkeypatch.setenv("FORGE_KEEP_RUNS", raw)
-    with pytest.raises(ValueError, match=message.replace("[", r"\[").replace("]", r"\]")):
-        RunConfig.from_env()
-
-
-@pytest.mark.parametrize(
-    ("name", "valid", "invalid", "low", "high"),
-    [
-        ("FORGE_KEEP_RUNS", "1000", "1001", 0, 1000),
-        ("FORGE_LINEAGE_TOP_K", "10", "11", 0, 10),
-    ],
-)
-def test_bounded_int_envs_share_range_validation(
-    monkeypatch, name: str, valid: str, invalid: str, low: int, high: int
-) -> None:
-    """Bounded integer env vars share inclusive range semantics.
-
-    Design: §E demands symmetric validation for retention and lineage knobs.
-    Implementation: verify each env accepts its upper bound and rejects above it.
-    Example: FORGE_LINEAGE_TOP_K='11' raises the shared bounded-int message.
-    """
-    monkeypatch.setenv(name, valid)
-    cfg = RunConfig.from_env()
-    assert getattr(cfg, "keep_runs" if name == "FORGE_KEEP_RUNS" else "lineage_top_k") == int(valid)
-
-    monkeypatch.setenv(name, invalid)
-    with pytest.raises(ValueError) as exc_info:
-        RunConfig.from_env()
-    assert str(exc_info.value) == f"{name} must be an integer in [{low}, {high}], got {invalid!r}"
+    assert not hasattr(config, "CONCURRENCY_CAP")

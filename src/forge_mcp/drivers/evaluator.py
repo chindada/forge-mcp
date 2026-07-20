@@ -1,230 +1,96 @@
-"""§10.3 EvaluatorDriver — evaluate, triage, and remediate."""
+"""Evaluator stage (§6): gap-finding eval pass and triage pass."""
 
 from __future__ import annotations
 
-import json
-from importlib.resources import files
-from typing import TypeVar
+from pathlib import Path
 
-from pydantic import BaseModel, ValidationError
-
-from ..artifacts import atomic_write_json, atomic_write_text, render_eval_md
-from ..errors import OutputSchemaError
-from ..models import EvalResult, TriageResult
-from ..runcontext import RunContext
-from ..schemas.eval_result import EVAL_RESULT_SCHEMA
-from ..schemas.triage_result import TRIAGE_RESULT_SCHEMA
-from ._claude import (
-    CLAUDE_SETTING_SOURCES,
-    ClaudeRunner,
-    build_options,
-    collect_writes_to_basename,
-    git_deny_hooks,
-    maybe_append_retry_suffix,
-    prune_offcwd_write_copies,
-    truncate_for_warning,
-)
-
-BaseModelT = TypeVar("BaseModelT", bound=BaseModel)
-
-PIVOT_DIRECTIVE = (
-    "Prior iterations repeatedly produced the same gaps. Do NOT refine the "
-    "current approach — choose a different implementation strategy and state it "
-    "explicitly in the contract.\n\n"
-)
+from forge_mcp.config import claude_bin
+from forge_mcp.drivers._claude import ClaudeRunner, build_options, git_deny_hooks, run_log_tee
+from forge_mcp.models import EvalResult, TriageResult
+from forge_mcp.prompts import load_prompt
+from forge_mcp.schemas import envelope
 
 
-class EvaluatorDriver:
-    """Claude-backed evaluator phase driver.
+async def run_evaluator(
+    runner: ClaudeRunner,
+    *,
+    spec_text: str,
+    eval_schema: dict,
+    cwd: Path,
+    run_log_path: Path | None = None,
+) -> EvalResult:
+    """Run the Evaluator stage and return a validated EvalResult (§6).
 
-    Design: §9.2 uses Claude for schema-bearing evaluation/triage and a
-        non-schema remediation contract, each in fresh sessions.
-    Implementation: all Claude options flow through `_claude.build_options`,
-        parse errors raise OutputSchemaError for orchestrator retry.
-    Example: result = await EvaluatorDriver(runner).evaluate(ctx).
+    Design: §6 the Evaluator diffs the code under *cwd* against the frozen
+        spec_text and emits a structured list of gaps; it is git-mutation-denied
+        (PreToolUse git-deny hook) under bypassPermissions so it can read the
+        repo but cannot commit. With the single-plan direct-edit harness the
+        evaluated tree IS *cwd* (target_dir), so the now-unused sandbox parameter
+        is gone — *cwd* alone names the directory.
+    Implementation: build options with the evaluator_system prompt, the eval JSON
+        schema as output_format, git-deny hooks, and the provided cwd; compose a
+        prompt that names *cwd* and the frozen spec; call runner.run; validate the
+        structured_output into an EvalResult.
+    Example: ``await run_evaluator(runner, spec_text="# spec",
+        eval_schema={...}, cwd=Path("/r"))`` returns an EvalResult.
     """
-
-    def __init__(self, runner: ClaudeRunner) -> None:
-        """Store the Claude runner seam.
-
-        Design: evaluator tests substitute fakes at this protocol boundary.
-        Implementation: assign runner for later method calls.
-        Example: EvaluatorDriver(fake_runner).
-        """
-        self._runner = runner
-
-    @property
-    def last_session_id(self) -> str | None:
-        """Expose the evaluator runner's last_session_id for artifacts (§C2.2).
-
-        Design: evaluator calls may run multiple Claude turns in one iteration;
-            orchestrator reads immediately after each call returns.
-        Implementation: passthrough read with None default to preserve fail-soft
-            behavior and existing test fakes.
-        Example: sid = driver.last_session_id after evaluate returns.
-        """
-        return getattr(self._runner, "last_session_id", None)
-
-    async def evaluate(
-        self, ctx: RunContext, *, retry: bool = False, changed_files: list[str] | None = None
-    ) -> EvalResult:
-        """Evaluate the current iteration and write eval artifacts.
-
-        Design: §10.3 returns structured EvalResult with one orchestrator-owned
-            schema retry on parse failure.
-        Implementation: run Claude with EVAL_RESULT_SCHEMA and optional §H8
-            changed-files manifest, parse once, then write eval artifacts.
-        Example: er = await driver.evaluate(ctx, retry=False).
-        """
-        if ctx.iteration_n is None:
-            raise RuntimeError("EvaluatorDriver requires ctx.iteration_n")
-        if ctx.target_dir is None:
-            raise RuntimeError("EvaluatorDriver.evaluate requires ctx.target_dir")
-        iteration_dir = ctx.run_dir / f"iteration-{ctx.iteration_n}"
-        system = (files("forge_mcp.prompts") / "evaluator_system.md").read_text()
-        base_prompt = "Evaluate target_dir against inputs/design.md and return EvalResult JSON."
-        if changed_files:
-            manifest = "\n".join(f"- {path}" for path in changed_files)
-            base_prompt += (
-                "\n\nThe generator changed these files this iteration; review them first, "
-                f"then anything they affect:\n{manifest}"
-            )
-        prompt = maybe_append_retry_suffix(base_prompt, retry)
-        result = await self._runner.run(
-            prompt=prompt,
-            options=build_options(
-                setting_sources=CLAUDE_SETTING_SOURCES,
-                output_format=EVAL_RESULT_SCHEMA,
-                add_dirs=[ctx.target_dir, ctx.run_dir / "inputs"],
-                disallowed_tools=("Edit",),
-                cwd=iteration_dir,
-                cli_path=ctx.claude_cli_path,
-                hooks=git_deny_hooks(),
-            ),
-            system=system,
-        )
-        er = _parse_and_validate(EvalResult, result.structured, result.text)
-        atomic_write_json(iteration_dir / "eval.json", er.model_dump(mode="json"))
-        atomic_write_text(
-            iteration_dir / "eval.md", render_eval_md(er, iteration_n=ctx.iteration_n)
-        )
-        return er
-
-    async def triage_design_flaws(
-        self, ctx: RunContext, *, eval_result: EvalResult, retry: bool = False
-    ) -> TriageResult:
-        """Classify evaluator gaps as design flaws or code bugs.
-
-        Design: §11.1 strict citation validation happens in pure triage policy,
-            but this driver obtains the structured TriageResult artifact.
-        Implementation: run Claude with TRIAGE_RESULT_SCHEMA and write
-            triage.json after a single parse/validation attempt.
-        Example: tr = await driver.triage_design_flaws(ctx, eval_result=er).
-        """
-        if ctx.iteration_n is None:
-            raise RuntimeError("EvaluatorDriver requires ctx.iteration_n")
-        iteration_dir = ctx.run_dir / f"iteration-{ctx.iteration_n}"
-        system = (files("forge_mcp.prompts") / "evaluator_triage.md").read_text()
-        prompt = maybe_append_retry_suffix(
-            "Triage these evaluator gaps against inputs/design.md:\n"
-            + eval_result.model_dump_json(indent=2),
-            retry,
-        )
-        result = await self._runner.run(
-            prompt=prompt,
-            options=build_options(
-                setting_sources=CLAUDE_SETTING_SOURCES,
-                output_format=TRIAGE_RESULT_SCHEMA,
-                add_dirs=[ctx.run_dir / "inputs"],
-                disallowed_tools=("Edit", "Write"),
-                cwd=iteration_dir,
-                cli_path=ctx.claude_cli_path,
-                hooks=git_deny_hooks(),
-            ),
-            system=system,
-        )
-        triage = _parse_and_validate(TriageResult, result.structured, result.text)
-        atomic_write_json(iteration_dir / "triage.json", triage.model_dump(mode="json"))
-        return triage
-
-    async def write_remediation(
-        self,
-        ctx: RunContext,
-        *,
-        next_iteration_n: int,
-        eval_result: EvalResult,
-        pivot: bool = False,
-    ) -> str | None:
-        """Write the next iteration contract.md via Claude.
-
-        Design: §9.2 transitions to iter_remediating before this call so a
-            failure is attributed to remediation, not evaluation.
-        Implementation: run Claude in the next iteration directory, optionally
-            prepend the §H3 pivot directive, recover Write tool content, and
-            prune content-identical off-cwd copies left inside target_dir (§G2).
-        Example: await driver.write_remediation(ctx, next_iteration_n=2, eval_result=er).
-        """
-        next_dir = ctx.run_dir / f"iteration-{next_iteration_n}"
-        next_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        system = (files("forge_mcp.prompts") / "evaluator_remediation.md").read_text()
-        prompt = "Write contract.md for the next generator iteration from this EvalResult:\n"
-        prompt += eval_result.model_dump_json(indent=2)
-        if pivot:
-            prompt = PIVOT_DIRECTIVE + prompt
-        turn = await self._runner.run_with_messages(
-            prompt=prompt,
-            options=build_options(
-                setting_sources=CLAUDE_SETTING_SOURCES,
-                add_dirs=[ctx.run_dir / "inputs"],
-                disallowed_tools=("Edit",),
-                cwd=next_dir,
-                cli_path=ctx.claude_cli_path,
-                hooks=git_deny_hooks(),
-            ),
-            system=system,
-        )
-        contract_path = next_dir / "contract.md"
-        if contract_path.exists():
-            return None
-        recovered = collect_writes_to_basename(turn.messages, "contract.md")
-        if recovered is None:
-            return None
-        atomic_write_text(contract_path, recovered)
-        removed = prune_offcwd_write_copies(
-            turn.messages,
-            "contract.md",
-            canonical_path=contract_path,
-            content=recovered,
-            target_dir=ctx.target_dir,
-        )
-        msg = "recovered remediation Write tool content for contract.md"
-        if removed:
-            msg += f"; pruned {len(removed)} off-cwd copy"
-        return truncate_for_warning(msg)
+    options = build_options(
+        system=load_prompt("evaluator_system"),
+        output_format=envelope(eval_schema),
+        hooks=git_deny_hooks(),
+        cwd=str(cwd),
+        cli_path=str(claude_bin()),
+        stderr=run_log_tee(run_log_path) if run_log_path is not None else None,
+    )
+    prompt = (
+        f"## Frozen design spec\n\n{spec_text}\n\n"
+        f"## Project path\n\n{cwd}\n\n"
+        "Diff the code in the project above against the frozen design spec above and "
+        "report all gaps."
+    )
+    result = await runner.run(prompt=prompt, options=options)
+    return EvalResult(**(result.structured_output or {}))
 
 
-def _parse_and_validate(
-    model: type[BaseModelT], structured: dict | None, raw_text: str
-) -> BaseModelT:
-    """Parse and validate one structured driver response (§A).
+async def run_triage(
+    runner: ClaudeRunner,
+    *,
+    spec_text: str,
+    eval_result: EvalResult,
+    triage_schema: dict,
+    cwd: Path,
+    run_log_path: Path | None = None,
+) -> TriageResult:
+    """Run the Triage stage and return a validated TriageResult (§6).
 
-    Design: §10.3 makes the driver attempt exactly one parse while the
-        orchestrator owns retry through with_schema_retry; §A extends that
-        boundary to Pydantic schema deviations, not just JSON syntax failures.
-    Implementation: prefer structured dict, otherwise json.loads raw text,
-        require a top-level object, then model_validate with wrapped errors.
-    Example: result = _parse_and_validate(EvalResult, {'no_gaps': True}, '').
+    Design: §6 the Triage stage classifies each gap from the eval pass as
+        either a code bug or a design fault; a design fault requires verbatim
+        citations from the frozen spec_text to pass the citation gate; the
+        orchestrator (not this function) applies any amendments to spec.md.
+    Implementation: build options with the evaluator_triage prompt, the triage
+        JSON schema as output_format, git-deny hooks, and the provided cwd;
+        compose a prompt that includes the frozen spec and the serialised gaps;
+        call runner.run; validate the structured_output into a TriageResult.
+    Example: ``await run_triage(runner, spec_text="# spec", eval_result=er,
+        triage_schema={...}, cwd=Path("/r"))`` returns a TriageResult.
     """
-    if structured is not None:
-        parsed = structured
-    else:
-        try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            raise OutputSchemaError(raw=raw_text, reason=str(exc)) from exc
-    if not isinstance(parsed, dict):
-        raise OutputSchemaError(raw=raw_text, reason="top-level JSON value is not an object")
-    try:
-        return model.model_validate(parsed)
-    except ValidationError as exc:
-        raise OutputSchemaError(raw=raw_text, reason=str(exc)) from exc
+    options = build_options(
+        system=load_prompt("evaluator_triage"),
+        output_format=envelope(triage_schema),
+        hooks=git_deny_hooks(),
+        cwd=str(cwd),
+        cli_path=str(claude_bin()),
+        stderr=run_log_tee(run_log_path) if run_log_path is not None else None,
+    )
+    gaps_text = "\n".join(
+        f"- {g.title} ({g.severity}): {g.current_state} → {g.expected_state}"
+        for g in eval_result.gaps
+    )
+    prompt = (
+        f"## Frozen design spec\n\n{spec_text}\n\n"
+        f"## Gaps to triage\n\n{gaps_text or '(none)'}\n\n"
+        "Classify each gap as a code bug or a design fault. "
+        "For design faults, cite verbatim sections from the spec above."
+    )
+    result = await runner.run(prompt=prompt, options=options)
+    return TriageResult(**(result.structured_output or {}))

@@ -1,125 +1,147 @@
-"""§6.4 step 7 — live skill availability probe via Claude SDK init data."""
+"""Per-engine skill discovery probes (§10.3).
+
+All SDK imports are lazy (inside functions) so that
+``import forge_mcp.skills`` succeeds without the Claude SDK installed.
+"""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Literal
 
-REQUIRED_SKILLS: tuple[str, ...] = ("superpowers:writing-plans",)
-SKILL_PROBE_TIMEOUT_SECONDS = 120.0
+if TYPE_CHECKING:
+    from forge_mcp.drivers._claude import ClaudeRunner
+
+# Required Codex skill ids (§10.3 candidates).
+_REQUIRED_CODEX_SKILLS: tuple[str, ...] = ("executing-plans", "frontend-design")
+
+# Required Claude skill ids (§10.3 candidates).
+_REQUIRED_CLAUDE_SKILLS: tuple[str, ...] = ("writing-plans", "code-review")
 
 
-class SkillMissingError(Exception):
-    """Raised when a required superpowers skill is unavailable to Claude.
+@dataclass(frozen=True)
+class SkillProbe:
+    """Result of a single skill discovery probe (§10.3).
 
-    Design: Rule 8 fails fast rather than letting later phases degrade when a
-        required planning skill is absent.
-    Implementation: carry the missing skill ids and join them in the message.
-    Example: raise SkillMissingError(['superpowers:writing-plans']).
+    Design: §10.3 callers need a uniform result type for both Claude and Codex
+        probes so doctor/health-check code can iterate without branching on
+        engine type.
+    Implementation: frozen dataclass with three fields; status is restricted to
+        the literal union "OK" | "WARN" | "FAIL" so mypy catches typos.
+    Example: ``SkillProbe(label="executing-plans", status="FAIL", detail="not found")``.
     """
 
-    def __init__(self, missing: list[str]) -> None:
-        """Format the missing-skill list onto the exception message.
-
-        Design: doctor and preflight surface this message directly to users.
-        Implementation: store the list and comma-join ids for Exception text.
-        Example: SkillMissingError(['superpowers:writing-plans']).missing.
-        """
-        super().__init__("required skills missing: " + ", ".join(missing))
-        self.missing = missing
+    label: str
+    status: Literal["OK", "WARN", "FAIL"]
+    detail: str
 
 
-class SkillProbeTimeout(Exception):
-    """Raised when the skill probe exceeds SKILL_PROBE_TIMEOUT_SECONDS.
+def _find_codex_skill_dir(codex_home: Path, skill_id: str) -> Path | None:
+    """Locate a discoverable Codex skill directory for *skill_id* (§10.3).
 
-    Design: Rule 8 — preflight holds the target lock, so a hung Claude session
-        must fail fast and loud rather than block indefinitely.
-    Implementation: thin Exception carrying a fixed message.
-    Example: raise SkillProbeTimeout().
+    Design: §10.3 says to inspect both ``~/.codex/skills/`` and the ``~/.codex``
+        plugin cache; plugin-provided skills (e.g. superpowers' ``executing-plans``)
+        live only under the cache, so checking ``skills/`` alone yields a false
+        negative for a skill that is genuinely installed.
+    Implementation: prefer the direct ``codex_home/skills/<id>`` path; otherwise
+        glob the plugin cache layout
+        ``plugins/cache/<marketplace>/<plugin>/<hash>/skills/<id>`` and return the
+        first directory match, else None.
+    Example: with the superpowers plugin installed,
+        ``_find_codex_skill_dir(home, "executing-plans")`` returns the cache path.
     """
-
-    def __init__(self) -> None:
-        """Format the timeout message.
-
-        Design: operators need to know the probe, not the run, timed out.
-        Implementation: pass a fixed string to Exception.
-        Example: SkillProbeTimeout().
-        """
-        super().__init__(
-            f"skill probe exceeded {SKILL_PROBE_TIMEOUT_SECONDS}s without an init message"
-        )
-
-
-def _extract_skills(messages: list[Any]) -> list[str] | None:
-    """Return the init SystemMessage's data['skills'] list, or None if absent.
-
-    Design: A2 reads ground-truth loaded skills from the CLI's structured init
-        data; a missing skills field means the probe cannot verify.
-    Implementation: scan for subtype=='init', read data['skills'], and return
-        None when no init carries it.
-    Example: _extract_skills(messages) == ['superpowers:writing-plans'].
-    """
-    for msg in messages:
-        subtype = msg.get("subtype") if isinstance(msg, dict) else getattr(msg, "subtype", None)
-        if subtype != "init":
-            continue
-        data = msg.get("data") if isinstance(msg, dict) else getattr(msg, "data", None)
-        if isinstance(data, dict) and "skills" in data:
-            skills = data["skills"]
-            if isinstance(skills, list):
-                return [str(skill) for skill in skills]
+    direct = codex_home / "skills" / skill_id
+    if direct.is_dir():
+        return direct
+    for candidate in codex_home.glob(f"plugins/cache/*/*/*/skills/{skill_id}"):
+        if candidate.is_dir():
+            return candidate
     return None
 
 
-def _is_init_with_skills(msg: Any) -> bool:
-    """Return True for an init SystemMessage that exposes a 'skills' field (A2).
+def probe_codex_skills(*, codex_home: Path) -> list[SkillProbe]:
+    """Inspect ``codex_home`` for each required Codex skill id (§10.3).
 
-    Design: §A2 breaks out of the stream the moment the init message carrying
-        loaded skills is read, rather than waiting out the throwaway turn.
-    Implementation: detect subtype=='init' and a 'skills' key in data, handling
-        both dict-shaped and attribute-shaped messages.
-    Example: _is_init_with_skills(SystemMessage(subtype='init', data={'skills': []})).
+    Design: §10.3 this probe is pure filesystem — no live binary is needed;
+        it legitimately FAILs until the operator installs the required skills,
+        and that FAIL surfaces correctly to the doctor/health-check output. It
+        inspects both ``~/.codex/skills/`` and the plugin cache so a
+        plugin-provided skill is not reported as missing.
+    Implementation: for each id in ``_REQUIRED_CODEX_SKILLS`` resolve a
+        discoverable directory via ``_find_codex_skill_dir``; return OK with the
+        resolved path if found, FAIL otherwise.
+    Example: an empty ``codex_home`` (no skills/ entry, no plugin cache) yields
+        two FAIL probes.
     """
-    subtype = msg.get("subtype") if isinstance(msg, dict) else getattr(msg, "subtype", None)
-    if subtype != "init":
-        return False
-    data = msg.get("data") if isinstance(msg, dict) else getattr(msg, "data", None)
-    return isinstance(data, dict) and "skills" in data
+    results: list[SkillProbe] = []
+    for skill_id in _REQUIRED_CODEX_SKILLS:
+        found = _find_codex_skill_dir(codex_home, skill_id)
+        if found is not None:
+            results.append(SkillProbe(label=skill_id, status="OK", detail=str(found)))
+        else:
+            results.append(
+                SkillProbe(
+                    label=skill_id,
+                    status="FAIL",
+                    detail=(
+                        f"skill not found under {codex_home / 'skills'} or "
+                        f"{codex_home / 'plugins' / 'cache'}"
+                    ),
+                )
+            )
+    return results
 
 
-async def probe_required_skills(*, runner: Any, claude_cli_path: Path | None) -> None:
-    """Verify REQUIRED_SKILLS are loaded by reading init SystemMessage data (A2).
+async def probe_claude_skills(
+    *,
+    runner: ClaudeRunner,
+    required: tuple[str, ...],
+    deadline: float,
+) -> list[SkillProbe]:
+    """Open a Claude SDK session and check that required skills are advertised (§10.3).
 
-    Design: §6.4 step 7 exercises the same setting_sources path later Claude
-        phases use; A2 replaces model self-report with deterministic init data.
-    Implementation: open a session with build_options, issue a minimal query
-        under wait_for, break on the init message via a stop predicate, extract
-        data['skills'], and raise on unverifiable/missing.
-    Example: await probe_required_skills(runner=r, claude_cli_path=None).
+    Design: §10.3 the Claude side probe reads the ``SystemMessage.data["skills"]``
+        list emitted at session init; if a required skill is absent the probe
+        FAILs so operators know to install or enable it.
+    Implementation: lazy-import the SDK inside this async function; open a
+        session with the runner and read ``StructuredResult.init_skills`` (the
+        seam-forwarded init ``SystemMessage.data["skills"]`` list); wrap the
+        call in ``asyncio.timeout(deadline)``; a None init_skills is treated as
+        "no skills discoverable" so every required id FAILs (degraded). Return
+        one SkillProbe per id in *required*.
+    Example: ``await probe_claude_skills(runner=fake, required=("writing-plans",),
+        deadline=30.0)`` returns [SkillProbe(label="writing-plans", status=...)]
     """
-    from .drivers._claude import CLAUDE_SETTING_SOURCES, build_options
+    from forge_mcp.config import claude_bin  # lazy import (§10.4)
+    from forge_mcp.drivers._claude import build_options  # lazy import
 
-    options = build_options(
-        setting_sources=CLAUDE_SETTING_SOURCES,
-        disallowed_tools=("Edit", "Write"),
-        cli_path=claude_cli_path,
-    )
+    options = build_options(system="list skills only", cli_path=str(claude_bin()))
+
     try:
-        turn = await asyncio.wait_for(
-            runner.run_with_messages(
-                prompt="Respond with 'ok'.",
-                options=options,
-                system="",
-                stop=_is_init_with_skills,  # §A2 — break as soon as init skills are read.
-            ),
-            timeout=SKILL_PROBE_TIMEOUT_SECONDS,
-        )
-    except TimeoutError as exc:
-        raise SkillProbeTimeout() from exc
-    skills = _extract_skills(turn.messages)
-    if skills is None:
-        raise SkillMissingError(list(REQUIRED_SKILLS))
-    missing = [skill for skill in REQUIRED_SKILLS if skill not in set(skills)]
-    if missing:
-        raise SkillMissingError(missing)
+        async with asyncio.timeout(deadline):
+            result = await runner.run(prompt="list your skills", options=options)
+    except TimeoutError:
+        return [SkillProbe(label=sid, status="FAIL", detail="probe timed out") for sid in required]
+
+    # The init SystemMessage.data["skills"] is forwarded by the Claude seam onto
+    # StructuredResult.init_skills (§10.3). A None value means the session emitted
+    # no skills registry, so we treat every required id as undiscoverable.
+    available: list[str] = result.init_skills or []
+
+    results: list[SkillProbe] = []
+    for skill_id in required:
+        # Plugin skills are advertised namespaced (e.g. "superpowers:writing-plans"),
+        # so a required bare id matches either the bare form or any "<ns>:<id>" form.
+        if any(s == skill_id or s.endswith(f":{skill_id}") for s in available):
+            results.append(SkillProbe(label=skill_id, status="OK", detail="skill available"))
+        else:
+            results.append(
+                SkillProbe(
+                    label=skill_id,
+                    status="FAIL",
+                    detail=f"skill '{skill_id}' not found in session init",
+                )
+            )
+    return results

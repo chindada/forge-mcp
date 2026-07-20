@@ -1,91 +1,64 @@
-"""§10.3 PlannerDriver — Claude-authored implementation plan."""
+"""Planner stage (§6): convert a spec into a single structured Plan."""
 
 from __future__ import annotations
 
-from importlib.resources import files
+from pathlib import Path
 
-from ..artifacts import atomic_write_text
-from ..runcontext import RunContext
-from ._claude import (
-    CLAUDE_SETTING_SOURCES,
-    ClaudeRunner,
-    build_options,
-    collect_writes_to_basename,
-    git_deny_hooks,
-    prune_offcwd_write_copies,
-    truncate_for_warning,
-)
+from forge_mcp.config import claude_bin
+from forge_mcp.drivers._claude import ClaudeRunner, build_options, git_deny_hooks, run_log_tee
+from forge_mcp.models import Plan
+from forge_mcp.prompts import load_prompt
+from forge_mcp.schemas import envelope
+from forge_mcp.verifier import scope_verification_command
 
 
-class PlannerDriver:
-    """Claude-backed planner phase driver.
+async def run_planner(
+    runner: ClaudeRunner,
+    *,
+    spec_text: str,
+    plan_schema: dict,
+    cwd: Path,
+    run_log_path: Path | None = None,
+) -> Plan:
+    """Run the Planner stage and return a single validated Plan (§6).
 
-    Design: §9.1 starts a fresh Claude session to produce plan/plan.md from
-        run inputs without mutating target_dir.
-    Implementation: invoke the ClaudeRunner seam with cwd=run_dir/plan and
-        recover off-cwd Write tool content when needed.
-    Example: await PlannerDriver(runner).write_plan(ctx).
+    Design: §3 the Planner reads the frozen spec and returns exactly one Plan; it
+        is git-mutation-denied (PreToolUse git-deny hook) and runs under
+        bypassPermissions so it can read the repo to ground the plan but cannot
+        commit. The multi-plan PlanSet/DAG is gone — one plan, one tree.
+    Implementation: build options with the planner_system prompt,
+        output_format=envelope(plan_schema), git-deny hooks, and the provided cwd
+        — the caller passes plan_schema=Plan.model_json_schema(); call runner.run
+        with spec_text as the prompt; validate the structured_output into a Plan,
+        then scope any structurally-unsatisfiable clean-tree gate out of its
+        verification_command (recording the drop in the run log).
+    Example: ``await run_planner(runner, spec_text="# spec",
+        plan_schema=Plan.model_json_schema(), cwd=Path("/r"))`` returns one Plan.
     """
+    tee = run_log_tee(run_log_path) if run_log_path is not None else None
+    options = build_options(
+        system=load_prompt("planner_system"),
+        output_format=envelope(plan_schema),
+        hooks=git_deny_hooks(),
+        cwd=str(cwd),
+        cli_path=str(claude_bin()),
+        stderr=tee,
+    )
+    result = await runner.run(prompt=spec_text, options=options)
+    plan = Plan(**(result.structured_output or {}))
 
-    def __init__(self, runner: ClaudeRunner) -> None:
-        """Store the Claude runner seam.
-
-        Design: dependency injection keeps driver tests independent of SDKs.
-        Implementation: assign the protocol object to an instance attribute.
-        Example: PlannerDriver(fake_runner).
-        """
-        self._runner = runner
-
-    @property
-    def last_session_id(self) -> str | None:
-        """Expose the planner runner's last_session_id for artifacts (§C2.2).
-
-        Design: orchestrator code writes sessions.json without branching by
-            concrete SDK driver type.
-        Implementation: passthrough read with a None default for fakes and
-            fail-soft SDK capture paths.
-        Example: sid = driver.last_session_id after write_plan returns.
-        """
-        return getattr(self._runner, "last_session_id", None)
-
-    async def write_plan(self, ctx: RunContext) -> str | None:
-        """§10.3 write run_dir/plan/plan.md via Claude.
-
-        Design: §9.1 uses a fresh Claude session; off-cwd-write recovery returns
-            a descriptor surfaced as a ledger warning.
-        Implementation: load planner_system.md, run Claude in plan cwd, recover
-            the last Write tool_use targeting plan.md if missing, and prune
-            content-identical off-cwd copies left inside target_dir (§G2).
-        Example: await driver.write_plan(ctx).
-        """
-        plan_dir = ctx.run_dir / "plan"
-        plan_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        system = (files("forge_mcp.prompts") / "planner_system.md").read_text()
-        prompt = "Read inputs/design.md and author plan.md in the current working directory."
-        options = build_options(
-            setting_sources=CLAUDE_SETTING_SOURCES,
-            add_dirs=[ctx.run_dir / "inputs"],
-            disallowed_tools=("Edit",),
-            cwd=plan_dir,
-            cli_path=ctx.claude_cli_path,
-            hooks=git_deny_hooks(),
-        )
-        turn = await self._runner.run_with_messages(prompt=prompt, options=options, system=system)
-        plan_path = plan_dir / "plan.md"
-        if plan_path.exists():
-            return None
-        recovered = collect_writes_to_basename(turn.messages, "plan.md")
-        if recovered is None:
-            return None
-        atomic_write_text(plan_path, recovered)
-        removed = prune_offcwd_write_copies(
-            turn.messages,
-            "plan.md",
-            canonical_path=plan_path,
-            content=recovered,
-            target_dir=ctx.run_dir.parent.parent,
-        )
-        msg = "recovered planner Write tool content for plan.md"
-        if removed:
-            msg += f"; pruned {len(removed)} off-cwd copy"
-        return truncate_for_warning(msg)
+    # Backstop the §6.5 contract: a clean-tree gate can never pass in a
+    # never-committing direct-edit loop, so scope it out (keeping the correctness
+    # conjuncts) and record the drop. The planner_system contract is the primary
+    # control; this catches the inline case it misses without crashing the run.
+    scoped, dropped = scope_verification_command(plan.verification_command)
+    if dropped:
+        plan = plan.model_copy(update={"verification_command": scoped})
+        if tee is not None:
+            tee(
+                "forge: scoped verification_command — dropped non-completing "
+                f"clean-tree gate(s) {dropped}; the direct-edit loop never commits, "
+                "so a tree-cleanliness check can never pass in-loop (it belongs in "
+                f"the project's post-commit CI). Kept: {scoped!r}"
+            )
+    return plan

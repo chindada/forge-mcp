@@ -1,317 +1,131 @@
-"""§8.5 lifecycle helpers for cancellation, timeout, failure, and caps."""
+"""Terminal honesty and result projection for forge-mcp orchestrator.
+
+Pure projection functions — no I/O. Transforms the single plan's terminal
+report into a RunResult with honest unresolved_gaps (§8).
+"""
 
 from __future__ import annotations
 
-import asyncio
-import inspect
-import traceback
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, Protocol
+from dataclasses import dataclass, field
 
-from ..artifacts import atomic_write_text, write_design_flaws
-from ..models import EvalGap, EvalResult
-from .caps import GAP_LIST_CAP, build_gap_overflow, split_warnings
-from .ledger import RunLedger
-from .statemachine import RunStateMachine
+from forge_mcp.models import EvalGap, GapSummary, RunResult
+
+# Sentinel design_doc_section used for synthesized failure gaps (§8).
+_FAILURE_SENTINEL_SECTION = "§8-failure"
 
 
-class TaskCancellationProbe(Protocol):
-    """Duck-typed task cancellation source (§C1.6).
+@dataclass
+class PlanReport:
+    """Carries the terminal state and freshest gap set for the plan when it did not complete.
 
-    Design: lifecycle only reads is_cancelled so it should not depend on the
-        concrete experimental MCP context at runtime.
-    Implementation: Protocol supports fakes and ServerTaskContext alike.
-    Example: if probe.is_cancelled: raise CancelledError.
+    Design: §8 a non-completed run contributes the plan's freshest full
+        post-synthesize gap set (eval gaps ∪ synthesized verify gap) to the
+        RunResult; plan_id is retained as a stable label for the synthesized
+        failure gap even though there is only one plan.
+    Implementation: plain dataclass; no I/O; consumed by project_unresolved_gaps.
+    Example: PlanReport('plan', 'incomplete', [EvalGap(...)], [], None).
     """
 
-    @property
-    def is_cancelled(self) -> bool:
-        """Return whether cancellation has been requested.
-
-        Design: models ServerTaskContext.is_cancelled as a read-only property.
-        Implementation: concrete task contexts compute the current task state.
-        Example: if probe.is_cancelled: ...
-        """
-        ...
+    plan_id: str
+    terminal_state: str
+    gaps: list[EvalGap] = field(default_factory=list)
+    synthesized: list[GapSummary] = field(default_factory=list)
+    failure_reason: str | None = None
 
 
-def poll_task_cancellation(task: TaskCancellationProbe | None) -> None:
-    """Raise CancelledError when a live MCP task is cancelled (§C1.6).
+def synthesized_gap_for_failed_plan(plan_id: str, reason: str) -> GapSummary:
+    """Build a synthesized failure GapSummary for a failed plan with no gap set.
 
-    Design: C-Inv 1 centralizes the bridge from task.is_cancelled to the
-        existing §8.5 cancellation path; this helper never writes state.
-    Implementation: duck-type task.is_cancelled and raise asyncio.CancelledError
-        with a stable forensic message only when true.
-    Example: poll_task_cancellation(task) after a phase boundary.
+    Design: §8 a failed plan that has no eval gaps or synthesized gaps must still
+        contribute a visible gap so the caller is never silently absent of
+        failure information.
+    Implementation: title names the plan_id and includes the reason; severity is
+        hard-coded 'high'; design_doc_section is a fixed sentinel so the
+        non-optional field is always populated.
+    Example: synthesized_gap_for_failed_plan('plan', 'crashed: OSError') returns
+        a GapSummary whose title contains 'plan' and design_doc_section is set.
     """
-    if task is None:
-        return
-    if getattr(task, "is_cancelled", False):
-        raise asyncio.CancelledError("client cancelled via cancel_task")
-
-
-async def close_drivers(deps: Any) -> None:
-    """Close all phase drivers with interrupt and terminate escalation (§H10).
-
-    Design: §8.5 cancellation first asks SDK runners to close before escalating;
-        §H10 adds best-effort SDK-native interrupt before that close.
-    Implementation: inspect drivers and `_runner`, wait_for interrupt with 2s,
-        wait_for aclose with 5s, then call terminate on timeout/error.
-    Example: await close_drivers(deps).
-    """
-    for driver in (deps.drivers.planner, deps.drivers.generator, deps.drivers.evaluator):
-        runner = getattr(driver, "_runner", driver)
-        if runner is None:
-            continue
-        interrupt = getattr(runner, "interrupt", None)
-        if interrupt is not None:
-            try:
-                await asyncio.wait_for(interrupt(), timeout=2)
-            except Exception:
-                pass
-        try:
-            await asyncio.wait_for(runner.aclose(), timeout=5)
-        except Exception:
-            try:
-                runner.terminate()
-            except Exception:
-                pass
-
-
-async def emit_terminal_status(status: Any, terminal_status: str) -> None:
-    """Emit exactly one terminal status.update for the outcome.
-
-    Design: §8.1 / §12 — every terminal path (success inline, timeout
-        handler, failure handler) issues a single phase-kind status event so
-        the NDJSON / ctx.info stream has a canonical run-finished marker.
-    Implementation: thin wrapper over Status.update with the terminal phase as
-        both `phase` and the human message; kind='phase'.
-    Example: await emit_terminal_status(status, 'completed').
-    """
-    await status.update(
-        phase=terminal_status,
-        agent="orchestrator",
-        message=f"run {terminal_status}",
-        kind="phase",
+    return GapSummary(
+        title=f"Plan {plan_id} failed: {reason}",
+        severity="high",
+        design_doc_section=_FAILURE_SENTINEL_SECTION,
     )
 
 
-async def _finalize_terminal(
-    sm: RunStateMachine,
-    ledger: RunLedger,
-    deps: Any,
+def _eval_gap_to_summary(gap: EvalGap) -> GapSummary:
+    """Project an EvalGap to a GapSummary by copying the shared fields.
+
+    Design: §8 EvalGap carries implementation detail fields not needed in
+        RunResult; only title, severity, and design_doc_section are projected.
+    Implementation: construct GapSummary from the three shared fields.
+    Example: _eval_gap_to_summary(EvalGap(title='t', ...)) returns
+        GapSummary(title='t', ...).
+    """
+    return GapSummary(
+        title=gap.title,
+        severity=gap.severity,
+        design_doc_section=gap.design_doc_section,
+    )
+
+
+def project_unresolved_gaps(non_completed: list[PlanReport]) -> list[GapSummary]:
+    """Project the non-completed plan report(s) into the RunResult gap rows.
+
+    Design: §8 the single-plan run passes at most one PlanReport here; the
+        function stays list-shaped so build_run_result has one code path whether
+        the plan completed (empty list) or not. Each report contributes its
+        freshest full gap set — the per-iteration freshest set, NOT aggregated
+        across iterations; gaps are not deduped (the projection is honest about
+        every distinct row).
+    Implementation: for each PlanReport, project its EvalGaps to GapSummary via
+        {title, severity, design_doc_section}, then extend with its synthesized
+        GapSummaries; for a 'failed' report with no eval gaps AND no synthesized
+        gaps, contribute a synthesized_gap_for_failed_plan.
+    Example: one incomplete PlanReport with one eval gap and one synthesized gap
+        yields two GapSummary rows.
+    """
+    result: list[GapSummary] = []
+    for report in non_completed:
+        eval_summaries = [_eval_gap_to_summary(g) for g in report.gaps]
+        plan_gaps = eval_summaries + list(report.synthesized)
+        if not plan_gaps and report.terminal_state == "failed":
+            reason = report.failure_reason or "unknown reason"
+            plan_gaps = [synthesized_gap_for_failed_plan(report.plan_id, reason)]
+        result.extend(plan_gaps)
+    return result
+
+
+def build_run_result(
     *,
     status: str,
-    reason: str | None = None,
-) -> None:
-    """Run the one shared terminal-finalization tail for result-producing paths.
+    run_dir: str,
+    iterations: int,
+    non_completed: list[PlanReport],
+    stop_reason: str | None,
+    verified: bool,
+    summary: str,
+    failure_kind: str | None = None,
+) -> RunResult:
+    """Assemble a RunResult from orchestrator state and projected gap data.
 
-    Design: finding 1 — the inline engine path, handle_timeout, and
-        handle_failure previously each re-implemented this tail, which let
-        apply_caps_and_overflow run twice on the timeout path. One helper,
-        called once per path, makes double-application structurally impossible.
-        handle_cancellation (§8.5) is NOT a caller — it produces no RunResult.
-    Implementation: transition to the terminal state, emit state, write the
-        design-flaws sidecar (OSError-guarded), apply result caps + overflow
-        emits, then emit exactly one terminal status event.
-    Example: await _finalize_terminal(sm, ledger, deps, status='incomplete').
+    Design: §8 the RunResult must be an honest summary of what happened;
+        unresolved_gaps are derived from the non-completed plan (empty when the
+        plan completed); failure_kind is set ONLY when status='failed' (an
+        orchestrator-internal error), never for plan non-convergence.
+    Implementation: call project_unresolved_gaps to derive unresolved_gaps; pass
+        failure_kind through only when status='failed'; construct RunResult.
+    Example: build_run_result(status='incomplete', ...) yields a RunResult whose
+        unresolved_gaps come from non_completed and failure_kind=None.
     """
-    sm.transition(status, reason=reason)  # type: ignore[arg-type]
-    await _emit_if_present(deps, "emit_state")
-    design_flaws_full = [gap.model_copy(deep=True) for gap in ledger.design_flaw_gaps]
-    try:
-        write_design_flaws(deps.run_dir, design_flaws_full)
-        await _emit_if_present(deps, "emit_path", "design_flaws.json")
-    except OSError as exc:
-        ledger.warnings.append(
-            "design_flaws.json write failed (lineage feed-forward disabled): "
-            f"{type(exc).__name__}: {exc}"
-        )
-        deps.logger.warning("design_flaws.json write failed", exc_info=True)
-    apply_caps_and_overflow(ledger, deps.run_dir, deps.logger)
-    if ledger.unresolved_overflow_path:
-        await _emit_if_present(deps, "emit_path", "unresolved-gaps-overflow.md")
-    if ledger.design_flaw_overflow_path:
-        await _emit_if_present(deps, "emit_path", "design-flaw-gaps-overflow.md")
-    await emit_terminal_status(deps.status, status)
-
-
-async def _emit_if_present(deps: Any, method: str, *args: Any) -> None:
-    """Best-effort artifact emission for lifecycle handlers (§S5.4).
-
-    Design: notifications are observability-only and must not perturb timeout
-        or failure paths, including focused tests that use old dependency fakes.
-    Implementation: look up deps.emitter.<method>, call it if present, await
-        only awaitable results, and swallow emission failures.
-    Example: await _emit_if_present(deps, 'emit_state').
-    """
-    emitter = getattr(deps, "emitter", None)
-    target = getattr(emitter, method, None)
-    if not callable(target):
-        return
-    try:
-        result = target(*args)
-        if inspect.isawaitable(result):
-            await result
-    except Exception:  # noqa: BLE001  # §S-Decision 6 fail-soft
-        return
-
-
-async def handle_cancellation(sm: RunStateMachine, ledger: RunLedger, deps: Any, lock: Any) -> None:
-    """Apply the exact §8.5 client-cancellation terminal ordering, then re-raise.
-
-    Design: §8.5 step 5 — caller must observe CancelledError; the engine
-        produces no RunResult on this path. Observers seeing failed/
-        cancelled=True must be able to assume the lock is already free, so
-        final failed state is written after release.
-    Implementation: capture last_phase, transition cancelling, close drivers,
-        release lock, mark ledger, transition failed, raise CancelledError.
-    Example: await handle_cancellation(sm, ledger, deps, lock) raises.
-    """
-    ledger.failed_phase = sm.last_phase
-    sm.transition("cancelling", reason="client cancelled", cancelled=True)
-    await close_drivers(deps)
-    lock.release()
-    ledger.lock_released = True
-    ledger.decided_at = datetime.now(UTC)
-    sm.transition("failed", reason="client cancelled", cancelled=True)
-    raise asyncio.CancelledError()
-
-
-async def handle_timeout(sm: RunStateMachine, ledger: RunLedger, deps: Any) -> None:
-    """Finalize a runtime cap as incomplete, not cancelled.
-
-    Design: §6.3/§8.5 separate runtime cap from client disconnect; timeout
-        goes finalizing → incomplete after closing in-flight SDK sessions so
-        they cannot outlive the cap. Finding 1: the terminal tail is shared.
-    Implementation: transition finalizing, close drivers, collect latest
-        unresolved gaps, set decided_at, then run the shared terminal tail to
-        incomplete (caps applied exactly once).
-    Example: await handle_timeout(sm, ledger, deps).
-    """
-    sm.transition("finalizing")
-    await _emit_if_present(deps, "emit_state")
-    await close_drivers(deps)
-    ledger.unresolved_gaps = collect_unresolved_gaps_safe(deps.run_dir, deps.logger, ledger)
-    ledger.decided_at = datetime.now(UTC)
-    await _finalize_terminal(sm, ledger, deps, status="incomplete")
-
-
-async def handle_failure(sm: RunStateMachine, ledger: RunLedger, deps: Any, exc: Exception) -> None:
-    """Record a non-cancellation failure as terminal failed state.
-
-    Design: §6.3/§8.5 — failure returns a RunResult; traceback must be
-        truncated to ≤4096 before RunResult construction, and unresolved_gaps
-        are best-effort collected from disk so a crash still surfaces known
-        gaps. Finding 1: the terminal tail is shared; failures jump straight to
-        failed with no finalizing transition.
-    Implementation: close drivers, record metadata, truncate traceback,
-        best-effort collect unresolved gaps while preserving the original
-        exception, set decided_at, then run the shared terminal tail to failed
-        with reason=str(exc).
-    Example: await handle_failure(sm, ledger, deps, RuntimeError('boom')).
-    """
-    await close_drivers(deps)
-    ledger.failed_phase = sm.last_phase
-    ledger.error_class = exc.__class__.__name__
-    ledger.error_message = str(exc)
-    ledger.traceback_truncated = "".join(traceback.format_exception(exc))[:4096]
-    ledger.unresolved_gaps = collect_unresolved_gaps_safe(deps.run_dir, deps.logger, ledger)
-    ledger.decided_at = datetime.now(UTC)
-    await _finalize_terminal(sm, ledger, deps, status="failed", reason=str(exc))
-
-
-def collect_unresolved_gaps(run_dir: Path) -> list[EvalGap]:
-    """Return the latest iteration's eval.json gaps only.
-
-    Design: §11.5 / §8.5 — unresolved_gaps reflects the freshest evaluation;
-        aggregating older iterations would leak stale gaps into the terminal
-        RunResult.
-    Implementation: enumerate iteration-N directories, pick the highest N
-        whose eval.json exists, parse once, return its `gaps` list. Skip
-        missing or in-progress directories.
-    Example: gaps = collect_unresolved_gaps(Path('.harness/abcd1234')).
-    """
-    candidates: list[tuple[int, Path]] = []
-    for path in run_dir.glob("iteration-*"):
-        try:
-            candidates.append((int(path.name.split("-", 1)[1]), path))
-        except (IndexError, ValueError):
-            continue
-    for _, iteration_dir in sorted(candidates, reverse=True):
-        eval_path = iteration_dir / "eval.json"
-        if eval_path.exists():
-            return EvalResult.model_validate_json(eval_path.read_text()).gaps
-    return []
-
-
-def collect_unresolved_gaps_safe(
-    run_dir: Path, logger: Any, ledger: RunLedger | None = None
-) -> list[EvalGap]:
-    """Collect unresolved gaps without letting artifact corruption escape (§B).
-
-    Design: terminal failure/timeout paths must preserve their original outcome
-        even when the latest eval.json is malformed or unreadable.
-    Implementation: delegate to the strict collector, warn with exc_info on any
-        exception, and return an empty list as the conservative fallback.
-    Example: gaps = collect_unresolved_gaps_safe(Path('.harness/abcd1234'), logger).
-    """
-    try:
-        return collect_unresolved_gaps(run_dir)
-    except Exception as exc:  # noqa: BLE001
-        message = f"unresolved gap collection failed: {type(exc).__name__}: {exc}"
-        if ledger is not None:
-            ledger.warnings.append(message)
-        if logger is not None:
-            logger.warning("unresolved gap collection failed", exc_info=True)
-        return []
-
-
-def apply_caps_and_overflow(ledger: RunLedger, run_dir: Path, logger: Any) -> None:
-    """Apply RunResult caps and write overflow artifacts when needed.
-
-    Design: §11.2 keeps the tool result bounded while preserving dropped gap
-        details in private artifacts.
-    Implementation: write overflow markdown via atomic_write_text, cap lists,
-        and append a warning when warnings themselves are truncated.
-    Example: apply_caps_and_overflow(ledger, run_dir, logger).
-    """
-    unresolved_total = len(ledger.unresolved_gaps)
-    unresolved_overflow = build_gap_overflow(
-        ledger.unresolved_gaps, kind="unresolved", total=unresolved_total
+    unresolved_gaps = project_unresolved_gaps(non_completed)
+    resolved_failure_kind = failure_kind if status == "failed" else None
+    return RunResult(
+        status=status,  # type: ignore[arg-type]
+        run_dir=run_dir,
+        iterations=iterations,
+        unresolved_gaps=unresolved_gaps,
+        failure_kind=resolved_failure_kind,
+        stop_reason=stop_reason,
+        verified=verified,
+        summary=summary,
     )
-    if unresolved_overflow is not None:
-        path = run_dir / "unresolved-gaps-overflow.md"
-        try:
-            atomic_write_text(path, unresolved_overflow)
-            ledger.unresolved_overflow_path = str(path)
-        except OSError as exc:
-            ledger.warnings.append(
-                f"unresolved-gaps-overflow.md write failed: {type(exc).__name__}: {exc}"
-            )
-            if logger is not None:
-                logger.warning("unresolved-gaps-overflow.md write failed", exc_info=True)
-        ledger.unresolved_gaps = ledger.unresolved_gaps[:GAP_LIST_CAP]
-    design_total = len(ledger.design_flaw_gaps)
-    design_overflow = build_gap_overflow(
-        ledger.design_flaw_gaps, kind="design-flaw", total=design_total
-    )
-    if design_overflow is not None:
-        path = run_dir / "design-flaw-gaps-overflow.md"
-        try:
-            atomic_write_text(path, design_overflow)
-            ledger.design_flaw_overflow_path = str(path)
-        except OSError as exc:
-            ledger.warnings.append(
-                f"design-flaw-gaps-overflow.md write failed: {type(exc).__name__}: {exc}"
-            )
-            if logger is not None:
-                logger.warning("design-flaw-gaps-overflow.md write failed", exc_info=True)
-        ledger.design_flaw_gaps = ledger.design_flaw_gaps[:GAP_LIST_CAP]
-    kept, dropped = split_warnings(ledger.warnings)
-    if dropped:
-        kept.append(f"warnings truncated: {len(dropped)} additional warning(s) omitted")
-    ledger.warnings = kept
-    if logger is not None:
-        logger.info("applied result caps")

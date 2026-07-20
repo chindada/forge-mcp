@@ -1,274 +1,214 @@
-"""Reusable test doubles for forge-mcp tests.
+"""Test doubles (fakes) for ClaudeRunner and CodexRunner Protocols.
 
-This is the single home for fake ClaudeRunner/CodexRunner/driver doubles;
-later tasks populate it as those seams land.
+Reused by Tasks 17, 18, 19, 26, 27, and 28. Build once, use everywhere.
 """
 
+from __future__ import annotations
 
-class FakePlanner:
-    """Fake planner that writes a minimal plan artifact.
+from collections.abc import AsyncGenerator, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-    Design: phase tests need a deterministic planner without SDK calls.
-    Implementation: create run_dir/plan/plan.md and return no warning.
-    Example: await FakePlanner().write_plan(ctx).
+from forge_mcp.drivers._claude import ClaudeRunner, StructuredResult
+from forge_mcp.drivers._codex import CodexEvent, CodexRunner
+
+if TYPE_CHECKING:
+    from openai_codex import CodexConfig
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+
+def structured(payload: dict, *, init_skills: list[str] | None = None) -> StructuredResult:
+    """Build a StructuredResult with *payload* as structured_output.
+
+    Design: §17 tests need a concise way to build scripted StructuredResult
+        values without repeating the full constructor every time; §10.3 skill
+        probes additionally need to script the init-message skills list.
+    Implementation: returns StructuredResult(structured_output=payload,
+        text="", session_id="fake", init_skills=init_skills) — the minimal
+        non-None scripted result; init_skills defaults to None so existing
+        callers are unaffected.
+    Example: ``structured({"x": 1}).structured_output == {"x": 1}``.
+    """
+    return StructuredResult(
+        structured_output=payload, text="", session_id="fake", init_skills=init_skills
+    )
+
+
+# ---------------------------------------------------------------------------
+# FakeClaudeRunner
+# ---------------------------------------------------------------------------
+
+
+class FakeClaudeRunner:
+    """Scripted fake implementing the ClaudeRunner Protocol (§17).
+
+    Design: §17 tests inject a sequence of pre-built StructuredResult values
+        so orchestration code can be exercised without the real SDK.
+    Implementation: pop from *scripted* in order; last_session_id tracks the
+        session_id of the most-recently-returned result; interrupt/aclose are
+        no-ops.
+    Example: ``FakeClaudeRunner([structured({"x": 1})]).run(...)`` returns
+        that StructuredResult and advances last_session_id.
     """
 
-    async def write_plan(self, ctx):
-        """Write a canned plan file.
+    def __init__(self, scripted: list[StructuredResult]) -> None:
+        """Initialise with a list of pre-built results to return in order.
 
-        Design: §9.1 requires plan.md before iteration contracts are created.
-        Implementation: mkdir plan directory and write markdown text.
-        Example: await planner.write_plan(ctx) returns None.
+        Design: §17 the scripted list is consumed FIFO so tests can assert
+            ordered interactions without mocking.
+        Implementation: copy the list to avoid aliasing; set last_session_id
+            to None until the first run().
+        Example: ``FakeClaudeRunner([r1, r2])`` will return r1 then r2.
         """
-        (ctx.run_dir / "plan").mkdir(parents=True, exist_ok=True, mode=0o700)
-        (ctx.run_dir / "plan" / "plan.md").write_text("# plan\n")
-        return None
+        self._scripted = list(scripted)
+        self.last_session_id: str | None = None
+        self.prompts: list[str] = []
 
+    async def run(self, *, prompt: str, options: object) -> StructuredResult:
+        """Return the next scripted result and update last_session_id.
 
-class FakeGenerator:
-    """Fake generator that writes a summary artifact.
-
-    Design: phase tests isolate orchestrator sequencing from Codex behavior.
-    Implementation: write iteration-N/summary.md and perform no target edits.
-    Example: await FakeGenerator().implement(ctx, codex_bin='codex', status_cb=cb).
-    """
-
-    async def implement(self, ctx, *, codex_bin, status_cb, env=None):
-        """Write a canned summary for the current iteration.
-
-        Design: §10.2 requires a generator summary artifact per iteration.
-        Implementation: create the iteration directory and write markdown text.
-        Example: await generator.implement(ctx, codex_bin='codex', status_cb=cb).
+        Design: §17 consuming results in order mirrors real execution so tests
+            can make deterministic assertions about each call.
+        Implementation: pop index 0 (FIFO); update last_session_id; raise
+            IndexError if the scripted list is exhausted (test bug).
+        Example: after one call, last_session_id equals the returned result's
+            session_id.
         """
-        iter_dir = ctx.run_dir / f"iteration-{ctx.iteration_n}"
-        iter_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (iter_dir / "summary.md").write_text("# summary\n")
+        self.prompts.append(prompt)
+        result = self._scripted.pop(0)
+        self.last_session_id = result.session_id
+        return result
 
+    async def interrupt(self) -> None:
+        """No-op interrupt; satisfies the ClaudeRunner Protocol.
 
-class FakeEvaluator:
-    """Fake evaluator returning a sequence of EvalResults.
-
-    Design: phase tests need deterministic evaluation outcomes across multiple
-        iterations without invoking Claude.
-    Implementation: pop results from a supplied list and count remediation calls.
-    Example: evaluator = FakeEvaluator([EvalResult(...)]).
-    """
-
-    def __init__(self, plan):
-        """Store the canned EvalResult sequence.
-
-        Design: each evaluate call consumes one planned result.
-        Implementation: keep an index and a remediation counter.
-        Example: FakeEvaluator([er]).remediation_calls == 0.
+        Design: §17 fakes must implement the full Protocol surface; interrupt
+            is a best-effort signal that the fake ignores.
+        Implementation: returns immediately.
+        Example: ``await fake.interrupt()`` completes without side effects.
         """
-        self._plan = plan
-        self._i = 0
-        self.remediation_calls = 0
 
-    async def evaluate(self, ctx, *, retry=False):
-        """Return the next canned EvalResult and write eval.json.
+    async def aclose(self) -> None:
+        """No-op close; satisfies the ClaudeRunner Protocol.
 
-        Design: §9.2 expects evaluator artifacts to exist for result/lifecycle
-            collection tests.
-        Implementation: write model JSON to iteration-N/eval.json.
-        Example: er = await evaluator.evaluate(ctx).
+        Design: §17 fakes must implement the full Protocol surface; aclose
+            releases resources in real drivers but the fake has none.
+        Implementation: returns immediately.
+        Example: ``await fake.aclose()`` completes without side effects.
         """
-        er = self._plan[self._i]
-        self._i += 1
-        iter_dir = ctx.run_dir / f"iteration-{ctx.iteration_n}"
-        iter_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (iter_dir / "eval.json").write_text(er.model_dump_json())
-        return er
-
-    async def triage_design_flaws(self, ctx, *, eval_result, retry=False):
-        """Return an empty TriageResult for all gaps.
-
-        Design: phase tests focus on loop sequencing, not citation policy.
-        Implementation: construct the production TriageResult model directly.
-        Example: await evaluator.triage_design_flaws(ctx, eval_result=er).
-        """
-        from forge_mcp.models import TriageResult
-
-        return TriageResult(triages=[], summary="ok")
-
-    async def write_remediation(self, ctx, *, next_iteration_n, eval_result):
-        """Write a canned next-iteration contract.
-
-        Design: §9.2 remediation must create iteration-{N+1}/contract.md before
-            the next generator pass.
-        Implementation: increment remediation_calls and write markdown text.
-        Example: await evaluator.write_remediation(ctx, next_iteration_n=2, eval_result=er).
-        """
-        self.remediation_calls += 1
-        iter_dir = ctx.run_dir / f"iteration-{next_iteration_n}"
-        iter_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (iter_dir / "contract.md").write_text("# next\n")
-        return None
 
 
-class FakeServerTaskContext:
-    """Mutable ServerTaskContext double for cancellation/task-mode tests (§C1.6).
-
-    Design: §C1.6 — poll_task_cancellation only reads is_cancelled; status
-        fan-out only awaits update_status; orchestrator-side _extract_task_id
-        only reads task_id/id. A bag-of-attributes double is sufficient and
-        deliberately avoids importing the experimental mcp ServerTaskContext at
-        test time (Risk 2: experimental API churn).
-    Implementation: is_cancelled defaults False and is flipped by tests; task_id
-        is a plain attribute; update_status records lines for inspection.
-    Example: task = FakeServerTaskContext(task_id='tsk_abc'); task.is_cancelled = True.
-    """
-
-    def __init__(self, *, task_id: str | None = "tsk_fake") -> None:
-        """Initialize the fake task with optional id and empty status log.
-
-        Design: tests vary task_id and cancellation independently per case.
-        Implementation: store task_id, set is_cancelled False, prepare a list.
-        Example: FakeServerTaskContext(task_id=None).is_cancelled is False.
-        """
-        self.task_id = task_id
-        self.is_cancelled = False
-        self.status_lines: list[str] = []
-
-    async def update_status(self, line: str) -> None:
-        """Record one task-mode status line (§C1.5).
-
-        Design: §C1.5 fan-out only requires an awaitable update_status sink.
-        Implementation: append the incoming line for later assertions.
-        Example: await task.update_status('phase started').
-        """
-        self.status_lines.append(line)
+assert isinstance(FakeClaudeRunner([]), ClaudeRunner)
 
 
-class FakeSessionPlanner(FakePlanner):
-    """Planner double exposing a settable last_session_id (§C2.2).
-
-    Design: §C2.5 plan/sessions.json composition tests read the planner's
-        last_session_id after write_plan returns; this double lets each test
-        pin the captured id without driving a real Claude session.
-    Implementation: pin the value via the constructor; orchestrator reads it
-        as an instance attribute (matches PlannerDriver.last_session_id shape).
-    Example: FakeSessionPlanner(session_id='sess_plan').
-    """
-
-    def __init__(self, *, session_id: str | None = "sess_plan_fake") -> None:
-        """Store the planner session id for orchestrator passthrough.
-
-        Design: tests parameterize the captured id per scenario.
-        Implementation: assign the attribute; no other state changes.
-        Example: planner = FakeSessionPlanner(session_id=None).
-        """
-        self.last_session_id = session_id
+# ---------------------------------------------------------------------------
+# FakeCodexRunner
+# ---------------------------------------------------------------------------
 
 
-class FakeSessionGenerator(FakeGenerator):
-    """Generator double exposing a settable last_session_id (§C2.2).
+class FakeCodexRunner:
+    """Scripted fake implementing the CodexRunner Protocol (§17).
 
-    Design: §C2.5 iteration sessions.json tests need a deterministic Codex
-        thread id surfaced through GeneratorDriver.last_session_id semantics.
-    Implementation: assign the attribute at construction; tests use one
-        instance per iteration (the attribute is a per-call value in production
-        but a constant suffices for orchestrator-side composition tests).
-    Example: FakeSessionGenerator(session_id='thr_codex').
-    """
-
-    def __init__(self, *, session_id: str | None = "thr_gen_fake") -> None:
-        """Store the generator session id for orchestrator passthrough.
-
-        Design: tests vary the id per scenario including a None fail-soft case.
-        Implementation: assign and rely on inherited implement() behavior.
-        Example: gen = FakeSessionGenerator(session_id=None).
-        """
-        self.last_session_id = session_id
-
-
-class FakeSessionEvaluator(FakeEvaluator):
-    """Evaluator double exposing a mutable last_session_id (§C2.2).
-
-    Design: §C2.5 makes each evaluator phase (evaluate/triage/remediation)
-        read last_session_id immediately after the call returns; this double
-        rotates the exposed id from a configured list per call so the
-        sessions.json matrix tests can pin per-phase ids and the iter_remediating
-        regression test (Gap 8) can verify the LAST remediation attempt's id is
-        the one recorded (not the first).
-    Implementation: configure per-call ids per method via dicts of iter -> [ids];
-        each method pops the next id (or stays None when exhausted); inherits
-        plan-driven evaluate / triage / write_remediation bodies from FakeEvaluator.
-    Example: FakeSessionEvaluator([er], evaluate_ids=['sess_eval_1']).
+    Design: §17 tests inject a sequence of CodexEvent values so orchestration
+        code that consumes the generate() async generator can be exercised
+        without the real Codex SDK.
+    Implementation: generate() is a regular def returning an async generator;
+        if on_generate is set it is called first so tests can inject side
+        effects (e.g. sandbox file writes required by Task 28); last_thread_id
+        returns a stable fake id; interrupt/aclose are no-ops.
+    Example: ``FakeCodexRunner([e1, e2]).generate(...)`` yields e1 then e2.
     """
 
     def __init__(
         self,
-        plan: list,
-        *,
-        evaluate_ids: list[str | None] | None = None,
-        triage_ids: list[str | None] | None = None,
-        remediation_ids: list[str | None] | None = None,
+        events: list[CodexEvent],
+        on_generate: Callable[[str], object] | None = None,
     ) -> None:
-        """Bind id rotations to each evaluator method.
+        """Initialise with scripted events and an optional side-effect hook.
 
-        Design: §C2.5 reads last_session_id immediately after each call; the
-            double mutates the exposed attribute as the call begins so the
-            orchestrator sees the per-call id without coupling to plan order.
-        Implementation: keep deque-like lists per method; default to all None
-            so legacy tests behave like FakeEvaluator with last_session_id=None.
-        Example: FakeSessionEvaluator([er], remediation_ids=['a', 'b']).
+        Design: §17 on_generate lets tests inject sandbox file writes or other
+            side effects that must happen before the first event is yielded;
+            this is required by Task 28.
+        Implementation: store events and hook; last_thread_id is a constant
+            fake string.
+        Example: ``FakeCodexRunner([e], on_generate=lambda cwd: write_file(cwd))``.
         """
-        super().__init__(plan)
-        self._evaluate_ids = list(evaluate_ids or [])
-        self._triage_ids = list(triage_ids or [])
-        self._remediation_ids = list(remediation_ids or [])
-        self.last_session_id: str | None = None
+        self._events = list(events)
+        self._on_generate = on_generate
+        self._last_thread_id: str | None = "fake-thread-id"
 
-    def _rotate(self, queue: list[str | None]) -> None:
-        """Advance last_session_id to the next pinned id or None.
+    @property
+    def last_thread_id(self) -> str | None:
+        """Return the fake thread id.
 
-        Design: production runners overwrite last_session_id at the start of
-            each SDK call; this helper mirrors that timing.
-        Implementation: pop the head when present, else set None (fail-soft).
-        Example: self._rotate(self._remediation_ids).
+        Design: §17 callers that record thread ids for resume must get a
+            non-None value from the fake so they don't short-circuit.
+        Implementation: returns a stable constant string.
+        Example: ``fake.last_thread_id == "fake-thread-id"``.
         """
-        self.last_session_id = queue.pop(0) if queue else None
+        return self._last_thread_id
 
-    async def evaluate(self, ctx, *, retry=False, changed_files=None):
-        """Run evaluator.evaluate while rotating last_session_id.
+    def generate(
+        self,
+        *,
+        instructions: str,
+        config: CodexConfig,
+        run_log_path: Path | None = None,
+    ) -> AsyncGenerator[CodexEvent, None]:
+        """Return an async generator yielding all scripted events.
 
-        Design: parity with EvaluatorDriver.evaluate's per-call session reset.
-        Implementation: rotate the id first, then delegate to FakeEvaluator.
-        Example: er = await evaluator.evaluate(ctx).
+        Design: §17 the generator contract mirrors the real CodexDriver so
+            orchestration code can be tested without the SDK; on_generate is
+            called first if set so tests can inject file-system side effects.
+        Implementation: defined as a regular def returning an async generator
+            expression via a private helper so the Protocol signature matches.
+        Example: ``async for evt in fake.generate(...): ...`` yields each
+            scripted event in order.
         """
-        self._rotate(self._evaluate_ids)
-        return await super().evaluate(ctx, retry=retry)
+        return self._gen(instructions=instructions, config=config)
 
-    async def triage_design_flaws(self, ctx, *, eval_result, retry=False):
-        """Run triage while rotating last_session_id.
+    async def _gen(
+        self,
+        *,
+        instructions: str,
+        config: CodexConfig,
+    ) -> AsyncGenerator[CodexEvent, None]:
+        """Inner async generator: call hook then yield events.
 
-        Design: parity with EvaluatorDriver.triage_design_flaws timing.
-        Implementation: rotate the id first, then delegate to FakeEvaluator.
-        Example: tr = await evaluator.triage_design_flaws(ctx, eval_result=er).
+        Design: §17 separating the public generate() (regular def) from this
+            async generator allows the Protocol's non-async return type to be
+            satisfied while still using async yield syntax.
+        Implementation: call on_generate(str(config.cwd)) if set; then yield
+            each event from the scripted list.
+        Example: if on_generate writes a file, it is visible to the caller
+            before the first CodexEvent is received.
         """
-        self._rotate(self._triage_ids)
-        return await super().triage_design_flaws(ctx, eval_result=eval_result, retry=retry)
+        if self._on_generate is not None:
+            self._on_generate(str(config.cwd))
+        for event in self._events:
+            yield event
 
-    async def write_remediation(self, ctx, *, next_iteration_n, eval_result, pivot=False):
-        """Run remediation while rotating last_session_id per attempt.
+    async def interrupt(self) -> None:
+        """No-op interrupt; satisfies the CodexRunner Protocol.
 
-        Design: §C2.2 requires the recorded id to be the LAST successful
-            attempt's; the double exposes a fresh id per call so a re-author
-            test (Gap 8) can verify the orchestrator captures the second id.
-        Implementation: rotate first; then delegate to FakeEvaluator which
-            accepts the pivot kwarg ONLY if the production seam does — the
-            FakeEvaluator.write_remediation signature accepts (next_iteration_n,
-            eval_result) but NOT pivot, so swallow pivot here for parity.
-        Example: await evaluator.write_remediation(ctx, next_iteration_n=2, eval_result=er).
+        Design: §17 fakes must implement the full Protocol surface; interrupt
+            is a best-effort signal that the fake ignores.
+        Implementation: returns immediately.
+        Example: ``await fake.interrupt()`` completes without side effects.
         """
-        self._rotate(self._remediation_ids)
-        self.remediation_calls += 1
-        iter_dir = ctx.run_dir / f"iteration-{next_iteration_n}"
-        iter_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (iter_dir / "contract.md").write_text(
-            "# Remediation contract\n\n"
-            "Implement the missing behavior and verify it with focused tests.\n"
-            "## Acceptance criteria\n- [ ] Pass the sessions.json regression checks.\n"
-        )
-        return None
+
+    async def aclose(self) -> None:
+        """No-op close; satisfies the CodexRunner Protocol.
+
+        Design: §17 fakes must implement the full Protocol surface; aclose
+            releases resources in real drivers but the fake has none.
+        Implementation: returns immediately.
+        Example: ``await fake.aclose()`` completes without side effects.
+        """
+
+
+assert isinstance(FakeCodexRunner([]), CodexRunner)

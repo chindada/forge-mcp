@@ -1,138 +1,78 @@
-"""§11.1 strict verbatim citations and coercion drift surfacing."""
-
 from __future__ import annotations
 
-from forge_mcp.models import EvalGap, EvalResult, GapTriage, TriageResult
-from forge_mcp.orchestrator.triage import classify_gaps
-
-CANON = (
-    "The evaluator must cite design sections by quoting at least twenty "
-    "characters of verbatim text from the design document."
+from forge_mcp.models import EvalGap, GapTriage
+from forge_mcp.triage import (
+    effective_code_bug_titles,
+    is_valid_citation,
+    passes_citation_gate,
 )
 
+SPEC = "## §7.4 Merge\nThe orchestrator unions each completed plan's change-set into target_dir.\n"
 
-def _gap(title: str) -> EvalGap:
-    """Build one high-severity test gap.
 
-    Design: triage tests focus on title/citation behavior only.
-    Implementation: fill required EvalGap fields with compact strings.
-    Example: _gap('g1').title == 'g1'.
+def gap(title):
+    """Create a minimal EvalGap fixture with the given title.
+
+    Design: §5.3 gaps are identified by their whitespace-canonicalized title.
+    Implementation: fills required fields with sentinel values so tests focus on title.
+    Example: gap('real bug') returns EvalGap with title='real bug'.
     """
     return EvalGap(
         title=title,
         severity="high",
-        design_doc_section="§x",
+        design_doc_section="§7.4",
         current_state="c",
         expected_state="e",
         suggested_fix="f",
     )
 
 
-def _tri(title: str, *, design_fault: bool, cited: list[str], kind: str | None = None) -> GapTriage:
-    """Build one triage row.
-
-    Design: tests need concise construction of design-fault and code-bug rows.
-    Implementation: pass fields through to GapTriage with a fixed explanation.
-    Example: _tri('g1', design_fault=False, cited=[]).
+def test_citation_gate_requires_long_verbatim_substring():
+    """Design: §5.3 cited text must be a >=20-char verbatim substring of spec.
+    Implementation: a real long substring passes; a short/absent one fails.
+    Example: is_valid_citation('The orchestrator unions each completed plan', SPEC).
     """
-    return GapTriage(
-        gap_title=title,
-        design_fault=design_fault,
-        fault_kind=kind if design_fault else None,  # type: ignore[arg-type]
-        cited_sections=cited,
+    assert is_valid_citation("The orchestrator unions each completed plan", SPEC)
+    assert not is_valid_citation("§7.4", SPEC)  # too short
+    assert not is_valid_citation("a 30 character non-substring!!", SPEC)  # not in spec
+
+
+def test_design_fault_passes_only_with_valid_citations():
+    """Design: §5.3 design_fault rows demote unless every citation is valid.
+    Implementation: valid vs invalid citation.
+    Example: passes_citation_gate True only when verbatim.
+    """
+    good = GapTriage(
+        gap_title="g",
+        design_fault=True,
+        fault_kind="contradiction",
+        cited_sections=["The orchestrator unions each completed plan"],
         explanation="x",
     )
-
-
-def test_short_citation_demotes_to_code_bug() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    out = classify_gaps(
-        EvalResult(no_gaps=False, gaps=[_gap("g1")], summary="s"),
-        TriageResult(
-            triages=[_tri("g1", design_fault=True, cited=["too short"], kind="ambiguity")],
-            summary="s",
-        ),
-        CANON,
-        1,
-    )
-    assert len(out.design_flaws) == 0
-    assert len(out.code_bug_gaps) == 1
-
-
-def test_valid_citation_promotes_to_design_flaw() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    out = classify_gaps(
-        EvalResult(no_gaps=False, gaps=[_gap("g1")], summary="s"),
-        TriageResult(
-            triages=[
-                _tri(
-                    "g1",
-                    design_fault=True,
-                    cited=["The evaluator must cite design sections by quoting"],
-                    kind="ambiguity",
-                )
-            ],
-            summary="s",
-        ),
-        CANON,
-        1,
-    )
-    assert len(out.design_flaws) == 1
-    assert out.design_flaws[0].iteration_n == 1
-
-
-def test_title_collision_demotes_all_collided() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    out = classify_gaps(
-        EvalResult(no_gaps=False, gaps=[_gap("dup"), _gap("dup")], summary="s"),
-        TriageResult(
-            triages=[
-                _tri(
-                    "dup",
-                    design_fault=True,
-                    cited=["The evaluator must cite design sections by quoting"],
-                    kind="ambiguity",
-                )
-            ],
-            summary="s",
-        ),
-        CANON,
-        1,
-    )
-    assert len(out.design_flaws) == 0
-    assert len(out.code_bug_gaps) == 2
-    assert any("collision" in w for w in out.warnings)
-
-
-def test_coercion_drift_surfaced_once() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    er = EvalResult(no_gaps=False, gaps=[_gap("g1")], summary="s")
-    row = GapTriage(
-        gap_title="g1",
-        design_fault=False,
-        fault_kind="ambiguity",
-        cited_sections=[],
+    bad = GapTriage(
+        gap_title="g",
+        design_fault=True,
+        fault_kind="contradiction",
+        cited_sections=["nonexistent verbatim text here!!"],
         explanation="x",
     )
-    out = classify_gaps(er, TriageResult(triages=[row], summary="s"), CANON, 1)
-    assert sum("coerced" in w for w in out.warnings) == 1
+    assert passes_citation_gate(good, SPEC)
+    assert not passes_citation_gate(bad, SPEC)
+
+
+def test_effective_code_bugs_excludes_validated_design_faults():
+    """Design: §6.5 count only gaps whose triage is NOT a validated design fault.
+    Implementation: one validated fault (excluded), one untriaged gap (counted).
+    Example: only the untriaged title remains.
+    """
+    gaps = [gap("real bug"), gap("spec is wrong")]
+    triages = [
+        GapTriage(
+            gap_title="spec is wrong",
+            design_fault=True,
+            fault_kind="contradiction",
+            cited_sections=["The orchestrator unions each completed plan"],
+            explanation="x",
+        )
+    ]
+    assert effective_code_bug_titles(gaps, triages, SPEC) == {"real bug"}

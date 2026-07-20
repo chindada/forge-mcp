@@ -1,84 +1,135 @@
-"""§8.2 RunStateMachine. Sole writer of state.json (Invariant 1)."""
-
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
+from typing import Literal
 
-from ..state import RunState, StateLiteral, write_state
+from pydantic import BaseModel
 
-_TERMINAL: frozenset[str] = frozenset({"failed", "completed", "incomplete", "cancelling"})
+from forge_mcp.artifacts import RunLayout
+from forge_mcp.state import write_json
+
+# All valid state names for the single-plan, direct-edit run (§9).
+RunState = Literal[
+    "init",
+    "planning",
+    "executing",
+    "finalizing",
+    "completed",
+    "incomplete",
+    "failed",
+]
+
+_TERMINAL_STATES: frozenset[str] = frozenset({"completed", "incomplete", "failed"})
+
+# Explicit legal adjacency map (non-failed edges). The wave-cycle states
+# (scheduling/merging/amending/verifying) are gone: the run plans once, runs one
+# plan loop, then finalizes.
+_LEGAL_EDGES: dict[str, frozenset[str]] = {
+    "init": frozenset({"planning"}),
+    "planning": frozenset({"executing"}),
+    "executing": frozenset({"finalizing"}),
+    "finalizing": frozenset({"completed", "incomplete", "failed"}),
+}
+
+
+class RunStatePayload(BaseModel, extra="forbid"):
+    """Durable checkpoint for a forge-mcp run.
+
+    Design: §9 this payload is the sole content of run-level state.json; all
+        fields are explicit so an unexpected key from a corrupt write is caught
+        at parse time via extra='forbid'. The dead 'wave' field (write-only,
+        never read — there are no waves) is removed.
+    Implementation: Pydantic BaseModel with a Literal state field; last_phase
+        records the FROM-state of the most recent non-terminal transition so
+        that failure attribution is meaningful.
+    Example: RunStatePayload(state='init', last_phase=None,
+        last_updated_at='t', run_dir='/r', iterations=0).
+    """
+
+    state: RunState
+    last_phase: str | None
+    last_updated_at: str
+    run_dir: str = ""
+    iterations: int = 0
 
 
 class RunStateMachine:
-    """Wrap RunState + atomic write; track last non-terminal phase.
+    """Single writer of run-level state.json (Invariant I1).
 
-    Design: Invariant 1 gives state.json one writer, and §8.5 needs the last
-        non-terminal phase for accurate failure attribution.
-    Implementation: every transition validates through RunState and writes via
-        write_state; terminal states do not advance last_phase.
-    Example: sm.transition('iter_generating', iteration=1).
+    Design: §9 the orchestrator advances the run through the collapsed state
+        graph init->planning->executing->finalizing->terminal; illegal edges are
+        rejected to prevent the run from entering an undefined state.
+    Implementation: holds an in-memory RunStatePayload; each transition
+        validates the requested edge against _LEGAL_EDGES, updates the payload,
+        model_validates, and durably writes to RunLayout.state_json.
+    Example: sm = RunStateMachine(layout); sm.transition('planning', now='t').
     """
 
-    def __init__(self, state_path: Path, initial: RunState) -> None:
-        """Persist the initial RunState and record it in memory.
+    def __init__(self, layout: RunLayout) -> None:
+        """Initialise the state machine in the 'init' state and write state.json.
 
-        Design: state.json exists from run initialization onward for observers.
-        Implementation: write initial state immediately and initialize
-            last_phase unless the initial state is terminal.
-        Example: RunStateMachine(path, initial=RunState(state='init', ...)).
+        Design: §9 start state is always 'init' so recovery tools can detect an
+            un-started run by inspecting state.json.
+        Implementation: build a RunStatePayload at 'init', write it durably, and
+            store layout for later transitions.
+        Example: RunStateMachine(layout).payload.state == 'init'.
         """
-        self._path = state_path
-        self._current = initial
-        self._last_phase = initial.state if initial.state not in _TERMINAL else ""
-        write_state(state_path, initial)
+        self._layout = layout
+        self._payload = RunStatePayload(
+            state="init",
+            last_phase=None,
+            last_updated_at="",
+            run_dir=str(layout.root),
+        )
+        write_json(layout.state_json, self._payload, durable=True)
 
     @property
-    def current(self) -> RunState:
-        """Return the current in-memory RunState.
+    def payload(self) -> RunStatePayload:
+        """Return the current in-memory payload (read-only view).
 
-        Design: phase code needs state without rereading state.json.
-        Implementation: return the latest model written by transition.
-        Example: sm.current.state == 'planning'.
+        Design: §9 exposes the payload for inspection without granting write
+            access; the only mutation path is transition().
+        Implementation: return the private attribute directly.
+        Example: sm.payload.state == 'init' after construction.
         """
-        return self._current
+        return self._payload
 
-    @property
-    def last_phase(self) -> str:
-        """Return the last non-terminal phase.
+    def transition(self, to: str, *, now: str) -> None:
+        """Advance the run to state *to* and durably write state.json.
 
-        Design: terminal failures report the phase that actually failed rather
-            than the final terminal state.
-        Implementation: return the memo updated only on non-terminal states.
-        Example: sm.last_phase == 'iter_evaluating'.
+        Design: §9 legal edges are validated against an explicit adjacency map;
+            'failed' is reachable from any non-terminal; terminal states do not
+            advance last_phase so failure attribution is preserved.
+        Implementation: look up legal neighbours for the current state; raise
+            ValueError if *to* is not among them (and is not 'failed'); update
+            state, conditionally update last_phase, set last_updated_at,
+            model_validate, then durably write.
+        Example: sm.transition('planning', now='2024-01-01T00:00:00Z') moves the
+            run from 'init' to 'planning'.
         """
-        return self._last_phase
+        current = self._payload.state
 
-    @property
-    def iteration(self) -> int:
-        """Return the current iteration counter.
+        if current in _TERMINAL_STATES:
+            raise ValueError(f"Cannot transition from terminal state '{current}' to '{to}'.")
 
-        Design: result building and lifecycle need the durable iteration value.
-        Implementation: proxy the field from the current RunState.
-        Example: sm.iteration returns 2.
-        """
-        return self._current.iteration
+        allowed = _LEGAL_EDGES.get(current, frozenset())
+        # 'failed' is reachable from any non-terminal state.
+        if to != "failed" and to not in allowed:
+            raise ValueError(
+                f"Illegal transition: '{current}' -> '{to}'. "
+                f"Allowed: {sorted(allowed | {'failed'})}."
+            )
 
-    def transition(self, new_state: StateLiteral, **fields: Any) -> None:
-        """Validate, advance, and persist a state transition.
+        # Advance last_phase only when transitioning to a non-terminal state.
+        new_last_phase = self._payload.last_phase
+        if to not in _TERMINAL_STATES:
+            new_last_phase = current
 
-        Design: §8.2 last_phase advances only for non-terminal states so later
-            failure handling records the correct failed_phase.
-        Implementation: merge fields with current state, bump timestamp, write
-            atomically, then update in-memory state.
-        Example: sm.transition('iter_done', iteration=2).
-        """
-        payload = self._current.model_dump()
-        payload.update(state=new_state, **fields)
-        payload["last_updated_at"] = datetime.now(UTC)
-        new = RunState.model_validate(payload)
-        write_state(self._path, new)
-        self._current = new
-        if new_state not in _TERMINAL:
-            self._last_phase = new_state
+        self._payload = RunStatePayload.model_validate(
+            {
+                **self._payload.model_dump(),
+                "state": to,
+                "last_phase": new_last_phase,
+                "last_updated_at": now,
+            }
+        )
+        write_json(self._layout.state_json, self._payload, durable=True)

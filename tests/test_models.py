@@ -1,509 +1,195 @@
-from typing import Any
+# tests/test_models.py
+from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
+import forge_mcp.models as models
 from forge_mcp.models import (
-    ArtifactIndex,
-    DesignFlawGap,
     EvalGap,
-    EvalResult,
+    GapSummary,
     GapTriage,
-    IterationArtifacts,
+    Plan,
     RunForgeInput,
     RunResult,
-    TriageResult,
 )
 
 
-def test_xor_both_rejected():
-    """Pin a forge-mcp behavior.
+def test_run_forge_input_xor_path_or_content():
+    """Design: §4.3 exactly one of design_doc_path/content.
+    Implementation: both set -> ValidationError; neither -> ValidationError; one -> ok.
+    Example: RunForgeInput(target_dir='/r', design_doc_path='/r/d.md').
+    """
+    RunForgeInput(target_dir="/r", design_doc_path="/r/d.md")
+    RunForgeInput(target_dir="/r", design_doc_content="# hi")
+    with pytest.raises(ValidationError):
+        RunForgeInput(target_dir="/r")
+    with pytest.raises(ValidationError):
+        RunForgeInput(target_dir="/r", design_doc_path="/r/d.md", design_doc_content="x")
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+
+def test_run_forge_input_defaults():
+    """Design: §4.3 tunable caps default to 10 / 600.
+    Implementation: assert defaults.
+    Example: RunForgeInput(...).max_runtime_minutes == 600.
+    """
+    i = RunForgeInput(target_dir="/r", design_doc_path="/r/d.md")
+    assert i.max_iterations == 10 and i.max_runtime_minutes == 600
+
+
+def test_run_forge_input_forbids_extra():
+    """Design: §4.3 extra='forbid' keeps the tool-input schema tight.
+    Implementation: an unknown field raises.
+    Example: RunForgeInput(target_dir='/r', foo=1) -> ValidationError.
     """
     with pytest.raises(ValidationError):
-        RunForgeInput(target_dir="/t", design_doc_path="/d.md", design_doc_content="x")
+        RunForgeInput(target_dir="/r", design_doc_path="/r/d.md", foo=1)  # type: ignore[call-arg]
 
 
-def test_xor_neither_rejected():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_run_result_anchor_fields():
+    """Design: §4.3/§17 RunResult field names are schema anchors.
+    Implementation: construct and read each anchor field.
+    Example: RunResult(status='incomplete', ...).
     """
-    with pytest.raises(ValidationError):
-        RunForgeInput(target_dir="/t")
-
-
-def test_xor_accepts_path():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    m = RunForgeInput(target_dir="/t", design_doc_path="/d.md")
-    assert m.design_doc_content is None
-
-
-def test_xor_accepts_content():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    m = RunForgeInput(target_dir="/t", design_doc_content="x")
-    assert m.design_doc_path is None
-
-
-def test_extra_forbidden():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    with pytest.raises(ValidationError):
-        RunForgeInput.model_validate(
-            {"target_dir": "/t", "design_doc_content": "x", "extra": "nope"}
-        )
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"max_iterations": 0},
-        {"max_iterations": 101},
-        {"max_runtime_minutes": 0},
-        {"max_runtime_minutes": 24 * 60 + 1},
-    ],
-)
-def test_caps_bounded(kwargs):
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    with pytest.raises(ValidationError):
-        RunForgeInput(target_dir="/t", design_doc_content="x", **kwargs)
-
-
-def test_evalgap_title_newlines_collapsed():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    g = EvalGap(
-        title="line1\nline2",
-        severity="high",
-        design_doc_section="§6",
-        current_state="a",
-        expected_state="b",
-        suggested_fix="c",
+    r = RunResult(
+        status="incomplete",
+        run_dir="/r/.harness/x",
+        iterations=3,
+        unresolved_gaps=[GapSummary(title="t", severity="high", design_doc_section="§7.4")],
+        stop_reason="non-progress",
+        verified=False,
+        summary="1/2",
     )
-    assert "\n" not in g.title
-    assert g.title == "line1 line2"
+    assert r.unresolved_gaps[0].design_doc_section == "§7.4"
 
 
-def test_gaptriage_design_fault_requires_kind_and_citations():
-    """Pin a forge-mcp behavior.
+def test_eval_gap_title_canonicalized():
+    """Design: §5.3/§14 EvalGap.title whitespace-canonicalized for triage joins.
+    Implementation: collapse internal runs and strip.
+    Example: '  a   b ' -> 'a b'.
+    """
+    assert (
+        EvalGap(
+            title="  missing   delete ",
+            severity="high",
+            design_doc_section="§7.4",
+            current_state="x",
+            expected_state="y",
+            suggested_fix="z",
+        ).title
+        == "missing delete"
+    )
 
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+
+def test_gap_triage_design_fault_requires_kind_and_citation():
+    """Design: §14 design_fault ⇒ fault_kind set ∧ non-empty cited_sections.
+    Implementation: violating combo raises; non-fault coerces fault_kind to None.
+    Example: GapTriage(design_fault=True, fault_kind=None, ...) -> ValidationError.
     """
     with pytest.raises(ValidationError):
         GapTriage(
-            gap_title="t",
+            gap_title="g",
             design_fault=True,
             fault_kind=None,
-            cited_sections=[],
-            explanation="x",
+            cited_sections=["§7"],
+            explanation="e",
         )
     with pytest.raises(ValidationError):
         GapTriage(
-            gap_title="t",
+            gap_title="g",
             design_fault=True,
-            fault_kind="ambiguity",
+            fault_kind="contradiction",
             cited_sections=[],
-            explanation="x",
+            explanation="e",
         )
-
-
-def test_gaptriage_code_bug_coerces():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    g = GapTriage(
-        gap_title="t",
-        design_fault=False,
-        fault_kind="ambiguity",
-        cited_sections=["§5"],
-        explanation="x",
+    t = GapTriage(
+        gap_title="g", design_fault=False, fault_kind="other", cited_sections=[], explanation="e"
     )
-    assert g.fault_kind is None
-    assert any("ambiguity" in line for line in g._coercion_log)
+    assert t.fault_kind is None
 
 
-def test_runresult_traceback_bound_enforced():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_gap_triage_non_fault_omitting_fault_kind_defaults_none():
+    """Design: §14 a non-fault triage need not supply fault_kind.
+    Implementation: omit fault_kind entirely; validator leaves/sets it None.
+    Example: GapTriage(gap_title='g', design_fault=False, explanation='e').fault_kind is None.
     """
-    ai = ArtifactIndex(plan_path="/p", status_log_path="/s", state_json_path="/j")
-    with pytest.raises(ValidationError):
-        RunResult(
-            status="failed",
-            run_id="abcd1234",
-            run_dir="/p",
-            iterations_used=0,
-            runtime_seconds=1,
-            artifacts=ai,
-            message="m",
-            traceback_truncated="x" * 4097,
-        )
+    t = GapTriage(gap_title="g", design_fault=False, cited_sections=[], explanation="e")
+    assert t.fault_kind is None
 
 
-def test_runresult_run_id_pattern():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_run_result_forbids_extra():
+    """Design: §4.3 extra='forbid' anchor RunResult rejects unknown fields.
+    Implementation: an unknown field raises ValidationError.
+    Example: RunResult(..., foo=1) -> ValidationError.
     """
-    ai = ArtifactIndex(plan_path="/p", status_log_path="/s", state_json_path="/j")
     with pytest.raises(ValidationError):
         RunResult(
             status="completed",
-            run_id="ZZZZZZZZ",
-            run_dir="/p",
-            iterations_used=1,
-            runtime_seconds=1,
-            artifacts=ai,
-            message="ok",
+            run_dir="/r",
+            iterations=1,
+            verified=True,
+            summary="ok",
+            foo=1,  # type: ignore[call-arg]
         )
 
 
-def test_artifact_index_has_no_run_log_field():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    assert "run_log_path" not in ArtifactIndex.model_fields
-
-
-def test_iteration_artifacts_no_removed_removed_tool_surface():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    assert "removed_removed_tool_surface_decision_path" not in IterationArtifacts.model_fields
-
-
-def test_runresult_no_removed_removed_tool_surface_decisions():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    assert "removed_removed_tool_surface_decisions" not in RunResult.model_fields
-
-
-def test_designflawgap_requires_citations():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    gap = EvalGap(
-        title="t",
-        severity="high",
-        design_doc_section="§6",
-        current_state="a",
-        expected_state="b",
-        suggested_fix="c",
-    )
-    with pytest.raises(ValidationError):
-        DesignFlawGap(
-            gap=gap,
-            iteration_n=1,
-            fault_kind="ambiguity",
-            cited_sections=[],
-            explanation="x",
-        )
-
-
-def test_models_imported_for_public_api():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    assert EvalResult(no_gaps=True, summary="ok").gaps == []
-    assert TriageResult(summary="ok").triages == []
-
-
-def test_run_forge_input_new_optional_fields_default() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    inp = RunForgeInput(target_dir="/repo", design_doc_content="d")
-    assert inp.verify_command is None
-    assert inp.verify_timeout_seconds == 1800
-    assert inp.resume is False
-
-
-def test_network_access_rejected_as_extra_forbidden() -> None:
-    """Pin F-Inv 4 — RunForgeInput rejects the removed network_access knob.
-
-    Design: §F3 deletes the knob and keeps extra="forbid", so a stale caller
-        passing network_access fails loudly at validation (F-Decision 2:
-        delete, not deprecate) instead of being silently accepted.
-    Implementation: construct RunForgeInput with network_access=True and
-        assert pydantic raises ValidationError naming the field.
-    Example: pytest tests/test_models.py -k network_access_rejected -v.
-    """
-    stale_input: dict[str, Any] = {
-        "target_dir": "/repo",
-        "design_doc_content": "d",
-        "network_access": True,
-    }
-    with pytest.raises(ValidationError) as exc_info:
-        RunForgeInput(**stale_input)
-    assert "network_access" in str(exc_info.value)
-
-
-def test_verify_timeout_seconds_bounds_enforced() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_gap_summary_forbids_extra():
+    """Design: §4.3 extra='forbid' anchor GapSummary rejects unknown fields.
+    Implementation: an unknown field raises ValidationError.
+    Example: GapSummary(..., foo=1) -> ValidationError.
     """
     with pytest.raises(ValidationError):
-        RunForgeInput(target_dir="/repo", design_doc_content="d", verify_timeout_seconds=0)
+        GapSummary(title="t", severity="high", design_doc_section="§7.4", foo=1)  # type: ignore[call-arg]
+
+
+def test_plan_collapsed_to_three_fields():
+    """Design: §3/§15 Plan collapses to {surface, verification_command, body}.
+    Implementation: construct with only the three surviving fields; read each back;
+        verification_command defaults to None when omitted.
+    Example: Plan(surface='backend', body='# contract').verification_command is None.
+    """
+    p = Plan(surface="backend", verification_command="pytest -q", body="# contract")
+    assert p.surface == "backend"
+    assert p.verification_command == "pytest -q"
+    assert p.body == "# contract"
+    p2 = Plan(surface="frontend", body="# c")
+    assert p2.verification_command is None
+
+
+def test_plan_drops_id_depends_on_file_scope():
+    """Design: §3 the DAG fields id/depends_on/file_scope are removed.
+    Implementation: extra='forbid' rejects each dropped field; the model also has no
+        such attributes in its field set.
+    Example: Plan(surface='backend', body='b', id='x') -> ValidationError.
+    """
+    assert set(Plan.model_fields) == {"surface", "verification_command", "body"}
+    for stray in ({"id": "x"}, {"depends_on": []}, {"file_scope": []}):
+        with pytest.raises(ValidationError):
+            Plan(surface="backend", body="b", **stray)  # type: ignore[arg-type]
+
+
+def test_plan_surface_is_closed_literal():
+    """Design: §3/§15 surface is a closed Literal['backend','frontend'].
+    Implementation: an out-of-set surface value raises ValidationError.
+    Example: Plan(surface='mobile', body='b') -> ValidationError.
+    """
     with pytest.raises(ValidationError):
-        RunForgeInput(
-            target_dir="/repo", design_doc_content="d", verify_timeout_seconds=24 * 60 * 60 + 1
-        )
+        Plan(surface="mobile", body="b")  # type: ignore[arg-type]
 
 
-def test_long_run_continuity_optional_fields_are_in_schema():
-    """§C3 optional task/session path fields appear without being required.
-
-    Design: clients can discover task_id and sessions paths while old payloads
-        remain constructible.
-    Implementation: inspect Pydantic JSON schemas for properties and required.
-    Example: 'task_id' in RunResult.model_json_schema()['properties'].
+def test_plan_json_schema_has_no_planset_keys():
+    """Design: §3 Plan.model_json_schema() is the new Planner output contract.
+    Implementation: the schema's properties are exactly the three surviving fields.
+    Example: set(Plan.model_json_schema()['properties'])
+        == {'surface', 'verification_command', 'body'}.
     """
-    assert "task_id" in RunResult.model_json_schema()["properties"]
-    assert "task_id" not in RunResult.model_json_schema().get("required", [])
-    assert "sessions_path" in IterationArtifacts.model_json_schema()["properties"]
-    assert "sessions_path" not in IterationArtifacts.model_json_schema().get("required", [])
-    assert "plan_sessions_path" in ArtifactIndex.model_json_schema()["properties"]
-    assert "plan_sessions_path" not in ArtifactIndex.model_json_schema().get("required", [])
+    props = set(Plan.model_json_schema()["properties"])
+    assert props == {"surface", "verification_command", "body"}
 
 
-def test_iteration_artifacts_uri_companions_default_none():
-    """§R4.3 optional companions stay None by default.
-
-    Design: URI companions are additive and must not break old payloads.
-    Implementation: instantiate with only existing required path fields.
-    Example: IterationArtifacts(...).contract_uri is None.
+def test_planset_is_deleted():
+    """Design: §3 PlanSet is deleted entirely (one plan, no collection).
+    Implementation: the symbol must no longer be importable from forge_mcp.models.
+    Example: hasattr(forge_mcp.models, 'PlanSet') is False.
     """
-    from forge_mcp.models import IterationArtifacts
-
-    art = IterationArtifacts(n=1, contract_path="/x/iteration-1/contract.md")
-    assert art.contract_uri is None
-    assert art.summary_uri is None
-    assert art.eval_json_uri is None
-    assert art.eval_md_uri is None
-    assert art.triage_json_uri is None
-    assert art.sessions_uri is None
-    assert art.git_violation_uri is None
-    assert art.verify_uri is None
-
-
-def test_iteration_artifacts_uri_companions_set():
-    """§R4.3 explicit URI assignment works.
-
-    Design: Result builders can populate URI companions when tokenized.
-    Implementation: pass a contract_uri through the Pydantic model.
-    Example: art.contract_uri starts with forge://.
-    """
-    from forge_mcp.models import IterationArtifacts
-
-    art = IterationArtifacts(
-        n=1,
-        contract_path="/x/iteration-1/contract.md",
-        contract_uri="forge://aBcDeFgHiJkL/12345678/iteration-1/contract.md",
-    )
-    assert art.contract_uri == "forge://aBcDeFgHiJkL/12345678/iteration-1/contract.md"
-
-
-def test_artifact_index_uri_companions_default_none():
-    """§R4.2 artifact-index URI companions default to None.
-
-    Design: URI companions are optional and nullable in the schema.
-    Implementation: construct ArtifactIndex with pre-existing required paths.
-    Example: ArtifactIndex(...).plan_uri is None.
-    """
-    from forge_mcp.models import ArtifactIndex
-
-    idx = ArtifactIndex(
-        plan_path="/x/plan/plan.md",
-        status_log_path="/x/status.log",
-        state_json_path="/x/state.json",
-    )
-    assert idx.plan_uri is None
-    assert idx.plan_sessions_uri is None
-    assert idx.status_log_uri is None
-    assert idx.state_json_uri is None
-    assert idx.git_state_uri is None
-    assert idx.git_uncommitted_uri is None
-    assert idx.unresolved_gaps_overflow_uri is None
-    assert idx.design_flaw_gaps_overflow_uri is None
-
-
-def test_artifact_index_has_no_run_log_uri():
-    """§R-Inv 3 keeps run.log structurally unreachable.
-
-    Design: The public result is allowlist-based and excludes run.log.
-    Implementation: inspect Pydantic model fields for absent path and URI.
-    Example: 'run_log_uri' not in ArtifactIndex.model_fields.
-    """
-    from forge_mcp.models import ArtifactIndex
-
-    assert "run_log_uri" not in ArtifactIndex.model_fields
-    assert "run_log_path" not in ArtifactIndex.model_fields
-
-
-def test_run_forge_input_ignore_prior_attempts_default_false() -> None:
-    """§L8.1 — ignore_prior_attempts defaults to False.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.models import RunForgeInput
-
-    inp = RunForgeInput(target_dir="/r", design_doc_content="x")
-    assert inp.ignore_prior_attempts is False
-
-
-def test_run_forge_input_ignore_prior_attempts_true_accepted() -> None:
-    """§L8.1 — ignore_prior_attempts=True is accepted.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.models import RunForgeInput
-
-    inp = RunForgeInput(target_dir="/r", design_doc_content="x", ignore_prior_attempts=True)
-    assert inp.ignore_prior_attempts is True
-
-
-def test_run_result_linked_prior_runs_defaults_empty() -> None:
-    """§L8.2 — linked_prior_runs defaults to [] on cold starts.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.models import ArtifactIndex, RunResult
-
-    r = RunResult(
-        status="completed",
-        run_id="abcd1234",
-        run_dir="/r/.harness/abcd1234",
-        iterations_used=1,
-        runtime_seconds=10,
-        artifacts=ArtifactIndex(
-            plan_path="/r/plan/plan.md",
-            status_log_path="/r/status.log",
-            state_json_path="/r/state.json",
-        ),
-        message="ok",
-    )
-    assert r.linked_prior_runs == []
-
-
-def test_artifact_index_new_fields_default_none() -> None:
-    """§L8.3 — lineage ArtifactIndex companions default None.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.models import ArtifactIndex
-
-    ai = ArtifactIndex(
-        plan_path="/r/plan/plan.md",
-        status_log_path="/r/status.log",
-        state_json_path="/r/state.json",
-    )
-    assert ai.prior_attempts_path is None
-    assert ai.prior_attempts_uri is None
-    assert ai.design_flaws_path is None
-    assert ai.design_flaws_uri is None
-
-
-def test_run_forge_input_schema_still_object_root_lineage() -> None:
-    """§L8.7 — RunForgeInput schema stays object-root.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.models import RunForgeInput
-
-    schema = RunForgeInput.model_json_schema()
-    assert schema["type"] == "object"
-    assert "anyOf" not in schema and "oneOf" not in schema and "allOf" not in schema
-
-
-def test_run_result_schema_still_object_root_lineage() -> None:
-    """§L8.7 — RunResult schema stays object-root.
-
-    Design: cross-run learning and adjacent orchestration behavior is
-        load-bearing, so tests pin the user-visible contract.
-    Implementation: call focused production code or fixtures and assert the
-        observable artifact, model, prompt, or configuration result.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from forge_mcp.models import RunResult
-
-    assert RunResult.model_json_schema()["type"] == "object"
+    assert not hasattr(models, "PlanSet")

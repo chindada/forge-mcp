@@ -1,371 +1,477 @@
-"""§10.2 Codex SDK seam — shrunk after §15 excision (§15)."""
+"""Codex SDK seam (§8.2): the sole chokepoint for openai_codex imports.
+
+All openai_codex imports are lazy (inside functions) so that
+``import forge_mcp.drivers._codex`` succeeds without the SDK installed.
+"""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+import dataclasses
+import warnings
+from collections import deque
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    # Only imported at type-check time; not at runtime.
+    from openai_codex import CodexConfig
 
 
-@dataclass(frozen=True)
+# ---------------------------------------------------------------------------
+# Config builder
+# ---------------------------------------------------------------------------
+
+
+def build_codex_config(
+    *,
+    codex_bin: str,
+    cwd: Path,
+    env: dict | None = None,
+) -> CodexConfig:
+    """Build a CodexConfig for launching the Codex process (§8.2).
+
+    Design: §8.2 a single chokepoint ensures every call site uses a
+        consistent config without repeating construction details.
+    Implementation: lazy import of openai_codex.CodexConfig; converts
+        *cwd* to str and merges *env* (defaulting to {}) per spec.
+    Example: ``build_codex_config(codex_bin="codex", cwd=Path("/tmp")).cwd == "/tmp"``.
+    """
+    from openai_codex import CodexConfig  # lazy import
+
+    return CodexConfig(codex_bin=codex_bin, cwd=str(cwd), env=env or {})
+
+
+# ---------------------------------------------------------------------------
+# Event dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
 class CodexEvent:
-    """One streamed event from a Codex session (§10.2).
+    """A single streaming event from the Codex driver (§8.2).
 
-    Design: normalizes event shape for generator status forwarding.
-    Implementation: frozen dataclass with kind and dict payload.
-    Example: CodexEvent(kind='turn/started', payload={}).
+    Design: §8.2 callers receive a typed value object rather than raw SDK
+        notifications so they remain decoupled from the SDK payload shape.
+    Implementation: ``kind`` mirrors the notification method; ``payload``
+        is the result of the ``_dump`` triple-fallback.
+    Example: ``CodexEvent(kind="turn/completed", payload={"turn_id": "x"})``.
     """
 
     kind: str
     payload: dict
 
 
-@runtime_checkable
-class CodexSession(Protocol):
-    """Protocol for a streaming Codex session.
+# ---------------------------------------------------------------------------
+# Payload dump helper
+# ---------------------------------------------------------------------------
 
-    Design: §5.2 lets generator tests fake streaming without importing the SDK.
-    Implementation: async iterator of events plus close hook.
-    Example: async for event in session: ...
+
+def _dump(payload: object) -> dict:
+    """Convert an SDK notification payload to a plain dict (§8.2 triple fallback).
+
+    Design: §8.2 SDK payloads may be Pydantic models, plain dicts, or unknown
+        objects; callers need a guaranteed ``dict`` for uniform downstream use.
+    Implementation: try ``model_dump()`` first, then ``isinstance(dict)``,
+        then fall back to ``{}`` — never raises.
+    Example: ``_dump(object()) == {}``; ``_dump({"a": 1}) == {"a": 1}``.
     """
+    model_dump = getattr(payload, "model_dump", None)
+    if model_dump is not None:
+        try:
+            return model_dump()  # type: ignore[return-value]
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
-    def __aiter__(self) -> AsyncIterator[Any]: ...
-    async def close(self) -> None: ...
+
+# ---------------------------------------------------------------------------
+# Transient classification
+# ---------------------------------------------------------------------------
 
 
-@runtime_checkable
-class CodexRunner(Protocol):
-    """Protocol seam for Codex SDK usage (§5.2, §C2).
+def is_transient(exc: BaseException) -> bool:
+    """Classify *exc* as a retryable transient error (§8.2).
 
-    Design: concrete generator code depends on this seam rather than direct SDK
-        imports, preserving a single mocking point. §C2 adds capture-only
-        exposure of the durable Codex thread id.
-    Implementation: one `turn` method, lifecycle hooks, and fail-soft
-        last_thread_id when the SDK surface lacks `.id`.
-    Example: await runner.turn(instructions='go', ...); tid = runner.last_thread_id.
+    Design: §8.2 transient errors (ConnectionError, BrokenPipeError,
+        TransportClosedError, or SDK-retryable overloads) may be retried;
+        TimeoutError and CancelledError are NEVER transient and must always
+        propagate.
+    Implementation: TimeoutError / CancelledError short-circuit to False
+        first; ConnectionError / BrokenPipeError match by builtin type; the
+        openai_codex error symbols are lazy-imported and a missing SDK
+        degrades to builtin-only classification (never crashes).
+    Example: ``is_transient(ConnectionError())`` is True;
+        ``is_transient(TimeoutError())`` is False.
     """
+    import asyncio
 
-    @property
-    def last_thread_id(self) -> str | None:
-        """Expose the most recently retained thread id (§C2.2).
-
-        Design: Protocol models a read-only fail-soft forensic property.
-        Implementation: concrete runners may compute it from SDK thread state.
-        Example: tid = runner.last_thread_id.
-        """
-        ...
-
-    async def turn(
-        self,
-        *,
-        instructions: str,
-        server_config: Any,
-        approval_mode: Any,
-        env: dict | None,
-        run_log_path: Path | None = None,
-    ) -> CodexSession: ...
-    async def interrupt(self) -> None: ...
-    async def aclose(self) -> None: ...
-    def terminate(self) -> None: ...
-
-
-def build_app_server_config(*, codex_bin: str, cwd: Path, env: dict | None = None) -> Any:
-    """Construct the Codex launch config without MCP servers (§10.2).
-
-    Design: §15 removes MCP server attachments; A5 uses the real `codex_bin`
-        field name instead of the stale executable kwarg. openai-codex 0.132
-        renamed AppServerConfig → CodexConfig, keeping the same
-        codex_bin/cwd/env constructor kwargs.
-    Implementation: lazily import CodexConfig and pass codex_bin/cwd/env.
-    Example: build_app_server_config(codex_bin='codex', cwd=Path('/repo')).
-    """
-    from openai_codex import CodexConfig  # type: ignore
-
-    return CodexConfig(codex_bin=codex_bin, cwd=str(cwd), env=env or {})
-
-
-def is_transient_error(exc: BaseException) -> bool:
-    """Classify a Codex-seam exception as a transient transport fault (§H5.2).
-
-    Design: retry only transport-shaped failures — connection reset, timeout,
-        broken pipe, the SDK's TransportClosedError, and SDK overload errors
-        (ServerBusyError / overloaded JsonRpcError via is_retryable_error).
-        Filesystem/permission OSErrors and schema/validation/logic errors must
-        propagate (§H19 note 5: mis-classified logic errors retry a doomed call).
-    Implementation: match the stdlib transport tuple, then lazily import the SDK
-        helpers; the bare OSError base is deliberately NOT in the tuple.
-    Example: is_transient_error(ConnectionResetError()) is True.
-    """
-    if isinstance(exc, (ConnectionError, TimeoutError, BrokenPipeError)):
+    if isinstance(exc, (TimeoutError, asyncio.CancelledError)):
+        return False
+    if isinstance(exc, (ConnectionError, BrokenPipeError)):
         return True
     try:
-        from openai_codex import TransportClosedError, is_retryable_error  # type: ignore
+        from openai_codex.errors import (  # lazy import
+            TransportClosedError,
+            is_retryable_error,
+        )
     except ImportError:
         return False
     if isinstance(exc, TransportClosedError):
         return True
-    return bool(is_retryable_error(exc))
+    return is_retryable_error(exc)
 
 
-def never_approval_mode() -> Any:
-    """Return the deny-all approval mode (§10.2).
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
 
-    Design: generator runs non-interactively under a fixed sandbox policy.
-    Implementation: lazy SDK import keeps module import smoke tests independent
-        of an installed openai_codex package.
-    Example: approval = never_approval_mode().
+
+@runtime_checkable
+class CodexRunner(Protocol):
+    """Protocol for running Codex agents (§8.2 CodexRunner contract).
+
+    Design: §8.2 any implementation (real or test double) that satisfies
+        this Protocol can be injected into orchestration code.
+    Implementation: runtime_checkable so ``isinstance`` checks work in tests.
+    Example: ``assert isinstance(CodexDriver(), CodexRunner)``.
     """
-    from openai_codex import ApprovalMode  # type: ignore
-
-    return ApprovalMode.deny_all
-
-
-def _make_teeing_deque(original: Any, run_log_path: Path) -> Any:
-    """Build a deque(maxlen=400) whose append tees to run.log (§13/B7).
-
-    Design: Codex stderr is forensic; the SDK drains an internal deque(maxlen=400)
-        from a daemon thread started in __aenter__, so replace it before open.
-    Implementation: preserve buffered lines and maxlen; override append to
-        write '[codex-stderr] <line>' to run.log fail-soft.
-    Example: sync._stderr_lines = _make_teeing_deque(sync._stderr_lines, path).
-    """
-    import collections
-
-    class _TeeingDeque(collections.deque):
-        """Deque subclass that mirrors appended lines to run.log.
-
-        Design: replacing the SDK deque preserves its append contract.
-        Implementation: call super().append then append a prefixed log line.
-        Example: tee.append('stderr').
-        """
-
-        def append(self, line: Any) -> None:  # type: ignore[override]
-            """Append one item and tee it to run.log.
-
-            Design: forensic logging must be best-effort only.
-            Implementation: suppress OSError after preserving deque behavior.
-            Example: tee.append('boom').
-            """
-            super().append(line)
-            try:
-                with run_log_path.open("a") as handle:
-                    handle.write(f"[codex-stderr] {line}\n")
-            except OSError:
-                pass
-
-    teeing = _TeeingDeque(maxlen=getattr(original, "maxlen", 400))
-    teeing.extend(original)
-    return teeing
-
-
-class _CodexStreamSession:
-    """Adapt an AsyncTurnHandle stream into forge's CodexEvent iterator (A6).
-
-    Design: §10.2 generator consumes event.kind/payload; A6 maps ev.method to
-        CodexEvent.kind and closes AsyncCodex when streaming ends.
-    Implementation: normalize dict/model_dump payloads and delegate closing to
-        the runner's idempotent close helper.
-    Example: async for event in _CodexStreamSession(...): ...
-    """
-
-    def __init__(self, *, codex: Any, handle: Any, runner: CodexRunnerImpl) -> None:
-        """Bind the open codex, turn handle, and owning runner.
-
-        Design: the session owns success-path cleanup of the codex it streams.
-        Implementation: store references for iteration and close.
-        Example: _CodexStreamSession(codex=c, handle=h, runner=r).
-        """
-        self._codex = codex
-        self._handle = handle
-        self._runner = runner
-
-    async def __aiter__(self) -> AsyncIterator[CodexEvent]:
-        """Yield normalized CodexEvents, closing the codex on exhaustion.
-
-        Design: A6 maps method to kind; A6-lifecycle closes on stream end.
-        Implementation: model_dump pydantic payloads, pass dicts, otherwise {}.
-        Example: async for ev in session: ...
-        """
-        try:
-            async for ev in self._handle.stream():
-                payload = getattr(ev, "payload", None)
-                model_dump = getattr(payload, "model_dump", None)
-                if callable(model_dump):
-                    dumped = model_dump()
-                    payload_dict = dumped if isinstance(dumped, dict) else {}
-                elif isinstance(payload, dict):
-                    payload_dict = payload
-                else:
-                    payload_dict = {}
-                yield CodexEvent(kind=getattr(ev, "method", ""), payload=payload_dict)
-        finally:
-            await self._runner._close_codex(self._codex)
-
-    async def close(self) -> None:
-        """Idempotently close the underlying codex (§8.5 path symmetry).
-
-        Design: lifecycle close paths must be idempotent.
-        Implementation: delegate to the runner's one-shot _close_codex.
-        Example: await session.close().
-        """
-        await self._runner._close_codex(self._codex)
-
-
-class CodexRunnerImpl:
-    """Production CodexRunner over openai_codex (§10.2).
-
-    Design: §5.2 confines direct Codex SDK usage to this seam.
-    Implementation: lazy import, create a thread/run per turn, and keep the
-        active session for lifecycle cleanup.
-    Example: await CodexRunnerImpl().turn(instructions='go', ...).
-    """
-
-    def __init__(self) -> None:
-        """Construct an empty runner.
-
-        Design: no SDK session exists until a generator turn starts.
-        Implementation: store active session/codex for aclose/terminate.
-        Example: runner = CodexRunnerImpl().
-        """
-        self._session: Any | None = None
-        self._thread: Any | None = None
-        self._codex: Any | None = None
-        self._closed = False
 
     @property
-    def last_thread_id(self) -> str | None:
-        """Return the retained AsyncThread.id when available (§C2.2).
+    def last_thread_id(self) -> str | None: ...
 
-        Design: Codex thread ids are forensic-only in this round and must never
-            terminate a run if the pinned SDK changes shape.
-        Implementation: getattr with a None default plus str validation keeps
-            malformed values out of sessions.json.
-        Example: tid = runner.last_thread_id.
-        """
-        tid = getattr(self._thread, "id", None)
-        return tid if isinstance(tid, str) and tid else None
-
-    async def turn(
+    def generate(
         self,
         *,
         instructions: str,
-        server_config: Any,
-        approval_mode: Any,
-        env: dict | None,
+        config: CodexConfig,
         run_log_path: Path | None = None,
-    ) -> CodexSession:
-        """Spawn one Codex turn with unconditional full host access (§F2).
+    ) -> AsyncGenerator[CodexEvent, None]: ...
 
-        Design: §F2.2 — the generator is the deployer-isolated workhorse, so
-            every thread starts with the typed Sandbox.full_access preset and
-            deny_all approvals; no config= overrides exist (F-Inv 2 bans the
-            "full-access" vs "danger-full-access" string-namespace trap).
-        Implementation: open AsyncCodex(config=...), thread_start with the
-            full-access preset + approval mode, run one turn, and return a
-            stream wrapper that closes on exhaustion.
-        Example: session = await runner.turn(instructions='go', ...).
+    async def interrupt(self) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+
+class _StderrTeeDeque(deque):
+    """A bounded deque that mirrors each appended line into a run-log sink (§8.2).
+
+    Design: §8.2 forensic capture of Codex stderr. The SDK keeps its own bounded
+        in-memory buffer at ``codex._client._sync._stderr_lines``; swapping in this
+        subclass preserves that bounded behaviour (same ``maxlen``) while teeing
+        every appended line to ``run.log``. Fail-soft: a write error never disturbs
+        the turn.
+    Implementation: subclass ``deque`` so the SDK's append-and-evict semantics are
+        unchanged; override ``append``/``appendleft``/``extend`` to also write the
+        value (one line each) to an open text ``sink``, swallowing OSError/ValueError.
+        ``close()`` closes the sink idempotently.
+    Example: ``d = _StderrTeeDeque(maxlen=400, sink=fh); d.append("boom")`` buffers
+        and tees the line.
+    """
+
+    def __init__(self, iterable=(), maxlen: int | None = None, *, sink) -> None:
+        """Seed the deque (in-memory only) and remember the tee sink.
+
+        Design: §8.2 the swap must preserve any lines already buffered and the
+            original maxlen so the SDK's bounded buffer is unchanged.
+        Implementation: delegate to ``deque.__init__(iterable, maxlen)`` (which does
+            NOT tee the seed lines), then store the open sink for later appends.
+        Example: ``_StderrTeeDeque(existing, maxlen=400, sink=fh)``.
         """
-        from openai_codex import AsyncCodex, Sandbox, TextInput  # type: ignore
+        super().__init__(iterable, maxlen)
+        self._sink = sink
 
-        _ = env
-        self._closed = False
-        codex = AsyncCodex(config=server_config)
-        self._install_stderr_tee(codex, run_log_path)
-        await codex.__aenter__()
-        cwd = getattr(server_config, "cwd", None)
-        try:
-            thread = await codex.thread_start(
-                sandbox=Sandbox.full_access,  # §F2; §F-Inv 2 typed preset only.
-                approval_mode=approval_mode,
-                cwd=cwd,
-            )
-            self._thread = thread
-            handle = await thread.turn(
-                TextInput(text=instructions),
-                cwd=cwd,
-                approval_mode=approval_mode,
-            )
-        except BaseException:
-            await self._close_codex(codex)
-            raise
-        session = _CodexStreamSession(codex=codex, handle=handle, runner=self)
-        self._session = session
-        self._codex = codex
-        return cast(CodexSession, session)
+    def _tee(self, value: object) -> None:
+        """Write one line for *value* to the sink, swallowing any I/O error.
 
-    async def _close_codex(self, codex: Any) -> None:
-        """Idempotently close the AsyncCodex (A6-lifecycle).
-
-        Design: all close paths share a one-shot guard so double-close is a no-op.
-        Implementation: guard with self._closed and suppress close errors.
-        Example: await runner._close_codex(codex).
+        Design: §8.2 forensic only — a closed/full/broken sink must never break
+            the Codex stream.
+        Implementation: write ``str(value)`` plus a newline and flush; ignore
+            OSError (I/O fault) and ValueError (sink already closed).
+        Example: ``self._tee("line")`` appends ``"line\\n"`` to run.log.
         """
-        if self._closed or codex is None:
-            return
-        self._closed = True
         try:
-            await codex.close()
-        except Exception:
+            self._sink.write(f"{value}\n")
+            self._sink.flush()
+        except (OSError, ValueError):
             pass
 
-    def _install_stderr_tee(self, codex: Any, run_log_path: Path | None) -> None:
-        """Replace codex._client._sync._stderr_lines with a teeing deque (B7).
+    def append(self, value: object) -> None:
+        """Tee *value* then append it to the bounded buffer.
 
-        Design: §13 installs before __aenter__ so the drain thread appends to
-            the teeing deque; shifted private SDK layout is non-fatal.
-        Implementation: guard private attributes with AttributeError and swap
-            in _make_teeing_deque on success.
-        Example: self._install_stderr_tee(codex, Path('run.log')).
+        Design: §8.2 the SDK appends stderr lines here; each must reach run.log.
+        Implementation: tee first, then ``deque.append`` (preserving maxlen evict).
+        Example: ``d.append("err")``.
         """
+        self._tee(value)
+        super().append(value)
+
+    def appendleft(self, value: object) -> None:
+        """Tee *value* then left-append it to the bounded buffer.
+
+        Design: §8.2 cover the appendleft path symmetrically with append.
+        Implementation: tee first, then ``deque.appendleft``.
+        Example: ``d.appendleft("err")``.
+        """
+        self._tee(value)
+        super().appendleft(value)
+
+    def extend(self, values) -> None:
+        """Tee and append each value in *values* (per-item, preserving maxlen).
+
+        Design: §8.2 some SDK paths may batch-extend; tee every line.
+        Implementation: iterate and ``append`` each (which tees), rather than the
+            C-level batch extend.
+        Example: ``d.extend(["a", "b"])`` tees two lines.
+        """
+        for value in values:
+            self.append(value)
+
+    def close(self) -> None:
+        """Close the sink idempotently.
+
+        Design: §8.2 the run-log handle opened for the tee must be released when
+            the turn ends.
+        Implementation: close the sink, swallowing OSError (already closed).
+        Example: ``d.close()``.
+        """
+        try:
+            self._sink.close()
+        except OSError:
+            pass
+
+
+class CodexDriver:
+    """Codex agent runner implementing the CodexRunner Protocol (§8.2).
+
+    Design: §8.2 wraps AsyncCodex; installs a fail-soft stderr tee before
+        __aenter__; starts a thread with workspace_write sandbox and deny_all
+        approval mode (network access on via the sandbox_workspace_write
+        config override); streams turn notifications as CodexEvents.
+        Transient errors: ConnectionError | BrokenPipeError |
+        TransportClosedError | is_retryable_error(exc).
+        TimeoutError and CancelledError are ALWAYS re-raised (never transient).
+    Implementation: lazy SDK imports inside generate(); stderr tee is
+        installed via _try_install_stderr_tee() which NEVER raises (fail-soft);
+        close is idempotent.
+    Example: ``async for evt in driver.generate(instructions="hi", config=cfg): ...``.
+    """
+
+    def __init__(self) -> None:
+        """Initialise with no active Codex instance.
+
+        Design: §8.2 drivers are created once and reused; initial state must
+            be well-defined and inert.
+        Implementation: set last_thread_id and _codex to None so callers can
+            read last_thread_id safely before the first generate() call.
+        Example: ``d = CodexDriver(); assert d.last_thread_id is None``.
+        """
+        self._last_thread_id: str | None = None
+        self._codex: object | None = None
+        self._closed: bool = False
+        self._stderr_tee: _StderrTeeDeque | None = None
+
+    @property
+    def last_thread_id(self) -> str | None:
+        """Return the thread ID from the most recent generate() call.
+
+        Design: §8.2 callers may need the thread ID for forking or resuming.
+        Implementation: set after thread_start; None before first call.
+        Example: ``driver.last_thread_id`` returns ``None`` initially.
+        """
+        return self._last_thread_id
+
+    def _try_install_stderr_tee(self, codex: object, run_log_path: Path | None) -> None:
+        """Swap the Codex stderr deque for a run-log-teeing deque (§8.2), fail-soft.
+
+        Design: §8.2 forensic stderr capture: replace the SDK's private bounded
+            deque at ``codex._client._sync._stderr_lines`` with a ``_StderrTeeDeque``
+            that mirrors each appended line into ``run.log`` while preserving the
+            SDK's bounded buffer. This is the single most drift-fragile attribute
+            chain in the seam, so it MUST degrade to no-tee (warn-and-continue) and
+            never crash.
+        Implementation: when ``run_log_path`` is None there is no sink, so skip.
+            Otherwise navigate ``_client._sync._stderr_lines``; only when it is a
+            ``deque`` open ``run.log`` in append mode and replace the attribute with a
+            ``_StderrTeeDeque`` carrying the SAME ``maxlen`` (seeded with the existing
+            lines, not re-teed). A missing/wrong-typed deque, or any AttributeError/
+            OSError, warns and leaves the SDK untouched. The installed tee is recorded
+            on ``self`` so ``_generate_impl`` can close its sink.
+        Example: ``_try_install_stderr_tee(codex, run_dir / "run.log")`` tees Codex
+            stderr; ``_try_install_stderr_tee(codex, None)`` is a no-op.
+        """
+        self._stderr_tee = None
         if run_log_path is None:
             return
         try:
-            sync = codex._client._sync
-            sync._stderr_lines = _make_teeing_deque(sync._stderr_lines, run_log_path)
-        except AttributeError:
+            client = getattr(codex, "_client", None)
+            sync = getattr(client, "_sync", None)
+            existing = getattr(sync, "_stderr_lines", None)
+            if sync is None or not isinstance(existing, deque):
+                warnings.warn(
+                    "openai_codex: stderr deque not found at _client._sync._stderr_lines; "
+                    "stderr tee disabled (fail-soft)",
+                    stacklevel=3,
+                )
+                return
+            sink = open(run_log_path, "a", encoding="utf-8")
+            tee = _StderrTeeDeque(existing, maxlen=existing.maxlen, sink=sink)
+            sync._stderr_lines = tee
+            self._stderr_tee = tee
+        except (AttributeError, OSError):
+            warnings.warn(
+                "openai_codex: could not install stderr tee; disabled (fail-soft)",
+                stacklevel=3,
+            )
+
+    def generate(
+        self,
+        *,
+        instructions: str,
+        config: CodexConfig,
+        run_log_path: Path | None = None,
+    ) -> AsyncGenerator[CodexEvent, None]:
+        """Return an async generator streaming CodexEvents for one turn (§8.2).
+
+        Design: §8.2 the Protocol declares ``generate`` as a regular method
+            returning an AsyncGenerator so callers can ``async for`` over it;
+            the streaming body lives in ``_generate_impl`` so the signatures
+            stay precise and consistent.
+        Implementation: a thin wrapper that returns the ``_generate_impl``
+            coroutine-generator without awaiting; no SDK import here.
+        Example: ``async for evt in driver.generate(instructions="x", config=cfg): ...``.
+        """
+        return self._generate_impl(
+            instructions=instructions,
+            config=config,
+            run_log_path=run_log_path,
+        )
+
+    async def _generate_impl(
+        self,
+        *,
+        instructions: str,
+        config: CodexConfig,
+        run_log_path: Path | None = None,
+    ) -> AsyncGenerator[CodexEvent, None]:
+        """Stream CodexEvents for one turn of Codex (§8.2).
+
+        Design: §8.2 callers iterate CodexEvents without coupling to SDK
+            notification internals; transient errors propagate so callers
+            can retry at their discretion.
+        Implementation: lazy imports; stderr tee installed before __aenter__
+            (D4 fail-soft); thread_start with workspace_write/deny_all + network config; turn
+            streamed via AsyncTurnHandle.stream(); notification method/payload
+            emitted as CodexEvent via _dump.  TimeoutError and CancelledError
+            are NEVER caught (always re-raised).
+        Example: ``async for evt in driver._generate_impl(instructions="x", config=cfg): ...``.
+        """
+        from openai_codex import ApprovalMode, AsyncCodex, Sandbox, TextInput  # lazy import
+
+        codex = AsyncCodex(config=config)
+        self._try_install_stderr_tee(codex, run_log_path)
+
+        try:
+            async with codex as codex_ctx:
+                self._codex = codex_ctx
+                thread = await codex_ctx.thread_start(
+                    sandbox=Sandbox.workspace_write,
+                    approval_mode=ApprovalMode.deny_all,
+                    cwd=str(config.cwd) if config.cwd is not None else None,
+                    config={"sandbox_workspace_write": {"network_access": True}},
+                )
+                self._last_thread_id = thread.id
+                turn_handle = await thread.turn(
+                    TextInput(text=instructions),
+                    cwd=str(config.cwd) if config.cwd is not None else None,
+                    approval_mode=ApprovalMode.deny_all,
+                )
+                stream = turn_handle.stream()
+                try:
+                    async for notification in stream:
+                        payload_obj = getattr(notification, "payload", None)
+                        yield CodexEvent(
+                            kind=str(getattr(notification, "method", "")),
+                            payload=_dump(payload_obj),
+                        )
+                finally:
+                    aclose = getattr(stream, "aclose", None)  # AsyncGenerator has aclose()
+                    if aclose is not None:
+                        await aclose()  # type: ignore[misc]  # runtime AsyncGenerator
+        finally:
+            self._codex = None
+            if self._stderr_tee is not None:
+                self._stderr_tee.close()
+                self._stderr_tee = None
+
+    async def interrupt(self) -> None:
+        """Best-effort interrupt of the current generate(); silently ignored if idle.
+
+        Design: §8.2 callers invoke interrupt() on a best-effort basis
+            (e.g., from a signal handler); it must never raise.
+        Implementation: getattr-guarded to survive SDK version differences.
+        Example: calling interrupt() when no generate() is active is a no-op.
+        """
+        codex = self._codex
+        if codex is None:
+            return
+        interrupt_fn = getattr(codex, "close", None)
+        if interrupt_fn is None:
+            return
+        try:
+            result = interrupt_fn()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:  # noqa: BLE001
             pass
 
     async def aclose(self) -> None:
-        """Grace-close the active session (§8.5).
+        """Close and release the Codex instance (idempotent).
 
-        Design: lifecycle closes SDK resources before releasing locks on
-            cancellation/failure paths and is idempotent with stream cleanup.
-        Implementation: delegate to the one-shot _close_codex and clear refs.
-        Example: await runner.aclose().
+        Design: §8.2 drivers may be reused across multiple generate() calls;
+            aclose() lets callers cleanly release resources.
+        Implementation: delegates to codex.close() if active; sets _closed
+            flag to prevent double-close errors.
+        Example: ``await driver.aclose()`` after all generate() calls.
         """
-        await self._close_codex(self._codex)
-        self._session = None
-
-    async def interrupt(self) -> None:
-        """Best-effort SDK-native interrupt of the active Codex run (§H10).
-
-        Design: interrupt before hard teardown lets an in-flight turn flush
-            partial state; missing SDK support is a safe no-op.
-        Implementation: call session.interrupt() or session.cancel() when
-            present, awaiting awaitable results and suppressing errors.
-        Example: await runner.interrupt().
-        """
-        session = self._session
-        if session is None:
+        if self._closed:
             return
-        interrupt = getattr(session, "interrupt", None) or getattr(session, "cancel", None)
-        if interrupt is None:
+        self._closed = True
+        codex = self._codex
+        if codex is None:
             return
-        try:
-            result = interrupt()
-            if hasattr(result, "__await__"):
-                await result
-        except Exception:
-            pass
-
-    def terminate(self) -> None:
-        """Force-clear the tracked session (§8.5).
-
-        Design: provides an escalation hook after graceful close timeouts.
-        Implementation: best-effort clear because SDK process termination is
-            internal to openai_codex.
-        Example: runner.terminate().
-        """
-        self._session = None
+        close_fn = getattr(codex, "close", None)
+        if close_fn is not None:
+            try:
+                await close_fn()
+            except Exception:  # noqa: BLE001
+                pass
         self._codex = None
+
+    async def __aenter__(self) -> CodexDriver:
+        """Enter async context manager.
+
+        Design: §8.2 allows ``async with CodexDriver() as d:`` usage so
+            callers get guaranteed cleanup via ``__aexit__``.
+        Implementation: returns self; no setup needed since connect happens
+            inside each generate() call.
+        Example: ``async with CodexDriver() as d: async for e in d.generate(...): ...``.
+        """
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        """Exit async context manager, releasing resources.
+
+        Design: §8.2 ensures aclose() is always called when the context
+            exits, even if an exception propagates.
+        Implementation: delegates to aclose(); ignores exc_type/val/tb.
+        Example: context exit after generate() calls aclose() automatically.
+        """
+        await self.aclose()

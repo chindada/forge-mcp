@@ -1,210 +1,67 @@
+from __future__ import annotations
+
 import json
-import os
-from datetime import UTC, datetime
+from pathlib import Path
 
-import pytest
-from pydantic import ValidationError
-
-from forge_mcp.state import RunState, StateLiteral, read_state, write_state
+from forge_mcp.state import durable_append, durable_replace, light_replace, write_json
 
 
-def test_state_literal_excludes_pw_probe():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_durable_replace_overwrites_atomically(tmp_path: Path):
+    """Design: §13 whole-file replace is the state.json/spec.md writer.
+    Implementation: write twice; the second fully replaces the first.
+    Example: file content == last write.
     """
-    assert "iter_removed_probe" not in StateLiteral.__args__
+    p = tmp_path / "state.json"
+    durable_replace(p, "first")
+    durable_replace(p, "second")
+    assert p.read_text() == "second"
+    assert (p.stat().st_mode & 0o777) == 0o600
 
 
-def test_runstate_extra_forbidden():
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_durable_append_preserves_prior_entries(tmp_path: Path):
+    """Design: §13/I3 the audit log must NOT be replaced wholesale.
+    Implementation: two appends accumulate.
+    Example: both lines present.
     """
-    with pytest.raises(ValidationError):
-        RunState.model_validate(
-            {"state": "init", "run_id": "abcd1234", "iteration": 0, "extra": "nope"}
-        )
+    p = tmp_path / "spec_amendments.md"
+    durable_append(p, "entry-1\n")
+    durable_append(p, "entry-2\n")
+    assert p.read_text() == "entry-1\nentry-2\n"
 
 
-def test_write_state_atomic_mode_and_roundtrip(tmp_path):
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_light_replace_writes(tmp_path: Path):
+    """Design: §13 light tier for fingerprints/artifacts.
+    Implementation: bytes round-trip.
+    Example: file content matches.
     """
-    path = tmp_path / "state.json"
-    started = datetime.now(UTC)
-    state = RunState(
-        state="init",
-        run_id="abcd1234",
-        target_dir=str(tmp_path),
-        iteration=0,
-        started_at=started,
-    )
-    write_state(path, state)
-    assert read_state(path) == state
-    if os.name == "posix":
-        assert oct(path.stat().st_mode & 0o777) == "0o600"
-    assert not list(tmp_path.glob(".state.json.*"))
-    body = json.loads(path.read_text())
-    assert body["state"] == "init"
+    p = tmp_path / "fp.json"
+    light_replace(p, b'["a|high"]')
+    assert p.read_bytes() == b'["a|high"]'
 
 
-def test_write_state_overwrites_atomically(tmp_path):
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_write_json_durable_and_light(tmp_path: Path):
+    """Design: §13 write_json routes a dict/model to the chosen tier.
+    Implementation: durable=True and False both produce valid JSON.
+    Example: json.loads round-trips.
     """
-    path = tmp_path / "state.json"
-    started = datetime.now(UTC)
-    write_state(
-        path,
-        RunState(
-            state="init",
-            run_id="abcd1234",
-            target_dir=str(tmp_path),
-            iteration=0,
-            started_at=started,
-        ),
-    )
-    before = path.read_bytes()
-    write_state(
-        path,
-        RunState(
-            state="planning",
-            run_id="abcd1234",
-            target_dir=str(tmp_path),
-            iteration=0,
-            started_at=started,
-        ),
-    )
-    after = path.read_bytes()
-    assert before != after
-    assert read_state(path).state == "planning"
+    p = tmp_path / "x.json"
+    write_json(p, {"k": 1}, durable=True)
+    assert json.loads(p.read_text()) == {"k": 1}
+    write_json(p, {"k": 2}, durable=False)
+    assert json.loads(p.read_text()) == {"k": 2}
 
 
-def test_runstate_requires_target_dir_and_started_at() -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: §7 requires state.json to carry target root and run start time.
-    Implementation: omit both required fields and assert Pydantic rejects it.
-    Example: pytest raises ValidationError for incomplete RunState payloads.
+def test_write_json_indent_pretty_prints_for_humans(tmp_path: Path):
+    """Design: §13 indent is presentation-only — indent=2 pretty-prints the
+        human-read artifacts (eval.json/triage.json); the default stays compact.
+    Implementation: a nested dict with indent=2 is multi-line and indented yet
+        round-trips; the default has no newlines.
+    Example: indented output contains a newline; compact output does not.
     """
-    with pytest.raises(ValidationError):
-        RunState(state="init", run_id="abcd1234", iteration=0)  # type: ignore[call-arg]
-
-
-def test_runstate_round_trips_target_dir_and_started_at(tmp_path) -> None:
-    """Pin §7 RunState shape required for forensic state.json.
-
-    Design: target_dir and started_at must survive JSON persistence.
-    Implementation: serialize and validate through Pydantic JSON APIs.
-    Example: parsed.started_at equals the original aware timestamp.
-    """
-    started = datetime.now(UTC)
-    state = RunState(
-        state="init",
-        run_id="abcd1234",
-        iteration=0,
-        target_dir=str(tmp_path),
-        started_at=started,
-        last_updated_at=started,
-    )
-    parsed = RunState.model_validate_json(state.model_dump_json())
-    assert parsed.target_dir == str(tmp_path)
-    assert parsed.started_at == started
-
-
-def test_runstate_defaults_timestamp(tmp_path):
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    state = RunState(
-        state="init",
-        run_id="abcd1234",
-        target_dir=str(tmp_path),
-        iteration=0,
-        started_at=datetime.now(UTC),
-    )
-    assert state.last_updated_at.tzinfo is UTC
-    assert state.last_updated_at <= datetime.now(UTC)
-
-
-def test_write_state_fsyncs_file(tmp_path, monkeypatch) -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    import os
-    from datetime import UTC, datetime
-
-    from forge_mcp import state as state_mod
-    from forge_mcp.state import RunState, write_state
-
-    calls: list[int] = []
-    real_fsync = os.fsync
-
-    def spy(fd):
-        """Record fsync calls then delegate to the real fsync.
-
-        Design: §H2 requires write_state to fsync the file before replace.
-        Implementation: append the fd and call through to os.fsync.
-        Example: spy(3) records and forwards.
-        """
-        calls.append(fd)
-        return real_fsync(fd)
-
-    monkeypatch.setattr(state_mod.os, "fsync", spy)
-    now = datetime.now(UTC)
-    write_state(
-        tmp_path / "state.json",
-        RunState(
-            state="iter_done",
-            run_id="abcd1234",
-            target_dir=str(tmp_path),
-            iteration=1,
-            started_at=now,
-            last_completed_iteration=1,
-        ),
-    )
-    assert len(calls) >= 1
-
-
-def test_last_completed_iteration_round_trips(tmp_path) -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
-    """
-    from datetime import UTC, datetime
-
-    from forge_mcp.state import RunState, read_state, write_state
-
-    now = datetime.now(UTC)
-    path = tmp_path / "state.json"
-    write_state(
-        path,
-        RunState(
-            state="iter_done",
-            run_id="abcd1234",
-            target_dir=str(tmp_path),
-            iteration=7,
-            started_at=now,
-            last_completed_iteration=7,
-        ),
-    )
-    assert read_state(path).last_completed_iteration == 7
+    p = tmp_path / "x.json"
+    write_json(p, {"a": 1, "b": [2, 3]}, durable=False, indent=2)
+    pretty = p.read_text()
+    assert "\n  " in pretty  # multi-line and indented
+    assert json.loads(pretty) == {"a": 1, "b": [2, 3]}
+    write_json(p, {"a": 1, "b": [2, 3]}, durable=False)
+    assert "\n" not in p.read_text()  # default stays compact single-line

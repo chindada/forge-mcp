@@ -1,82 +1,86 @@
-"""§8.2 last_phase tracks last non-terminal phase only."""
-
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from pathlib import Path
+import json
 
-from forge_mcp.orchestrator.statemachine import RunStateMachine
-from forge_mcp.state import RunState
+import pytest
+from pydantic import ValidationError
+
+from forge_mcp.artifacts import RunLayout
+from forge_mcp.orchestrator.statemachine import (
+    RunState,
+    RunStateMachine,
+    RunStatePayload,
+)
 
 
-def _initial(p: Path) -> RunStateMachine:
-    """Create a RunStateMachine in init state.
-
-    Design: tests need a private state.json writer rooted in tmp dirs.
-    Implementation: construct RunState and pass it to RunStateMachine.
-    Example: sm = _initial(tmp_path).
+def test_legal_single_plan_path(tmp_path):
+    """Design: §9 the run advances init->planning->executing->finalizing->terminal.
+    Implementation: drive the full legal chain and read back the final state.
+    Example: state.json reflects 'completed' at the end.
     """
-    return RunStateMachine(
-        p / "state.json",
-        RunState(
-            state="init",
-            run_id="abcd1234",
-            target_dir=str(p),
-            iteration=0,
-            started_at=datetime.now(UTC),
-            last_updated_at=datetime.now(UTC),
-        ),
-    )
+    sm = RunStateMachine(RunLayout.for_run(tmp_path))
+    for to in ["planning", "executing", "finalizing", "completed"]:
+        sm.transition(to, now="t")
+    assert json.loads((tmp_path / "state.json").read_text())["state"] == "completed"
 
 
-def test_last_phase_advances_for_non_terminal(tmp_path: Path) -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_failed_reachable_from_any_nonterminal(tmp_path):
+    """Design: §9 'failed' is reachable from any non-terminal state.
+    Implementation: transition init->planning then planning->failed directly.
+    Example: state becomes 'failed' without passing through finalizing.
     """
-    sm = _initial(tmp_path)
-    sm.transition("planning")
-    assert sm.last_phase == "planning"
-    sm.transition("iter_generating", iteration=1)
-    assert sm.last_phase == "iter_generating"
+    sm = RunStateMachine(RunLayout.for_run(tmp_path))
+    sm.transition("planning", now="t")
+    sm.transition("failed", now="t")
+    assert sm.payload.state == "failed"
 
 
-def test_last_phase_does_not_advance_for_terminal(tmp_path: Path) -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_removed_states_are_illegal(tmp_path):
+    """Design: §9 scheduling/merging/amending/verifying edges are removed.
+    Implementation: planning->scheduling and executing->merging both raise.
+    Example: no path threads the old wave-cycle states.
     """
-    sm = _initial(tmp_path)
-    sm.transition("iter_generating", iteration=1)
-    sm.transition("failed", reason="boom")
-    assert sm.last_phase == "iter_generating"
+    sm = RunStateMachine(RunLayout.for_run(tmp_path))
+    sm.transition("planning", now="t")
+    with pytest.raises(ValueError):
+        sm.transition("scheduling", now="t")
+    sm.transition("executing", now="t")
+    with pytest.raises(ValueError):
+        sm.transition("merging", now="t")
 
 
-def test_last_phase_does_not_advance_for_cancelling(tmp_path: Path) -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_illegal_skip_raises(tmp_path):
+    """Design: §9 illegal edges are rejected (single source of legal ordering).
+    Implementation: jump init->finalizing.
+    Example: raises ValueError.
     """
-    sm = _initial(tmp_path)
-    sm.transition("iter_evaluating", iteration=2)
-    sm.transition("cancelling", reason="client", cancelled=True)
-    assert sm.last_phase == "iter_evaluating"
+    sm = RunStateMachine(RunLayout.for_run(tmp_path))
+    with pytest.raises(ValueError):
+        sm.transition("finalizing", now="t")
 
 
-def test_iteration_pinned_via_kwargs(tmp_path: Path) -> None:
-    """Pin a forge-mcp behavior.
-
-    Design: CI catches regressions for this behavior.
-    Implementation: call focused production code and assert output.
-    Example: pytest runs this test in the non-slow suite.
+def test_terminal_cannot_advance(tmp_path):
+    """Design: §9 terminal states do not advance.
+    Implementation: reach 'incomplete' then attempt another transition.
+    Example: transitioning out of a terminal state raises ValueError.
     """
-    sm = _initial(tmp_path)
-    sm.transition("iter_generating", iteration=3)
-    assert sm.iteration == 3
-    assert sm.current.iteration == 3
+    sm = RunStateMachine(RunLayout.for_run(tmp_path))
+    for to in ["planning", "executing", "finalizing", "incomplete"]:
+        sm.transition(to, now="t")
+    with pytest.raises(ValueError):
+        sm.transition("completed", now="t")
+
+
+def test_wave_field_removed():
+    """Design: §9 the dead RunStatePayload.wave field is removed.
+    Implementation: the model has no 'wave' field and extra='forbid' rejects it.
+    Example: passing wave=0 raises ValidationError.
+    """
+    assert "wave" not in RunStatePayload.model_fields
+    assert "scheduling" not in RunState.__args__
+    with pytest.raises(ValidationError):
+        # Route through model_validate (dict) so pyright doesn't flag the
+        # deliberately-invalid 'wave' key as a Literal mismatch.
+        RunStatePayload.model_validate(
+            {"state": "init", "last_phase": None, "last_updated_at": "t", "wave": 0}
+        )
