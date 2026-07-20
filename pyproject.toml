@@ -11,7 +11,7 @@ license = {text = "MIT"}
 dependencies = [
   "mcp[cli] >=1.12,<2",
   "claude-agent-sdk >=0.1.20,<1",
-  "openai-codex >=0.1.0b3",
+  "openai-codex >=0.144,<1",
   "pydantic >=2.7,<3",
   "typer >=0.12",
   "psutil >=5.9",
@@ -19,10 +19,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest >=8", "pytest-asyncio >=0.23", "ruff >=0.5", "pyright >=1.1.350"]
-
-[tool.uv]
-# openai-codex 0.1.0b3 pins a pre-release CLI binary; allow it explicitly.
-constraint-dependencies = ["openai-codex-cli-bin >=0.137.0a4"]
 
 [project.scripts]
 forge = "forge_mcp.cli:main"
