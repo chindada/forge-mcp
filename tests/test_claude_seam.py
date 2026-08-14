@@ -17,6 +17,24 @@ def test_envelope_is_idempotent():
     assert envelope(once) == once
 
 
+def test_build_options_disables_mcp_inheritance_without_hiding_skills():
+    """MCP isolation must remain independent from settings-backed skill discovery.
+
+    Design: every forge-created Claude session must reject inherited MCP servers
+        while retaining the user, project, and local sources that advertise skills.
+    Implementation: construct options only; assert the empty strict MCP boundary
+        together with the unchanged skills and setting source values.
+    Example: a forge skill-probe session can see `superpowers:writing-plans` but
+        cannot load a `forge` MCP declaration from any settings source.
+    """
+    options = _claude.build_options(system="list skills only")
+
+    assert options.mcp_servers == {}
+    assert options.strict_mcp_config is True
+    assert options.skills == "all"
+    assert options.setting_sources == ["user", "project", "local"]
+
+
 def test_git_deny_hook_blocks_mutation_passes_safe():
     """Design: §8.1/§9 the PreToolUse hook denies git-mutating Bash, passes the rest.
     Implementation: call the deny callback with a git commit and a safe command.

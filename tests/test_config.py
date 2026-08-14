@@ -18,6 +18,31 @@ def test_env_overrides(monkeypatch, tmp_path):
     assert config.claude_config_dir() == tmp_path / "cc"
 
 
+def test_claude_bin_makes_relative_override_independent_of_child_cwd(monkeypatch, tmp_path):
+    """Resolve one Claude executable before SDK sessions change child cwd.
+
+    Design: preflight and every Claude stage must address the identical binary,
+        even when FORGE_CLAUDE_BIN is relative and a stage uses another cwd.
+    Implementation: resolve from a server directory, then compare the returned
+        path after moving the test process to a distinct target directory.
+    Example: ``bin/claude`` becomes ``/server/bin/claude`` for every stage.
+    """
+    server_dir = tmp_path / "server"
+    target_dir = tmp_path / "target"
+    claude_path = server_dir / "bin" / "claude"
+    claude_path.parent.mkdir(parents=True)
+    claude_path.touch()
+    target_dir.mkdir()
+    monkeypatch.chdir(server_dir)
+    monkeypatch.setenv("FORGE_CLAUDE_BIN", "bin/claude")
+
+    resolved = config.claude_bin()
+    monkeypatch.chdir(target_dir)
+
+    assert resolved.is_absolute()
+    assert resolved == claude_path.resolve()
+
+
 def test_create_run_dir_makes_gitignore_and_timestamp_dir(tmp_path):
     """Design: §11/§12 .harness is self-ignored; run dir is a valid run-id.
     Implementation: create_run_dir then inspect.

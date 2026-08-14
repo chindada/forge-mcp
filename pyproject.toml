@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
   "mcp[cli] >=1.12,<2",
-  "claude-agent-sdk >=0.1.20,<1",
+  "claude-agent-sdk >=0.1.74,<1",
   "openai-codex >=0.144,<1",
   "pydantic >=2.7,<3",
   "typer >=0.12",

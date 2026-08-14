@@ -6,6 +6,7 @@ All SDK imports are lazy (inside functions) so that
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ _DISK_WARN_BYTES: int = 500 * 1024 * 1024
 
 # Short timeout (seconds) for the ``codex --version`` smoke probe.
 _CODEX_VERSION_TIMEOUT: float = 5.0
+
+# Claude Code 2.1.153 fixed strict-MCP handling for custom-agent servers.
+_MIN_CLAUDE_VERSION: tuple[int, int, int] = (2, 1, 153)
+_CLAUDE_VERSION_TIMEOUT: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -87,25 +92,47 @@ def _check_git_available() -> Check:
 
 
 def _check_claude_cli() -> Check:
-    """Return a Check row for whether the Claude CLI binary is present (§4.4).
+    """Return a Check row for Claude CLI presence and MCP-safe version (§4.4).
 
-    Design: §4.4 Claude CLI availability is required for claude-engine runs;
-        detecting absence early prevents cryptic failures at session start.
-    Implementation: call claude_bin() from forge_mcp.config; if the returned
-        path exists on disk (or shutil.which resolves it) return OK, else FAIL.
-    Example: with FORGE_CLAUDE_BIN pointing to a missing path returns FAIL.
+    Design: §4.4 Claude CLI availability is required for claude-engine runs,
+        and versions before 2.1.153 cannot enforce strict MCP configuration for
+        custom-agent servers, so both conditions must pass before a live probe.
+    Implementation: run the exact claude_bin() value's bounded ``--version``
+        command, parse the leading three-part version, and fail closed on a
+        missing, old, unrecognized, timed-out, or unsuccessful binary.
+    Example: a missing override or version 2.1.152 FAILs; 2.1.153 returns OK.
     """
     from forge_mcp.config import claude_bin  # lazy import avoids SDK at module load
 
     label = "claude CLI"
     bin_path = claude_bin()
-    if bin_path.exists():
-        return Check(label, "OK", str(bin_path))
-    # Fall back to which in case it's on PATH but not at the resolved path
-    on_path = shutil.which("claude")
-    if on_path:
-        return Check(label, "OK", on_path)
-    return Check(label, "FAIL", f"claude binary not found: {bin_path}")
+    try:
+        result = subprocess.run(
+            [str(bin_path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_CLAUDE_VERSION_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return Check(label, "FAIL", f"claude --version timed out after {_CLAUDE_VERSION_TIMEOUT}s")
+    except OSError as exc:
+        return Check(label, "FAIL", f"claude --version OSError: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return Check(label, "FAIL", f"exit code {result.returncode}: {detail}")
+
+    raw = (result.stdout or result.stderr).strip()
+    version_line = raw.splitlines()[0] if raw else ""
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\s|$)", version_line)
+    if match is None:
+        return Check(label, "FAIL", f"unrecognized claude --version output: {version_line!r}")
+
+    version = (int(match[1]), int(match[2]), int(match[3]))
+    if version < _MIN_CLAUDE_VERSION:
+        minimum = ".".join(str(part) for part in _MIN_CLAUDE_VERSION)
+        return Check(label, "FAIL", f"Claude Code {version_line} is below required {minimum}")
+    return Check(label, "OK", f"{bin_path} ({version_line})")
 
 
 def _check_codex_binary() -> Check:
@@ -181,29 +208,45 @@ def _check_codex_version_smoke() -> Check:
 
 
 def _check_sdk_contract() -> Check:
-    """Return a Check row for whether the Claude SDK contract symbols are importable (§8.4).
+    """Return a Check row for whether the Claude SDK supports MCP isolation (§8.4).
 
-    Design: §8.4 the seam layer depends on specific symbols from the Claude SDK;
-        verifying them at preflight time catches partial or stale SDK installs
-        before any run attempt.
-    Implementation: attempt lazy imports of the required seam symbols from
-        forge_mcp.drivers._claude (ClaudeRunner, StructuredResult, build_options);
-        return WARN (not FAIL) when the SDK is absent so SDK-less environments
-        can still run Codex-only sessions.
-    Example: with SDK installed returns OK; without SDK installed returns WARN.
+    Design: §8.4 the seam depends on both its public symbols and the SDK options
+        that keep settings-backed skills separate from strict MCP isolation.
+    Implementation: require the SDK, inspect ``ClaudeAgentOptions`` for all
+        load-bearing fields, and import the seam symbols; absence or
+        incompatibility returns FAIL without importing at module load.
+    Example: no SDK or an SDK without ``strict_mcp_config`` returns FAIL.
     """
+    import inspect
+
     label = "SDK contract"
     try:
-        # Import the seam symbols to validate the SDK chokepoint is intact.
+        import claude_agent_sdk
+    except ModuleNotFoundError as exc:
+        if exc.name == "claude_agent_sdk":
+            return Check(label, "FAIL", f"Claude SDK required for Claude stages: {exc}")
+        return Check(label, "FAIL", f"Claude SDK import failed: {exc}")
+    except ImportError as exc:
+        return Check(label, "FAIL", f"Claude SDK import failed: {exc}")
+
+    required_options = {"mcp_servers", "strict_mcp_config", "setting_sources", "skills"}
+    try:
+        option_parameters = inspect.signature(claude_agent_sdk.ClaudeAgentOptions).parameters
+    except (AttributeError, TypeError, ValueError) as exc:
+        return Check(label, "FAIL", f"ClaudeAgentOptions unavailable: {exc}")
+    missing_options = sorted(required_options - set(option_parameters))
+    if missing_options:
+        return Check(label, "FAIL", f"ClaudeAgentOptions missing: {', '.join(missing_options)}")
+
+    try:
         from forge_mcp.drivers._claude import (  # noqa: F401
             ClaudeRunner,
             StructuredResult,
             build_options,
         )
-
-        return Check(label, "OK", "ClaudeRunner, StructuredResult, build_options present")
     except ImportError as exc:
-        return Check(label, "WARN", f"Claude SDK absent — Codex-only mode: {exc}")
+        return Check(label, "FAIL", f"Claude seam import failed: {exc}")
+    return Check(label, "OK", "Claude seam and MCP-isolation options present")
 
 
 def _check_disk_space(target_dir: Path | None) -> Check:
@@ -252,16 +295,16 @@ def _check_claude_skills(*, probe_live: bool = True) -> list[Check]:
     """Return Check rows for required Claude skill availability (§10.3).
 
     Design: §10.3 the Claude-side probe verifies that required skills are
-        advertised at session init; it is skipped (WARN) when the Claude CLI
-        is absent or the SDK is not installed, so SDK-less environments still
-        pass preflight without a FAIL.
+        advertised at session init; it is skipped (WARN) when compatibility
+        preflight disables live probing or its required runtime is unavailable.
     Implementation: attempt lazy imports of ClaudeDriver and probe_claude_skills;
         if the SDK or CLI is unavailable emit a single WARN row; otherwise run
         the async probe via asyncio.run with a short deadline and map each
         SkillProbe to a Check with label prefixed "claude-skill:".
         When *probe_live* is False, skip the live session entirely and return a
         single WARN row so tests and CI can stay offline and fast.
-    Example: with SDK absent returns a single WARN row "claude-skill: skipped …".
+    Example: with live probing disabled returns a single WARN row
+        "claude-skill:probe: skipped (live probe disabled)".
     """
     import asyncio
 
@@ -342,13 +385,19 @@ def run_checks(target_dir: Path | None, *, probe_claude_live: bool = True) -> li
 
     rows += _safe(lambda: _check_target_writable(target_dir), "target writable")
     rows += _safe(_check_git_available, "git available")
-    rows += _safe(_check_claude_cli, "claude CLI")
+    claude_cli_rows = _safe(_check_claude_cli, "claude CLI")
+    rows += claude_cli_rows
     rows += _safe(_check_codex_binary, "codex binary")
     rows += _safe(_check_codex_importable, "openai_codex importable")
     rows += _safe(_check_codex_version_smoke, "codex --version smoke")
-    rows += _safe(_check_sdk_contract, "SDK contract")
+    sdk_contract_rows = _safe(_check_sdk_contract, "SDK contract")
+    rows += sdk_contract_rows
     rows += _safe(lambda: _check_disk_space(target_dir), "disk space")
     rows += _safe(_check_codex_skills, "codex-skill probes")
-    rows += _safe(lambda: _check_claude_skills(probe_live=probe_claude_live), "claude-skill probes")
+    claude_probe_live = probe_claude_live and not any_fail(claude_cli_rows + sdk_contract_rows)
+    rows += _safe(
+        lambda: _check_claude_skills(probe_live=claude_probe_live),
+        "claude-skill probes",
+    )
 
     return rows

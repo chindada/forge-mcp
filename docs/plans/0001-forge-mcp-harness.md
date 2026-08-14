@@ -17,8 +17,8 @@ Every task's requirements implicitly include this section. Values copied verbati
 - **Python:** `requires-python = ">=3.11"`. The harness assumes 3.11+, where `asyncio.TimeoutError is TimeoutError` (§8.1) — load-bearing for the runtime cap.
 - **Dependency pins (normative version floors):**
   - `mcp[cli] >=1.12,<2` — the **mcp 1.x major line**. The v2.x `mcp.server.mcpserver.MCPServer` MUST NOT appear (§4.1).
-  - `claude-agent-sdk >=0.1.20,<1` — verified against installed `0.2.x` (0.2.106–0.2.108 present).
-  - `openai-codex >=0.1.0b2` — introspect the **`0.1.0b2`** wheel (`openai_codex-0.1.0b2.dist-info`), **never** the `0.131.0a4` copies also in the uv cache (§8.2). In `0.1.0b2`: config class `CodexConfig`, sandbox enum `Sandbox` (`full_access`→wire `danger-full-access`), never-ask approval `ApprovalMode.deny_all`, real `TransportClosedError` in `openai_codex.errors`, `turn()` has no public `sandbox_policy=`.
+  - `claude-agent-sdk >=0.1.74,<1` — 0.1.74 introduced strict MCP configuration; verified against installed `0.2.137`.
+  - `openai-codex >=0.144,<1` — the active supported range. The original implementation evidence in §8.2 used the historical `0.1.0b2` wheel; current SDK contract tests are authoritative.
   - `pydantic >=2.7,<3` · `typer >=0.12` · `psutil >=5.9`.
   - **`filelock` is intentionally NOT a dependency** — see Recommended Option Decisions D1 (lock uses the hand-rolled `O_EXCL` marker, not `SoftFileLock`).
   - `git` available on PATH (verified `2.54.0`).
@@ -215,8 +215,8 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
   "mcp[cli] >=1.12,<2",
-  "claude-agent-sdk >=0.1.20,<1",
-  "openai-codex >=0.1.0b2",
+  "claude-agent-sdk >=0.1.74,<1",
+  "openai-codex >=0.144,<1",
   "pydantic >=2.7,<3",
   "typer >=0.12",
   "psutil >=5.9",
@@ -1269,7 +1269,7 @@ git commit -m "feat(prompts): five stage system/triage/remediation prompts (§5)
 - Consumes: `forge_mcp.ids` (`format_run_id`, `is_run_id`).
 - Produces (§10.4/§12):
   - `claude_config_dir() -> Path` — `$CLAUDE_CONFIG_DIR` else `~/.claude`.
-  - `claude_bin() -> Path` — `$FORGE_CLAUDE_BIN` else `shutil.which("claude")` else `~/.local/bin/claude`.
+  - `claude_bin() -> Path` — `$FORGE_CLAUDE_BIN` else `shutil.which("claude")` else `~/.local/bin/claude`, resolved absolute before use.
   - `codex_bin() -> Path` — `$FORGE_CODEX_BIN` else `shutil.which("codex")` else `~/.npm-global/bin/codex`.
   - `create_run_dir(target_dir: Path, when: time.struct_time) -> Path` — ensures `<target_dir>/.harness/`, writes the self-ignoring `.gitignore` (`*`, `O_EXCL`, never overwritten), and creates `<target_dir>/.harness/<run_id>/` at `0700`; appends a `-NN` uniquifier on same-second collision (uses `ids.format_run_id`). Returns the run dir.
   - `CONCURRENCY_CAP: int = 4` (tunable, `[verify-against-installed]`).
@@ -1326,7 +1326,8 @@ def test_same_second_rerun_uniquifies(tmp_path):
 
 Guidance (§10.4/§12):
 - `_env_path(name)` helper returning `Path(os.environ[name])` or `None`.
-- `claude_bin`/`codex_bin`: env → `shutil.which(...)` → default path; return `Path`.
+- `claude_bin`: env → `shutil.which(...)` → default path; return an absolute `Path`.
+- `codex_bin`: env → `shutil.which(...)` → default path; return `Path`.
 - `_ensure_harness_gitignore(harness)`: create `harness` (`exist_ok`); attempt `fd = os.open(harness/".gitignore", O_CREAT|O_EXCL|O_WRONLY, 0o600)`; on success `os.write(fd, b"*")`, close; on `FileExistsError` leave it (never overwrite — §7.2).
 - `create_run_dir`: `harness = target_dir/".harness"`; ensure gitignore; loop uniquifier from `None,1,2,…`: `run_id = format_run_id(when, uniquifier=u)`; try `os.makedirs(harness/run_id, mode=0o700, exist_ok=False)`; on `FileExistsError` bump `u`; return on success.
 - `CONCURRENCY_CAP = 4`.
@@ -2527,7 +2528,7 @@ def test_any_fail_true_on_fail_row():
 
 - [ ] **Step 2: Run tests to verify they fail** → FAIL.
 
-- [ ] **Step 3: Implement `src/forge_mcp/check.py`** per §4.4/§10.3. Each probe is isolated in a `try/except` and returns a row (never raises out of `run_checks`). The git check uses `shutil.which("git")`; the Codex smoke shells `codex --version` with a short timeout; the SDK-contract check imports the seams' symbols (skips→WARN if SDK absent). Skill probes delegate to `forge_mcp.skills`.
+- [ ] **Step 3: Implement `src/forge_mcp/check.py`** per §4.4/§10.3. Each probe is isolated in a `try/except` and returns a row (never raises out of `run_checks`). The git check uses `shutil.which("git")`; the Codex smoke shells `codex --version` with a short timeout; the SDK-contract check imports the required seams' symbols (FAIL if SDK absent). Skill probes delegate to `forge_mcp.skills`.
 
 - [ ] **Step 4: Run tests to verify they pass** → PASS.
 
@@ -3063,4 +3064,3 @@ After all 31 tasks merge, run the full CI gate once and confirm green:
 **Type consistency.** `PlanLoopResult` (T26) is consumed unchanged by T27/T28; `Change`/`Manifest`/`Entry` (T8) by T13/T26; `RunResult`/`GapSummary`/`RunForgeInput` anchors (T2) by T28/T29; `VerifyOutcome` (T7) by T26; `StructuredResult`/`CodexEvent` (T14/T15) by the stages and fakes (T17). The `RunLayout` (T11) path API is the single source consumed by T20/T21/T24/T26/T28.
 
 **No future / out-of-scope work.** Every non-goal in §2 (cost accounting, browser verification, cross-run resume, MCP resource/subscription/task surface, cross-run learning, extra filesystem metadata) is **absent** from the task list by construction — nothing is deferred; all in-scope work is covered by T1–T31.
-

@@ -43,16 +43,20 @@ def claude_bin() -> Path:
 
     Design: §10.4 the binary location varies by install method; env var
         overrides allow test harnesses and alternate installs to be used
-        without modifying PATH.
+        without modifying PATH. An absolute result prevents SDK child cwd from
+        reinterpreting the executable after preflight validates it.
     Implementation: check $FORGE_CLAUDE_BIN first, then shutil.which('claude'),
-        then fall back to ~/.local/bin/claude.
+        then fall back to ~/.local/bin/claude; resolve the selected path before
+        returning it.
     Example: with FORGE_CLAUDE_BIN=/opt/claude, returns Path('/opt/claude').
     """
-    return (
-        _env_path("FORGE_CLAUDE_BIN")
-        or (Path(w) if (w := shutil.which("claude")) else None)
-        or Path.home() / ".local" / "bin" / "claude"
-    )
+    configured = _env_path("FORGE_CLAUDE_BIN")
+    if configured is not None:
+        return configured.resolve()
+    on_path = shutil.which("claude")
+    if on_path is not None:
+        return Path(on_path).resolve()
+    return (Path.home() / ".local" / "bin" / "claude").resolve()
 
 
 def codex_bin() -> Path:

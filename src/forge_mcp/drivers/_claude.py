@@ -132,17 +132,20 @@ def build_options(
     """Build a fully-configured ClaudeAgentOptions for forge-mcp runs.
 
     Design: §8.1 single chokepoint so every call site uses consistent
-        defaults (bypassPermissions, claude_code preset, etc.) without
-        repeating them.
-    Implementation: SDK import is lazy.  *output_format* is passed through
-        ``envelope()`` so callers can supply either a bare JSON Schema or an
-        already-enveloped one — the result is always correct.
+        defaults and no forge-created Claude session can inherit MCP servers
+        that recursively start forge-mcp.
+    Implementation: SDK import is lazy. MCP servers are empty and strict MCP
+        isolation is enabled independently from skills and setting sources.
+        *output_format* is passed through ``envelope()`` so callers can supply
+        either a bare JSON Schema or an already-enveloped one.
     Example: ``build_options(system="you are an agent")`` returns a valid
-        ``ClaudeAgentOptions`` with ``permission_mode="bypassPermissions"``.
+        ``ClaudeAgentOptions`` with strict MCP isolation and skills enabled.
     """
     from claude_agent_sdk import ClaudeAgentOptions  # lazy import
 
     kwargs: dict = {
+        "mcp_servers": {},
+        "strict_mcp_config": True,
         "permission_mode": "bypassPermissions",
         "tools": {"type": "preset", "preset": "claude_code"},
         "system_prompt": system,

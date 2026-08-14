@@ -21,6 +21,10 @@ def test_claude_symbols_exist():
     assert hasattr(c, "ClaudeAgentOptions")
     assert hasattr(c, "ClaudeSDKClient")
     assert hasattr(c, "HookMatcher")
+    options_sig = inspect.signature(c.ClaudeAgentOptions)
+    assert {"mcp_servers", "strict_mcp_config", "setting_sources", "skills"} <= set(
+        options_sig.parameters
+    )
     sig = inspect.signature(c.ClaudeSDKClient.__init__)
     assert "options" in sig.parameters
 

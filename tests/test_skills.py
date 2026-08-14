@@ -57,7 +57,10 @@ async def test_claude_probe_ok_when_init_skills_present():
     probes = await probe_claude_skills(
         runner=runner, required=("writing-plans", "code-review"), deadline=5.0
     )
-    assert all(p.status != "FAIL" for p in probes)
+    assert [(p.label, p.status) for p in probes] == [
+        ("writing-plans", "OK"),
+        ("code-review", "OK"),
+    ]
 
 
 @pytest.mark.driver
@@ -73,7 +76,10 @@ async def test_claude_probe_matches_namespaced_skill():
     probes = await probe_claude_skills(
         runner=runner, required=("writing-plans", "code-review"), deadline=5.0
     )
-    assert all(p.status != "FAIL" for p in probes)
+    assert [(p.label, p.status) for p in probes] == [
+        ("writing-plans", "OK"),
+        ("code-review", "OK"),
+    ]
 
 
 @pytest.mark.driver

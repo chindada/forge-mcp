@@ -18,7 +18,7 @@ Each phase runs in a **fresh SDK session** — no conversation or model state is
 - **[uv](https://docs.astral.sh/uv/)** — installed by `make setup-tools`
 - **git** — on your `PATH`
 - **The `codex` binary** — `npm install -g @openai/codex` (a manual prerequisite)
-- **The `claude` CLI** — installed separately (a manual prerequisite)
+- **Claude Code CLI ≥ 2.1.153** — installed separately (a manual prerequisite)
 
 `codex` and `claude` are **not** installed by the Makefile; install them yourself.
 
@@ -34,16 +34,18 @@ uv run forge check   # verify your environment
 
 1. `target writable` — the target directory exists, is a directory, and is writable
 2. `git available` — `git` is on `PATH`
-3. `claude CLI` — the `claude` binary is present
+3. `claude CLI` — `claude --version` succeeds and reports Claude Code ≥ 2.1.153
 4. `codex binary` — the `codex` binary is present
 5. `openai_codex importable` — the `openai_codex` package imports
 6. `codex --version smoke` — `codex --version` runs
-7. `SDK contract` — the Claude SDK seam symbols import
+7. `SDK contract` — the required Claude SDK is installed and supports the strict MCP-isolation options
 8. `disk space` — enough free space (warns below 500 MiB)
 9. `codex-skill:<id>` — required Codex filesystem skills are installed
 10. `claude-skill:<id>` — required Claude session skills are discoverable
 
 Each row prints as `[STATUS] label: detail`, where `STATUS` is `OK`, `WARN`, or `FAIL`. Exit code `0` means no failures. **A `WARN` never fails the check** — only a `FAIL` does, and any `FAIL` must be fixed before serving.
+
+If the Claude CLI or required SDK is absent or fails its compatibility check, preflight skips the live Claude skill probe. This prevents an unsafe child process from starting before `forge serve` rejects the failed checks.
 
 ## Register with Claude Code
 
@@ -183,12 +185,14 @@ forge-mcp reads exactly **four** environment variables:
 
 | Variable            | Default                                      | Purpose                                               |
 | ------------------- | -------------------------------------------- | ----------------------------------------------------- |
-| `FORGE_CLAUDE_BIN`  | `which("claude")` → `~/.local/bin/claude`    | Override the `claude` binary path                     |
+| `FORGE_CLAUDE_BIN`  | `which("claude")` → `~/.local/bin/claude`    | Override the Claude Code ≥ 2.1.153 binary path       |
 | `FORGE_CODEX_BIN`   | `which("codex")` → `~/.npm-global/bin/codex` | Override the `codex` binary path                      |
 | `CLAUDE_CONFIG_DIR` | `~/.claude`                                  | Select the Claude config/profile root                 |
 | `CODEX_HOME`        | `~/.codex`                                   | Codex home used to locate skills during `forge check` |
 
 forge-mcp reads **only** these. It does **not** read `ANTHROPIC_API_KEY` or any other credential — Claude and Codex authentication is configured through those tools' own login mechanisms.
+
+`FORGE_CLAUDE_BIN` may be relative to the forge process's working directory; forge resolves it to one absolute path before preflight and reuses that path for every Claude stage.
 
 ## Development
 

@@ -210,12 +210,12 @@ state only what appears here. Citations are `path:line`.
 
 The package reads **exactly four** environment variables (full-tree grep confirmed):
 
-| Variable | Read at | Default | Purpose |
-|----------|---------|---------|---------|
-| `FORGE_CLAUDE_BIN` | `config.py:52` | `which("claude")` → `~/.local/bin/claude` (`config.py:51-55`) | Override the `claude` binary path |
-| `FORGE_CODEX_BIN` | `config.py:68` | `which("codex")` → `~/.npm-global/bin/codex` (`config.py:67-71`) | Override the `codex` binary path |
-| `CLAUDE_CONFIG_DIR` | `config.py:38` | `~/.claude` | Select the Claude config/profile root |
-| `CODEX_HOME` | `check.py:245` | `~/.codex` (`check.py:246`) | Codex home used to locate skills during `forge check` |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FORGE_CLAUDE_BIN` | `which("claude")` → `~/.local/bin/claude` | Override the `claude` binary; resolved absolute before use |
+| `FORGE_CODEX_BIN` | `which("codex")` → `~/.npm-global/bin/codex` | Override the `codex` binary path |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Select the Claude config/profile root |
+| `CODEX_HOME` | `~/.codex` | Codex home used to locate skills during `forge check` |
 
 - **`ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are not referenced anywhere in the
   package** (0 matches). The README must therefore attribute Claude/Codex authentication to
@@ -223,37 +223,33 @@ The package reads **exactly four** environment variables (full-tree grep confirm
 
 ### §3.7 `forge check` probes (preflight)
 
-`run_checks(target_dir, *, probe_claude_live=True)` (`check.py:310`) emits a flat list of
-`Check` rows with `status: Literal["OK", "WARN", "FAIL"]`, in this fixed order
-(`check.py:343-352`); each probe is isolated by `_safe` so a crash becomes one FAIL row
-(`check.py:327-341`):
+`run_checks(target_dir, *, probe_claude_live=True)` emits a flat list of `Check` rows with
+`status: Literal["OK", "WARN", "FAIL"]`, in this fixed order; each probe is isolated by
+`_safe` so a crash becomes one FAIL row:
 
-1. `target writable` — `target_dir` exists, is a dir, is writable (WARN if no `target_dir`)
-   (`check.py:343`, `_check_target_writable` `:50-71`).
-2. `git available` — `git` on PATH (`check.py:344`, `:74-86`).
-3. `claude CLI` — `claude` binary present via `claude_bin()`/PATH (`check.py:345`,
-   `:89-108`).
-4. `codex binary` — `codex` binary present via `codex_bin()`/PATH (`check.py:346`,
-   `:111-129`).
-5. `openai_codex importable` — the `openai_codex` package imports (`check.py:347`,
-   `:132-148`).
-6. `codex --version smoke` — live `codex --version` (WARN if not on PATH, `:163-164`;
-   timeout `5.0s` = `_CODEX_VERSION_TIMEOUT`, `check.py:19`) (`check.py:348`, `:151-180`).
-7. `SDK contract` — Claude SDK seam symbols import (WARN if SDK absent → Codex-only mode,
-   `:205-206`) (`check.py:349`, `:183-206`).
-8. `disk space` — free space at `target_dir`/home (WARN below `500 MiB` =
-   `_DISK_WARN_BYTES`, `check.py:16`) (`check.py:350`, `:209-227`).
+1. `target writable` — `target_dir` exists, is a dir, is writable (WARN if no `target_dir`).
+2. `git available` — `git` on PATH.
+3. `claude CLI` — the configured binary's bounded `claude --version` succeeds and reports
+   Claude Code ≥2.1.153; older or unrecognized versions FAIL.
+4. `codex binary` — `codex` binary present via `codex_bin()`/PATH.
+5. `openai_codex importable` — the `openai_codex` package imports.
+6. `codex --version smoke` — live `codex --version` with a 5-second timeout (WARN if not
+   on PATH).
+7. `SDK contract` — the Claude seam imports and `ClaudeAgentOptions` exposes
+   `mcp_servers`, `strict_mcp_config`, `setting_sources`, and `skills`; an absent or
+   incompatible SDK FAILs because every forge run has Claude stages.
+8. `disk space` — free space at `target_dir`/home (WARN below `500 MiB`).
 9. `codex-skill:<id>` — filesystem skills under `$CODEX_HOME/skills` (+ plugin cache);
-   required ids `("executing-plans", "frontend-design")` (`skills.py:18`) (`check.py:351`,
-   `_check_codex_skills` `:230-248`).
+   required ids `("executing-plans", "frontend-design")`.
 10. `claude-skill:<id>` — live Claude session skill discovery (skipped/WARN with
-    `--no-live-claude`, `check.py:276-277`); required ids `("writing-plans", "code-review")`
-    (`check.py:292`, `skills.py:21`); deadline `20.0s` (`check.py:293`) (`check.py:352`,
-    `_check_claude_skills` `:251-307`).
+    `--no-live-claude`); required ids `("writing-plans", "code-review")`; deadline `20.0s`.
 
-`any_fail` is `any(c.status == "FAIL" …)` — **WARN never fails** (`check.py:38-47`). `forge
-serve` runs the same `run_checks(None)` as preflight and raises `RuntimeError` if any row
-FAILs before starting `mcp.run()` (`server.py:180-185`).
+A `FAIL` from probe 3 or 7 forces probe 10 into its disabled/WARN path, so preflight never
+launches a live Claude session that cannot honor the MCP-isolation contract.
+
+`any_fail` is `any(c.status == "FAIL" …)` — **WARN never fails**. `forge serve` runs the
+same `run_checks(None)` as preflight and raises `RuntimeError` if any row FAILs before
+starting `mcp.run()`.
 
 ### §3.8 Build & tooling (pyproject / scripts)
 
@@ -263,7 +259,7 @@ FAILs before starting `mcp.run()` (`server.py:180-185`).
 - `requires-python = ">=3.11"`; license MIT (`pyproject.toml:9-10`). Package exposes
   `__version__ = "0.1.0"` (`src/forge_mcp/__init__.py:5`).
 - Runtime deps (`pyproject.toml:11-18`): `mcp[cli] >=1.12,<2`, `claude-agent-sdk
-  >=0.1.20,<1`, `openai-codex >=0.1.0b2`, `pydantic >=2.7,<3`, `typer >=0.12`, `psutil
+  >=0.1.74,<1`, `openai-codex >=0.144,<1`, `pydantic >=2.7,<3`, `typer >=0.12`, `psutil
   >=5.9`.
 - **Dev deps are an extra**, not a PEP-735 group: `[project.optional-dependencies].dev =
   ["pytest >=8", "pytest-asyncio >=0.23", "ruff >=0.5", "pyright >=1.1.350"]`

@@ -19,8 +19,8 @@ generation, a leaner module set) and must not be produced by copy-paste.
 produced code. Two disciplines therefore apply throughout:
 
 1. **Verified facts are stated as normative.** Every SDK/MCP/git fact below was verified
-   against the *installed source* (claude-agent-sdk `0.2.106`, openai-codex `0.1.0b2`
-   cached wheel, mcp `1.x`, git `2.54.0`) or empirically reproduced.
+   against the installed claude-agent-sdk `0.2.137`, the historical openai-codex `0.1.0b2`
+   cached-wheel baseline, mcp `1.x`, and git `2.54.0`, or empirically reproduced.
 2. **Version-volatile facts are marked `[verify-against-installed]`.** Where a fact can
    drift across SDK/tool versions, the marker tells the Evaluator to treat a *reasonable
    equivalent in the installed version* as conformant, not a gap. The marker also covers
@@ -348,9 +348,10 @@ class GapSummary(BaseModel, extra="forbid"):
 A diagnostics subcommand (the `doctor`), exit non-zero on any `FAIL`. Each check returns
 `(label, status ∈ {OK, WARN, FAIL}, detail)`; `forge serve` runs the same checks as
 preflight and maps `FAIL → a tagged error` before starting a run. Checks (§10.3): target/
-harness writable; `git` available; Claude CLI + auth resolvable; Codex binary + `openai_codex`
-import + `codex --version` smoke; SDK contract introspection (§8.4); **per-engine skill
-discovery** (§10.3); disk-space `WARN` below a threshold.
+harness writable; `git` available; Claude Code CLI ≥2.1.153; Codex binary +
+`openai_codex` import + `codex --version` smoke; SDK contract introspection (§8.4);
+**per-engine skill discovery** (§10.3); disk-space `WARN` below a threshold. A Claude CLI
+or SDK contract `FAIL` suppresses the live Claude skill probe.
 
 ---
 
@@ -732,7 +733,7 @@ Python-SDK shape is **beta-volatile** (§8.4).
 
 ### §8.1 Claude seam — `drivers/_claude.py` (claude-agent-sdk)
 
-Verified against installed `claude-agent-sdk 0.2.106` (satisfies `>=0.1.20,<1`; shapes hold
+Verified against installed `claude-agent-sdk 0.2.137` (satisfies `>=0.1.74,<1`; shapes hold
 across the installed 0.2.x line).
 
 **Options builder** — one chokepoint for every Claude call:
@@ -747,7 +748,8 @@ def build_options(*, skills="all", setting_sources=("user","project","local"), s
     Design: §8.1 a single chokepoint prevents option drift. The claude_code TOOL preset
         and the system prompt are INDEPENDENT fields — selecting the tools preset does not
         set a system prompt, so `system` is passed separately as the `system_prompt`.
-    Implementation: ClaudeAgentOptions(permission_mode="bypassPermissions",
+    Implementation: ClaudeAgentOptions(mcp_servers={}, strict_mcp_config=True,
+        permission_mode="bypassPermissions",
         tools={"type":"preset","preset":"claude_code"}, system_prompt=system,
         setting_sources=list(setting_sources), ...). output_format is idempotently
         enveloped to {"type":"json_schema","schema":<bare>}; a bare schema is dropped by
@@ -758,20 +760,22 @@ def build_options(*, skills="all", setting_sources=("user","project","local"), s
 ```
 
 Verified facts (the exact field SET / enum members carry `[verify-against-installed]`; the
-load-bearing ones below are confirmed in 0.2.106):
+load-bearing ones below are confirmed in 0.2.137):
 
 - `permission_mode="bypassPermissions"` is a valid `PermissionMode`.
 - The claude_code tool capability set is `tools={"type":"preset","preset":"claude_code"}`
   — the `tools` field, **distinct** from `allowed_tools` (which only auto-approves a list,
   and is *not* how the preset is selected).
 - `system_prompt` is an independent field (plain string here).
+- `mcp_servers={}` passes no explicit servers and `strict_mcp_config=True` excludes MCP
+  servers from settings, project files, and plugins while leaving skill settings enabled.
 - **Skills are enabled via the dedicated `skills` option** (`skills="all"`, or
   `skills=["superpowers:writing-plans", …]`) — the single switch that turns skills on; the SDK
   then auto-adds the `Skill` tool and the needed `setting_sources`. `setting_sources`
   (`["user","project","local"]`; `[]` = isolation) *separately* controls filesystem settings
   (`settings.json`, plus `CLAUDE.md` when it includes `"project"`) and does **not** by itself
   enable skills in this SDK line. `[verify-against-installed]` (the dedicated `skills` option
-  exists in 0.2.106; older lines loaded skills via `setting_sources` only).
+  exists in 0.2.137; older lines loaded skills via `setting_sources` only).
 - `output_format` must be the envelope `{"type":"json_schema","schema":<bare>}`.
 - `cwd`, `add_dirs`, `disallowed_tools`, `cli_path`, `stderr` are valid fields.
 
@@ -1038,8 +1042,8 @@ hard-pinned cross-engine literal.
 ### §10.4 Configuration & environment (fallbacks)
 
 - `CLAUDE_CONFIG_DIR` → default `~/.claude`.
-- `FORGE_CLAUDE_BIN` → else `shutil.which("claude")` → else `~/.local/bin/claude`; threaded
-  into `build_options(cli_path=…)`.
+- `FORGE_CLAUDE_BIN` → else `shutil.which("claude")` → else `~/.local/bin/claude`;
+  resolved absolute and threaded into `build_options(cli_path=…)`.
 - `FORGE_CODEX_BIN` → else `shutil.which("codex")` → else `~/.npm-global/bin/codex`;
   threaded into `CodexConfig(codex_bin=…)`.
 
